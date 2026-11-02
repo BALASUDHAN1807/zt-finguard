@@ -1,0 +1,64 @@
+# ZT-FinGuard runtime detection rules for Falco.
+# Alerts are POSTed (mTLS) to the audit service and appear on the dashboard.
+
+- list: zt_images
+  items: [zt-finguard/gateway, zt-finguard/auth, zt-finguard/account,
+          zt-finguard/transaction, zt-finguard/risk, zt-finguard/audit,
+          zt-finguard/dashboard]
+
+- macro: zt_container
+  condition: (container.image.repository in (zt_images))
+
+- list: zt_shells
+  items: [sh, bash, dash, ash, zsh, busybox]
+
+- rule: ZT shell or tool spawned in service container
+  desc: Our images ship without a shell; any shell or download tool means someone has code execution.
+  condition: >
+    spawned_process and zt_container and
+    (proc.name in (zt_shells) or proc.name in (curl, wget, nc, ncat, socat, apt, apt-get, pip))
+  output: >
+    Shell/tool started in ZT-FinGuard container (container=%container.name image=%container.image.repository
+    proc=%proc.name cmdline=%proc.cmdline parent=%proc.pname user=%user.uid)
+  priority: CRITICAL
+  tags: [zt, execution, T1059]
+
+- rule: ZT write below read-only paths
+  desc: Root filesystem is read-only; attempts to write outside /tmp indicate tampering.
+  condition: >
+    open_write and zt_container and not fd.name startswith /tmp and not fd.name startswith /dev
+  output: >
+    Write attempt in ZT-FinGuard container (container=%container.name file=%fd.name proc=%proc.cmdline)
+  priority: ERROR
+  tags: [zt, persistence]
+
+- rule: ZT unexpected service reads a secret
+  desc: Only the owning process (python / streamlit) should read mounted secrets.
+  condition: >
+    open_read and zt_container and fd.name startswith /run/secrets/ and
+    not proc.name in (python, python3, streamlit)
+  output: >
+    Secret read by unexpected process (container=%container.name file=%fd.name proc=%proc.cmdline)
+  priority: CRITICAL
+  tags: [zt, credential_access, T1552]
+
+- rule: ZT database connection from non-database workload
+  desc: Only auth, account, transaction and audit may connect to PostgreSQL.
+  condition: >
+    outbound and zt_container and fd.sport = 5432 and
+    not container.image.repository in (zt-finguard/auth, zt-finguard/account,
+                                       zt-finguard/transaction, zt-finguard/audit)
+  output: >
+    Unexpected DB connection (container=%container.name image=%container.image.repository
+    connection=%fd.name)
+  priority: CRITICAL
+  tags: [zt, lateral_movement]
+
+- rule: ZT privilege escalation attempt
+  desc: setuid/setgid inside a container that runs as uid 10001 with no-new-privileges.
+  condition: >
+    evt.type in (setuid, setgid, setresuid, setresgid) and evt.dir = < and zt_container and evt.arg.uid = 0
+  output: >
+    Privilege escalation attempt (container=%container.name proc=%proc.cmdline)
+  priority: CRITICAL
+  tags: [zt, privilege_escalation]

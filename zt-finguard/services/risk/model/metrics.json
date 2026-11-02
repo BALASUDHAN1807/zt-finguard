@@ -1,0 +1,35 @@
+{
+  "trained_at": "2026-10-26T09:32:05+00:00",
+  "dataset": "paysim_sample.csv",
+  "synthetic": true,
+  "rows_transfer_cashout": 129958,
+  "fraud_rate": 0.00923,
+  "features": [
+    "is_transfer",
+    "log_amount",
+    "drain_ratio",
+    "orig_balance_zero",
+    "dest_balance_zero",
+    "hour"
+  ],
+  "test": {
+    "pr_auc": 0.9156,
+    "roc_auc": 0.9954,
+    "at_medium": {
+      "threshold": 0.4,
+      "precision": 0.584,
+      "recall": 0.95,
+      "flagged_share": 0.01502
+    },
+    "at_high": {
+      "threshold": 0.75,
+      "precision": 0.6955,
+      "recall": 0.9367,
+      "flagged_share": 0.01243
+    }
+  },
+  "leaky_baseline_with_post_balances": {
+    "pr_auc": 0.9623,
+    "note": "uses newbalanceOrig/newbalanceDest, unavailable at decision time"
+  }
+}

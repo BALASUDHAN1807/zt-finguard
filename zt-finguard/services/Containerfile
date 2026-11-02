@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+# One hardened image recipe for every Python workload.
+#   docker build -f services/Containerfile --build-arg SERVICE=auth -t zt-finguard/auth services/
+#   podman build -f services/Containerfile --build-arg SERVICE=auth -t zt-finguard/auth services/
+#
+# Hardening in the image:
+#   * multi-stage: compilers / pip caches never reach the runtime image
+#   * runs as an unprivileged, non-login user (uid 10001)
+#   * no shell, no package manager left in the final image
+#   * code is owned by root and read-only to the service user
+# Hardening at runtime (compose.yaml): read-only rootfs, cap_drop ALL,
+# no-new-privileges, seccomp default profile, pids/memory/cpu limits.
+
+ARG PYTHON_IMAGE=docker.io/library/python:3.12-slim-bookworm
+
+# ---------------------------------------------------------------- builder
+FROM ${PYTHON_IMAGE} AS builder
+ARG SERVICE
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN python -m venv /opt/venv
+COPY requirements-base.txt /tmp/requirements-base.txt
+COPY ${SERVICE}/requirements.txt /tmp/requirements-service.txt
+RUN /opt/venv/bin/pip install -r /tmp/requirements-base.txt -r /tmp/requirements-service.txt
+
+# ---------------------------------------------------------------- runtime
+FROM ${PYTHON_IMAGE}
+ARG SERVICE
+LABEL org.opencontainers.image.title="zt-finguard-${SERVICE}" \
+      org.opencontainers.image.description="ZT-FinGuard ${SERVICE} service" \
+      org.opencontainers.image.source="https://github.com/your-user/zt-finguard"
+
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/common:/app/service \
+    SERVICE_NAME=${SERVICE} \
+    ZT_IN_CONTAINER=1 \
+    TZ=Asia/Kolkata
+
+RUN groupadd --system --gid 10001 zt \
+ && useradd --system --uid 10001 --gid zt --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin zt
+
+COPY --from=builder /opt/venv /opt/venv
+COPY common/ /app/common/
+COPY ${SERVICE}/ /app/service/
+WORKDIR /app/service
+
+# Remove shells and the package manager: an attacker who gets code execution
+# cannot spawn /bin/sh or apt-get install tools. (Exec-form RUN: needs no shell.)
+RUN ["/opt/venv/bin/python", "-c", "import os, shutil; [os.remove(p) for p in ('/bin/sh','/bin/dash','/bin/bash','/usr/bin/sh','/usr/bin/dash','/usr/bin/bash','/usr/bin/apt','/usr/bin/apt-get','/usr/bin/dpkg') if os.path.lexists(p)]"]
+
+USER 10001:10001
+EXPOSE 8443
+HEALTHCHECK --interval=15s --timeout=4s --start-period=20s --retries=3 \
+  CMD ["python", "-m", "ztcommon.healthcheck"]
+ENTRYPOINT ["python", "app.py"]

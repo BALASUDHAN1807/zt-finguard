@@ -1,0 +1,4 @@
+**/__pycache__
+**/*.pyc
+risk/data
+**/.pytest_cache
