@@ -18,7 +18,7 @@ CERT_DAYS="${CERT_DAYS:-7}"
 CA_DAYS="${CA_DAYS:-365}"
 
 # workload identities = certificate Common Names
-SERVICES=(gateway dashboard auth account transaction risk audit opa postgres redis falco)
+SERVICES=(gateway dashboard auth account transaction risk audit responder opa postgres redis falco)
 
 mkdir -p "$OUT"
 chmod 700 "$OUT"

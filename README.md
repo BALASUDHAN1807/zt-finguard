@@ -22,6 +22,9 @@ Runs unchanged on **Docker** or **rootless Podman**.
 | Hardened containers | Non-root uid 10001, read-only rootfs, `cap_drop: ALL`, no-new-privileges, seccomp, cgroup limits, **no shell in images** |
 | Supply chain + runtime | **Trivy** image/secret scan (CI gate), **Falco** eBPF rules streaming alerts to the audit log |
 | Visibility | **Streamlit** security dashboard: decisions, denial reasons, risk mix, ZT overhead vs 100 ms budget, health, model card |
+| **Customer-controlled session timeout** | customer picks the inactivity timeout, admin sets the maximum, gateway expires idle sessions; re-sign-in required (auto-refresh never counts as activity) |
+| **Automatic container quarantine** | Falco alert ≥ Critical → `responder` disconnects the container from every network, alerts the admin; one-click release |
+| **Device trust verification** | first device trusted; new devices are *pending* (view only, no transfers) until approved from a trusted device + TOTP; revoke ends sessions |
 
 ## Architecture
 
@@ -49,8 +52,8 @@ re-verifies JWT → risk score → OPA decision → (step-up | deny + revoke | c
 Requirements: Linux, Docker 24+ with Compose v2 **or** Podman 4.4+ with `podman compose`, Python 3, OpenSSL.
 
 ```bash
-make setup                 # private CA, per-service certs, JWT keys, demo users
-make up                    # or: make up ENGINE=podman
+./deploy.sh                # checks prerequisites, certs, build, waits until healthy
+                           # (or step by step: make setup && make up; Podman: ./deploy.sh --podman)
 make users                 # demo usernames, passwords and current authenticator codes
 ```
 
@@ -66,6 +69,22 @@ Open **https://localhost:8501** (import `certs/ca.crt` into your browser to remo
 
 Each code works once. Add the TOTP secret from `make users` to Google Authenticator to sign in from your phone.
 
+## Deploy to the cloud (Docker)
+
+On any Ubuntu 22.04/24.04 VM with 4 GB+ RAM (Azure for Students, Oracle Always Free, AWS t3.medium...):
+
+```bash
+unzip zt-finguard.zip && cd zt-finguard
+./deploy/cloud-setup.sh      # installs Docker, firewall, HTTPS (Let's Encrypt), builds and starts everything
+```
+
+Pre-built images on Docker Hub (`make push IMAGE_PREFIX=bala1807/zt-finguard-`, see
+[docs/docker-hub.md](docs/docker-hub.md)) let the VM pull instead of build:
+`IMAGE_PREFIX=bala1807/zt-finguard- ./deploy/cloud-setup.sh`.
+
+You get a public `https://<ip>.sslip.io` address with a trusted certificate. Only Caddy (80/443)
+is reachable from the internet. Step-by-step guide: **[docs/deploy-cloud.md](docs/deploy-cloud.md)**.
+
 ## Dashboard (Streamlit)
 
 The dashboard is an ordinary client of the gateway. It has no certificates for the internal
@@ -76,7 +95,8 @@ through the same checks as any API call.
 |---|---|
 | customer | **My account** (balance, history with risk scores) · **Send money** (live risk score, reasons, step-up MFA, decision time) |
 | teller | **Account lookup** (read any account, cannot transfer) |
-| admin | **Security overview** (decisions, denials by reason, risk mix, ZT overhead vs 100 ms budget, service health, Trivy results; auto-refresh 5 s) · **Access decisions** (filterable audit stream) · **Risk model** (metrics, leaky vs leak-free, model card) · **Audit integrity** (verify hash chain) |
+| every role | **Security settings** (inactivity timeout, my devices: approve / revoke) |
+| admin | **Session & device policy** (maximum timeout, device inventory) · **Containers & quarantine** (live status, isolate / release) · **Security overview** (decisions, denials by reason, risk mix, ZT overhead vs 100 ms budget, service health, Trivy results; auto-refresh 5 s) · **Access decisions** (filterable audit stream) · **Risk model** (metrics, leaky vs leak-free, model card) · **Audit integrity** (verify hash chain) |
 
 | | |
 |---|---|
@@ -127,13 +147,13 @@ PaySim run** — the bundled model is trained on synthetic data.
 compose.yaml            11 services, 4 networks, secrets, hardening
 services/Containerfile  one hardened multi-stage image recipe
 services/common/        ztcommon: mTLS server/client, JWT, OPA/audit/Redis clients
-services/{gateway,auth,account,transaction,risk,audit,dashboard}/
+services/{gateway,auth,account,transaction,risk,audit,responder,dashboard}/
 policies/               Rego policy + tests + OPA API authorization
 db/                     schema, per-service roles, pg_hba (cert auth), TLS start-up
 falco/zt_rules.yaml     runtime detection rules
 scripts/                PKI, secrets, Trivy scan, demo users
 tests/test_e2e.py       end-to-end Zero Trust tests
-docs/                   evaluation guide
+docs/                   evaluation, cloud deployment, features 19-21 (session-device-quarantine.md)
 ```
 
 ## References

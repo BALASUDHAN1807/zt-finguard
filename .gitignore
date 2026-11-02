@@ -6,3 +6,6 @@ services/risk/data/
 __pycache__/
 *.pyc
 .pytest_cache/
+.env
+.venv/
+.devcontainer/deploy.log

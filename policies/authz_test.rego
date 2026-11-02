@@ -9,7 +9,7 @@ transfer(subject, ctx) := {
 	"subject": subject,
 	"action": "transaction.transfer",
 	"resource": {"owner": "alice", "account": "ZT1"},
-	"context": object.union({"caller": "transaction", "amount": 1000, "risk_level": "low"}, ctx),
+	"context": object.union({"caller": "transaction", "amount": 1000, "risk_level": "low", "device_trust": "trusted"}, ctx),
 }
 
 test_low_risk_own_transfer_allowed if {
@@ -101,4 +101,45 @@ test_admin_dashboard_allowed if {
 		"context": {"caller": "gateway"},
 	}
 	d.allow
+}
+
+test_transfer_from_pending_device_denied if {
+	d := authz.decision with input as transfer(customer, {"device_trust": "pending"})
+	not d.allow
+	"device_not_trusted" in d.reasons
+}
+
+test_transfer_without_device_info_fails_closed if {
+	inp := transfer(customer, {})
+	no_device := object.union(object.remove(inp, ["context"]), {"context": object.remove(inp.context, ["device_trust"])})
+	d := authz.decision with input as no_device
+	"device_not_trusted" in d.reasons
+}
+
+test_step_up_cannot_bypass_untrusted_device if {
+	d := authz.decision with input as transfer(customer, {"device_trust": "pending", "risk_level": "medium", "step_up": true})
+	not d.allow
+	"device_not_trusted" in d.reasons
+}
+
+test_every_role_manages_own_sessions_and_devices if {
+	every r in ["customer", "teller", "admin"] {
+		d := authz.decision with input as {
+			"subject": {"user": "u", "role": r, "mfa": true},
+			"action": "self.manage", "resource": {}, "context": {"caller": "gateway"},
+		}
+		d.allow
+	}
+}
+
+test_only_admin_sets_session_policy_or_quarantines if {
+	every a in ["admin.session_policy", "admin.quarantine", "admin.devices"] {
+		c := authz.decision with input as {"subject": customer, "action": a, "resource": {}, "context": {"caller": "gateway"}}
+		not c.allow
+		ad := authz.decision with input as {
+			"subject": {"user": "admin", "role": "admin", "mfa": true},
+			"action": a, "resource": {}, "context": {"caller": "gateway"},
+		}
+		ad.allow
+	}
 }

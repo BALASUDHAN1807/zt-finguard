@@ -1,0 +1,8 @@
+# Codespaces only. GitHub's port-forwarding proxy rewrites Host/Origin headers,
+# which Streamlit's same-origin websocket check rejects (blank page). The proxy
+# itself requires GitHub sign-in (private ports) or is an explicit public link.
+services:
+  dashboard:
+    environment:
+      STREAMLIT_SERVER_ENABLE_CORS: "false"
+      STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION: "false"

@@ -1,0 +1,33 @@
+# Public HTTPS entry point (Let's Encrypt) -> Streamlit dashboard
+{
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$SITE_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	# The dashboard itself is served over TLS by the container; Caddy verifies it
+	# with our private CA (no plaintext hop, even inside the VM).
+	reverse_proxy https://dashboard:8501 {
+		transport http {
+			tls_trusted_ca_certs /run/secrets/ca_crt
+			tls_server_name dashboard
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

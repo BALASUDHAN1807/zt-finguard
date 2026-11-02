@@ -24,6 +24,11 @@ Run `make test` (stack running). Each row is one automated test in `tests/test_e
 | 13 | Suspicious but possibly legit | allowed or blocked outright | step-up MFA, token bound to that exact amount/payee | `test_medium_risk_transfer_needs_step_up_bound_to_that_transfer` |
 | 14 | Brute force | unlimited guesses | locked after 5 failures + gateway rate limit | `test_lockout_after_five_failures` |
 | 15 | Log tampering | undetectable | hash chain verifies | `test_audit_chain_verifies` |
+| 16 | Unattended logged-in screen | session lives until token expiry | expires after the customer's idle timeout; auto-refresh doesn't extend it | `test_inactive_session_expires_and_background_polling_does_not_keep_it_alive` |
+| 17 | Customer picks an unsafe timeout | allowed | capped by the administrator maximum | `test_admin_maximum_caps_customer_choice` |
+| 18 | Stolen password + TOTP on attacker's device | full access | device is *pending*: no money movement until approved from a trusted device | `test_new_device_is_pending_and_cannot_move_money_until_approved` |
+| 19 | Lost / stolen device | sessions stay valid | owner revokes it: sessions end at once, sign-in refused | `test_revoking_a_device_ends_its_session_and_blocks_sign_in` |
+| 20 | Compromised container | lateral movement to DB/services | Falco alert → container cut off from all networks, admin alerted | `test_falco_alert_triggers_automatic_quarantine` (Docker) |
 
 Put this table (with your measured run) in the results chapter.
 

@@ -1,0 +1,45 @@
+# Cloud overlay:  docker compose -f compose.yaml -f compose.cloud.yaml up -d
+#
+# On a public VM only Caddy is reachable from the internet (80 for the ACME
+# challenge, 443 for HTTPS). It gets a real Let's Encrypt certificate and
+# forwards to the dashboard over TLS that it verifies against our private CA.
+# Gateway and dashboard ports are bound to 127.0.0.1 only (for ssh tunnels and
+# `make test` on the VM).
+
+services:
+  gateway:
+    ports: !override
+      - "127.0.0.1:8443:8443"
+
+  dashboard:
+    ports: !override
+      - "127.0.0.1:8501:8501"
+
+  caddy:
+    image: docker.io/library/caddy:2.8.4-alpine
+    networks: [edge-net]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:?set SITE_DOMAIN in .env (deploy/cloud-setup.sh does this)}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    secrets:
+      - {source: ca_crt, target: ca_crt}
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 128m
+    restart: unless-stopped
+    depends_on:
+      dashboard: {condition: service_healthy}
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}

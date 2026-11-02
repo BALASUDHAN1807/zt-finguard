@@ -12,6 +12,10 @@
 #              audit                                     (internal)
 # Being on the same network is never enough: every hop is mTLS and every
 # endpoint has an allow-list of workload identities (certificate CNs).
+#
+# Images: built locally as zt-finguard/<service>, or pulled from Docker Hub when
+# IMAGE_PREFIX is set, e.g. IMAGE_PREFIX=bala1807/zt-finguard- -> bala1807/zt-finguard-gateway
+# (see docs/docker-hub.md).
 
 name: zt-finguard
 
@@ -133,7 +137,7 @@ services:
   risk:
     <<: *hardened
     build: {context: ./services, dockerfile: Containerfile, args: {SERVICE: risk}}
-    image: zt-finguard/risk:latest
+    image: ${IMAGE_PREFIX:-zt-finguard/}risk:${IMAGE_TAG:-latest}
     networks: [auth-net]
     mem_limit: 768m
     cpus: 1.0
@@ -148,7 +152,7 @@ services:
   audit:
     <<: *hardened
     build: {context: ./services, dockerfile: Containerfile, args: {SERVICE: audit}}
-    image: zt-finguard/audit:latest
+    image: ${IMAGE_PREFIX:-zt-finguard/}audit:${IMAGE_TAG:-latest}
     networks: [auth-net, db-net]
     environment:
       <<: *svc-env
@@ -163,7 +167,7 @@ services:
   auth:
     <<: *hardened
     build: {context: ./services, dockerfile: Containerfile, args: {SERVICE: auth}}
-    image: zt-finguard/auth:latest
+    image: ${IMAGE_PREFIX:-zt-finguard/}auth:${IMAGE_TAG:-latest}
     networks: [auth-net, db-net]
     environment:
       <<: *svc-env
@@ -188,7 +192,7 @@ services:
   account:
     <<: *hardened
     build: {context: ./services, dockerfile: Containerfile, args: {SERVICE: account}}
-    image: zt-finguard/account:latest
+    image: ${IMAGE_PREFIX:-zt-finguard/}account:${IMAGE_TAG:-latest}
     networks: [app-net, auth-net, db-net]
     environment:
       <<: *svc-env
@@ -207,7 +211,7 @@ services:
   transaction:
     <<: *hardened
     build: {context: ./services, dockerfile: Containerfile, args: {SERVICE: transaction}}
-    image: zt-finguard/transaction:latest
+    image: ${IMAGE_PREFIX:-zt-finguard/}transaction:${IMAGE_TAG:-latest}
     networks: [app-net, auth-net, db-net]
     environment:
       <<: *svc-env
@@ -223,11 +227,39 @@ services:
       risk: {condition: service_healthy}
       audit: {condition: service_healthy}
 
+  # ------------------------------------- F20: automatic container quarantine
+  # Receives Falco alerts and isolates the offending container. It is the only
+  # workload with the container-engine socket (Docker, or Podman's compatible
+  # API: CONTAINER_SOCK=$XDG_RUNTIME_DIR/podman/podman.sock). Access is granted
+  # through the socket's group only - the service still runs as uid 10001.
+  responder:
+    <<: *hardened
+    build: {context: ./services, dockerfile: Containerfile, args: {SERVICE: responder}}
+    image: ${IMAGE_PREFIX:-zt-finguard/}responder:${IMAGE_TAG:-latest}
+    networks: [auth-net, edge-net]   # edge-net only for the optional alert webhook
+    group_add: ["${CONTAINER_SOCK_GID:-999}"]
+    environment:
+      <<: *svc-env
+      SERVICE_NAME: responder
+      COMPOSE_PROJECT: zt-finguard
+      QUARANTINE_MIN_PRIORITY: "${QUARANTINE_MIN_PRIORITY:-Critical}"
+      QUARANTINE_PAUSE: "${QUARANTINE_PAUSE:-0}"
+      ALERT_WEBHOOK_URL: "${ALERT_WEBHOOK_URL:-}"
+    secrets:
+      - {source: ca_crt, target: ca_crt}
+      - {source: responder_crt, target: tls_crt}
+      - {source: responder_key, target: tls_key}
+    volumes:
+      - ${CONTAINER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      - responder_state:/state
+    depends_on:
+      audit: {condition: service_healthy}
+
   # ----------------------------------------------------------------- edge
   gateway:
     <<: *hardened
     build: {context: ./services, dockerfile: Containerfile, args: {SERVICE: gateway}}
-    image: zt-finguard/gateway:latest
+    image: ${IMAGE_PREFIX:-zt-finguard/}gateway:${IMAGE_TAG:-latest}
     networks: [edge-net, app-net, auth-net]
     ports: ["8443:8443"]
     environment:
@@ -235,7 +267,7 @@ services:
       SERVICE_NAME: gateway
       REPORTS_DIR: /reports
       RATE_LIMIT_PER_MIN: "240"
-      LOGIN_RATE_LIMIT_PER_MIN: "10"
+      LOGIN_RATE_LIMIT_PER_MIN: "${LOGIN_RATE_LIMIT_PER_MIN:-10}"
     secrets:
       - {source: ca_crt, target: ca_crt}
       - {source: gateway_crt, target: tls_crt}
@@ -252,7 +284,7 @@ services:
   dashboard:
     <<: *hardened
     build: {context: ./services, dockerfile: Containerfile, args: {SERVICE: dashboard}}
-    image: zt-finguard/dashboard:latest
+    image: ${IMAGE_PREFIX:-zt-finguard/}dashboard:${IMAGE_TAG:-latest}
     networks: [edge-net]          # can only talk to the gateway, like any browser
     ports: ["8501:8501"]
     entrypoint:
@@ -297,7 +329,7 @@ services:
       - -o
       - http_output.enabled=true
       - -o
-      - http_output.url=https://audit:8443/falco
+      - http_output.url=https://responder:8443/falco
       - -o
       - http_output.mtls=true
       - -o
@@ -325,6 +357,7 @@ networks:
 
 volumes:
   pgdata: {}
+  responder_state: {}
 
 secrets:
   ca_crt: {file: ./certs/ca.crt}
@@ -340,6 +373,8 @@ secrets:
   transaction_key: {file: ./certs/transaction.key}
   risk_crt: {file: ./certs/risk.crt}
   risk_key: {file: ./certs/risk.key}
+  responder_crt: {file: ./certs/responder.crt}
+  responder_key: {file: ./certs/responder.key}
   audit_crt: {file: ./certs/audit.crt}
   audit_key: {file: ./certs/audit.key}
   opa_crt: {file: ./certs/opa.crt}

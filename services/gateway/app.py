@@ -24,12 +24,12 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from ztcommon import clients, mtls, tokens
+from ztcommon import clients, mtls, sessions, tokens
 
 REPORTS_DIR = os.environ.get("REPORTS_DIR", "/reports")
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", "240"))
 LOGIN_RATE_LIMIT = int(os.environ.get("LOGIN_RATE_LIMIT_PER_MIN", "10"))
-SERVICES = ["auth", "account", "transaction", "risk", "audit"]
+SERVICES = ["auth", "account", "transaction", "risk", "audit", "responder"]
 
 app = FastAPI(title="ZT-FinGuard gateway", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -96,7 +96,8 @@ def deny(request: Request, actor: str, reason: str, status: int = 401):
 
 
 async def session(request: Request, authorization: str | None = Header(None),
-                  x_device_id: str | None = Header(None), user_agent: str | None = Header(None)) -> dict:
+                  x_device_id: str | None = Header(None), user_agent: str | None = Header(None),
+                  x_zt_background: str | None = Header(None)) -> dict:
     t0 = time.perf_counter()
     try:
         claims = tokens.verify_access(tokens.bearer(authorization))
@@ -112,14 +113,27 @@ async def session(request: Request, authorization: str | None = Header(None),
     if revoked_at and issued_ms <= int(revoked_at):
         reason = await r.get(f"revoked_reason:{claims['sub']}") or "revoked"
         deny(request, claims["usr"], f"session_revoked:{reason}")
+    # F21: a revoked device loses every session immediately
+    device_trust = await r.get(f"dev:{claims['sub']}:{claims['dfp']}") or "pending"
+    if device_trust == "revoked":
+        deny(request, claims["usr"], "device_revoked")
+    # F19: inactivity timeout (dashboard auto-refresh sends X-ZT-Background and never counts as activity)
+    idle_reason, left = await sessions.check(r, claims.get("sid"), claims["sub"],
+                                             touch=x_zt_background != "1")
+    if idle_reason:
+        await r.set(f"rtfam_revoked:{claims.get('sid')}", 1, ex=8 * 3600)
+        deny(request, claims["usr"], idle_reason)
+    claims["_device_trust"] = device_trust
+    claims["_idle_left"] = left
     GATEWAY_CHECK_MS.append((time.perf_counter() - t0) * 1000)
     claims["_raw"] = tokens.bearer(authorization)
     return claims
 
 
 async def forward(method: str, service: str, path: str, claims: dict | None = None,
-                  body: Any = None) -> JSONResponse:
+                  body: Any = None, extra_headers: dict | None = None) -> JSONResponse:
     headers = {"Authorization": f"Bearer {claims['_raw']}"} if claims else {}
+    headers.update(extra_headers or {})
     try:
         resp = await mtls.client().request(method, mtls.url(service, path), json=body, headers=headers)
     except httpx.HTTPError:
@@ -180,7 +194,7 @@ class LogoutBody(BaseModel):
 @app.post("/api/auth/logout")
 async def logout(body: LogoutBody, claims: dict = Depends(session)):
     return await forward("POST", "auth", "/logout", body={
-        "jti": claims["jti"], "exp": claims["exp"], "sub": claims["sub"],
+        "jti": claims["jti"], "exp": claims["exp"], "sub": claims["sub"], "sid": claims.get("sid"),
         "username": claims["usr"], "refresh_token": body.refresh_token})
 
 
@@ -197,7 +211,8 @@ async def step_up(body: StepUpBody, claims: dict = Depends(session)):
 
 @app.get("/api/me")
 async def me(claims: dict = Depends(session)):
-    return {k: claims[k] for k in ("usr", "role", "mfa", "amr", "exp", "iat", "jti")}
+    return {k: claims[k] for k in ("usr", "role", "mfa", "amr", "exp", "iat", "jti")} | {
+        "device_trust": claims["_device_trust"], "idle_seconds_left": claims["_idle_left"]}
 
 
 # ---------------------------------------------------------- banking routes
@@ -226,7 +241,57 @@ class TransferBody(BaseModel):
 
 @app.post("/api/transfer")
 async def transfer(body: TransferBody, claims: dict = Depends(session)):
-    return await forward("POST", "transaction", "/transfer", claims, body.model_dump())
+    # Device trust is decided here (the policy enforcement point) and passed on; the
+    # transaction service only accepts this header from the gateway's mTLS identity.
+    return await forward("POST", "transaction", "/transfer", claims, body.model_dump(),
+                         extra_headers={"X-ZT-Device-Trust": claims["_device_trust"]})
+
+
+# ------------------------------------------- F19 / F21: user self-service
+class SessionPrefBody(BaseModel):
+    idle_timeout_minutes: int = Field(ge=1, le=1440)
+
+
+class TotpBody(BaseModel):
+    totp: str = Field(max_length=10)
+
+
+@app.get("/api/me/session")
+async def my_session(claims: dict = Depends(session)):
+    await require_admin_action("self.manage", claims)
+    return await forward("GET", "auth", "/me/session", claims)
+
+
+@app.put("/api/me/session")
+async def set_my_session(body: SessionPrefBody, claims: dict = Depends(session)):
+    await require_admin_action("self.manage", claims)
+    return await forward("PUT", "auth", "/me/session", claims, body.model_dump())
+
+
+@app.get("/api/me/devices")
+async def my_devices(claims: dict = Depends(session)):
+    await require_admin_action("self.manage", claims)
+    return await forward("GET", "auth", "/me/devices", claims)
+
+
+@app.post("/api/me/devices/verify-current")
+async def verify_current_device(body: TotpBody, claims: dict = Depends(session)):
+    await require_admin_action("self.manage", claims)
+    return await forward("POST", "auth", "/me/devices/verify-current", claims, body.model_dump())
+
+
+@app.post("/api/me/devices/{device_id}/{op}")
+async def device_op(device_id: int, op: str, body: TotpBody, claims: dict = Depends(session)):
+    if op not in ("approve", "revoke"):
+        raise HTTPException(404, "unknown operation")
+    await require_admin_action("self.manage", claims)
+    return await forward("POST", "auth", f"/me/devices/{device_id}/{op}", claims, body.model_dump())
+
+
+@app.delete("/api/me/devices/{device_id}")
+async def forget_device(device_id: int, claims: dict = Depends(session)):
+    await require_admin_action("self.manage", claims)
+    return await forward("DELETE", "auth", f"/me/devices/{device_id}", claims)
 
 
 # ------------------------------------------------------------ admin routes
@@ -310,6 +375,52 @@ async def verify_audit(claims: dict = Depends(session)):
                   decision="info" if result.get("ok") else "alert",
                   reason="chain_intact" if result.get("ok") else "chain_broken", details=result)
     return result
+
+
+# --------------------------------------- F19 / F21 / F20: admin controls
+class SessionPolicyBody(BaseModel):
+    max_idle_minutes: int = Field(ge=1, le=sessions.ADMIN_MAX_LIMIT)
+
+
+@app.get("/api/admin/session-policy")
+async def get_session_policy(claims: dict = Depends(session)):
+    await require_admin_action("admin.session_policy", claims)
+    return await forward("GET", "auth", "/admin/session-policy", claims)
+
+
+@app.put("/api/admin/session-policy")
+async def set_session_policy(body: SessionPolicyBody, claims: dict = Depends(session)):
+    await require_admin_action("admin.session_policy", claims)
+    return await forward("PUT", "auth", "/admin/session-policy", claims, body.model_dump())
+
+
+@app.get("/api/admin/devices")
+async def admin_devices(claims: dict = Depends(session)):
+    await require_admin_action("admin.devices", claims)
+    return await forward("GET", "auth", "/admin/devices", claims)
+
+
+class QuarantineBody(BaseModel):
+    service: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,30}$")
+    reason: str = Field(default="manual quarantine by administrator", max_length=200)
+
+
+@app.get("/api/admin/quarantine")
+async def quarantine_status(claims: dict = Depends(session)):
+    await require_admin_action("admin.quarantine", claims)
+    return await forward("GET", "responder", "/quarantine")
+
+
+@app.post("/api/admin/quarantine")
+async def quarantine(body: QuarantineBody, claims: dict = Depends(session)):
+    await require_admin_action("admin.quarantine", claims)
+    return await forward("POST", "responder", "/quarantine", body=body.model_dump() | {"actor": claims["usr"]})
+
+
+@app.post("/api/admin/quarantine/{service}/release")
+async def release(service: str, claims: dict = Depends(session)):
+    await require_admin_action("admin.quarantine", claims)
+    return await forward("POST", "responder", f"/quarantine/{service}/release", body={"actor": claims["usr"]})
 
 
 @app.get("/healthz")

@@ -42,23 +42,37 @@ def fresh_code(username: str) -> str:
 
 
 class Client:
+    """One browser/device. Unless a device is given, it becomes that user's usual
+    device ("e2e-<user>") on first sign-in, like a person using their own laptop."""
+
     def __init__(self, device: str | None = None, ua: str = "zt-e2e-tests"):
-        self.headers = {"X-Device-Id": device or uuid.uuid4().hex, "User-Agent": ua}
+        self.device = device
+        self.ua = ua
         self.http = httpx.Client(base_url=GATEWAY, verify=CA, timeout=20)
         self.token: str | None = None
         self.refresh: str | None = None
+        self.last_login: dict | None = None
 
-    def req(self, method, path, **kw):
+    @property
+    def headers(self) -> dict:
+        return {"X-Device-Id": self.device or "e2e-anonymous", "User-Agent": self.ua}
+
+    def req(self, method, path, background: bool = False, **kw):
         h = dict(self.headers)
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
+        if background:
+            h["X-ZT-Background"] = "1"
         return self.http.request(method, path, headers=h, **kw)
 
     def login(self, username: str, code: str | None = None):
+        if self.device is None:
+            self.device = f"e2e-{username}"
         r = self.req("POST", "/api/auth/login", json={
             "username": username, "password": USERS[username]["password"],
             "totp": code or fresh_code(username)})
         if r.status_code == 200:
+            self.last_login = r.json()
             self.token = r.json()["access_token"]
             self.refresh = r.json()["refresh_token"]
         return r
@@ -263,3 +277,82 @@ def test_lockout_after_five_failures():
     r = c.req("POST", "/api/auth/login", json={
         "username": name, "password": "Long-enough-pw-1", "totp": pyotp.TOTP(secret).now()})
     assert r.status_code == 401  # correct credentials, but the account is locked
+
+
+# ------------------------------------------------- F21: device trust
+def _pending_device_id(trusted: Client, label_hint: str) -> int:
+    devs = trusted.req("GET", "/api/me/devices").json()["devices"]
+    pending = [d for d in devs if d["status"] == "pending" and not d["current"]]
+    assert pending, devs
+    return max(pending, key=lambda d: d["id"])["id"]
+
+
+def test_new_device_is_pending_and_cannot_move_money_until_approved():
+    bob = account_of("bob")
+    home = logged_in("alice")                       # alice's usual (trusted) device
+    phone = Client(device="phone-" + uuid.uuid4().hex[:8], ua="Mozilla/5.0 (Linux; Android 14) Chrome/130")
+    r = phone.login("alice")
+    assert r.status_code == 200 and r.json()["device"]["status"] == "pending"
+    assert phone.req("GET", "/api/accounts/me").status_code == 200          # may look ...
+    t = phone.req("POST", "/api/transfer", json={"to_account": bob, "amount": 100})
+    assert t.status_code == 403 and "device_not_trusted" in t.json()["reasons"]   # ... but not move money
+    dev_id = _pending_device_id(home, "Android")
+    # a pending device cannot approve itself
+    own = phone.req("POST", f"/api/me/devices/{dev_id}/approve", json={"totp": fresh_code("alice")})
+    assert own.status_code == 403
+    ok = home.req("POST", f"/api/me/devices/{dev_id}/approve", json={"totp": fresh_code("alice")})
+    assert ok.status_code == 200, ok.text
+    t2 = phone.req("POST", "/api/transfer", json={"to_account": bob, "amount": 100})
+    assert t2.status_code == 200 and t2.json()["decision"] == "allow", t2.text
+
+
+def test_revoking_a_device_ends_its_session_and_blocks_sign_in():
+    home = logged_in("bob")
+    tablet = Client(device="tablet-" + uuid.uuid4().hex[:8])
+    assert tablet.login("bob").status_code == 200
+    assert tablet.req("GET", "/api/accounts/me").status_code == 200
+    dev_id = _pending_device_id(home, "tablet")
+    rv = home.req("POST", f"/api/me/devices/{dev_id}/revoke", json={"totp": fresh_code("bob")})
+    assert rv.status_code == 200
+    after = tablet.req("GET", "/api/accounts/me")
+    assert after.status_code == 401 and after.json()["detail"] == "device_revoked"
+    again = Client(device=tablet.device).login("bob")
+    assert again.status_code == 403
+
+
+# ----------------------------------------- F19: customer session timeout
+def _new_user() -> tuple[str, str]:
+    name = "idle_" + uuid.uuid4().hex[:8]
+    r = Client().req("POST", "/api/auth/register", json={"username": name, "password": "Long-enough-pw-1"})
+    assert r.status_code == 200, r.text
+    USERS[name] = {"password": "Long-enough-pw-1", "totp_secret": r.json()["totp_secret"]}
+    return name, r.json()["totp_secret"]
+
+
+def test_admin_maximum_caps_customer_choice():
+    admin = logged_in("admin")
+    name, _ = _new_user()
+    user = logged_in(name)
+    assert user.req("PUT", "/api/admin/session-policy", json={"max_idle_minutes": 240}).status_code == 403
+    try:
+        assert admin.req("PUT", "/api/admin/session-policy", json={"max_idle_minutes": 5}).status_code == 200
+        cfg = user.req("GET", "/api/me/session").json()
+        assert cfg["admin_max_minutes"] == 5 and cfg["effective_minutes"] <= 5
+        assert user.req("PUT", "/api/me/session", json={"idle_timeout_minutes": 15}).status_code == 400
+        assert user.req("PUT", "/api/me/session", json={"idle_timeout_minutes": 2}).json()["effective_minutes"] == 2
+    finally:
+        admin.req("PUT", "/api/admin/session-policy", json={"max_idle_minutes": 30})
+
+
+def test_inactive_session_expires_and_background_polling_does_not_keep_it_alive():
+    name, _ = _new_user()
+    c = logged_in(name)
+    assert c.req("PUT", "/api/me/session", json={"idle_timeout_minutes": 1}).status_code == 200
+    time.sleep(35)
+    assert c.req("GET", "/api/me", background=True).status_code == 200   # auto-refresh: allowed, not activity
+    time.sleep(35)                                                       # 70 s since last real activity
+    r = c.req("GET", "/api/accounts/me")
+    assert r.status_code == 401 and r.json()["detail"].startswith("session_idle_timeout")
+    # the refresh token cannot revive it - the user must sign in again
+    assert c.req("POST", "/api/auth/refresh", json={"refresh_token": c.refresh}).status_code == 401
+    assert Client(device=c.device).login(name).status_code == 200

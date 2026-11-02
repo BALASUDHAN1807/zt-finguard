@@ -1,13 +1,19 @@
 # ZT-FinGuard runtime detection rules for Falco.
-# Alerts are POSTed (mTLS) to the audit service and appear on the dashboard.
+# Alerts are POSTed (mTLS) to the responder service, which logs every alert and
+# automatically QUARANTINES the container for priority >= Critical (F20):
+# the container is disconnected from all networks and the admin is alerted.
 
-- list: zt_images
-  items: [zt-finguard/gateway, zt-finguard/auth, zt-finguard/account,
-          zt-finguard/transaction, zt-finguard/risk, zt-finguard/audit,
-          zt-finguard/dashboard]
+# Our own services, identified by Docker Compose labels so the rules work whether
+# images are built locally (zt-finguard/<svc>) or pulled from Docker Hub
+# (<user>/zt-finguard-<svc>). Third-party containers (postgres, redis, opa, caddy,
+# falco) are excluded: their start-up scripts legitimately run a shell.
+- list: zt_services
+  items: [gateway, auth, account, transaction, risk, audit, dashboard, responder]
 
 - macro: zt_container
-  condition: (container.image.repository in (zt_images))
+  condition: >
+    (container.label[com.docker.compose.project] = zt-finguard and
+     container.label[com.docker.compose.service] in (zt_services))
 
 - list: zt_shells
   items: [sh, bash, dash, ash, zsh, busybox]
@@ -46,8 +52,7 @@
   desc: Only auth, account, transaction and audit may connect to PostgreSQL.
   condition: >
     outbound and zt_container and fd.sport = 5432 and
-    not container.image.repository in (zt-finguard/auth, zt-finguard/account,
-                                       zt-finguard/transaction, zt-finguard/audit)
+    not container.label[com.docker.compose.service] in (auth, account, transaction, audit)
   output: >
     Unexpected DB connection (container=%container.name image=%container.image.repository
     connection=%fd.name)

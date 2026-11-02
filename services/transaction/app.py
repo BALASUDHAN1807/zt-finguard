@@ -61,7 +61,8 @@ async def record(conn, sender: str, receiver: str, amount: Decimal, status: str,
 
 
 @app.post("/transfer", dependencies=[Depends(mtls.require_caller("gateway"))])
-async def transfer(body: TransferIn, response: Response, authorization: str | None = Header(None)):
+async def transfer(body: TransferIn, response: Response, authorization: str | None = Header(None),
+                   x_zt_device_trust: str | None = Header(None)):
     started = time.perf_counter()
     claims = tokens.verify_access(tokens.bearer(authorization))
     user, sub = claims["usr"], claims["sub"]
@@ -122,7 +123,9 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
         "action": "transaction.transfer",
         "resource": {"owner": sender["owner"], "account": sender["account_no"]},
         "context": {"caller": "transaction", "amount": float(amount),
-                    "risk_level": risk["level"], "step_up": stepped_up},
+                    "risk_level": risk["level"], "step_up": stepped_up,
+                    # set by the gateway (only caller allowed on this endpoint); absent -> denied
+                    "device_trust": x_zt_device_trust or "unknown"},
     })
     policy_ms = (time.perf_counter() - t_pol) * 1000
     timing = {"risk_ms": round(risk_ms, 1), "policy_ms": round(policy_ms, 1)}

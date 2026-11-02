@@ -8,7 +8,8 @@
 #   "action":   "transaction.transfer",
 #   "resource": {"owner": "alice", "account": "ZT1000000002"},
 #   "context":  {"caller": "transaction", "amount": 2500,
-#                "risk_level": "low|medium|high", "step_up": false}
+#                "risk_level": "low|medium|high", "step_up": false,
+#                "device_trust": "trusted|pending"}
 # }
 #
 # result = {"allow": bool, "step_up": bool, "reasons": [..]}
@@ -23,16 +24,22 @@ permissions := {
 		"account.read:own",
 		"transaction.transfer:own",
 		"transaction.history:own",
+		"self.manage",
 	},
 	"teller": {
 		"account.read:any",
 		"transaction.history:any",
+		"self.manage",
 	},
 	# Separation of duties: admins run security tooling but can never
 	# move money or read customer balances.
 	"admin": {
 		"admin.dashboard",
 		"admin.audit",
+		"admin.session_policy",
+		"admin.devices",
+		"admin.quarantine",
+		"self.manage",
 	},
 }
 
@@ -43,6 +50,10 @@ trusted_callers := {
 	"transaction.history": {"account", "transaction"},
 	"admin.dashboard": {"gateway"},
 	"admin.audit": {"gateway"},
+	"admin.session_policy": {"gateway"},
+	"admin.devices": {"gateway"},
+	"admin.quarantine": {"gateway"},
+	"self.manage": {"gateway"},
 }
 
 # Per-transfer ceiling by role (INR).
@@ -84,6 +95,12 @@ deny contains "risk_too_high" if {
 deny contains "risk_unknown" if {
 	is_transfer
 	not input.context.risk_level in {"low", "medium", "high"}
+}
+
+# F21: money only moves from a device the customer has verified
+deny contains "device_not_trusted" if {
+	is_transfer
+	not input.context.device_trust == "trusted" # missing value must deny, not be undefined
 }
 
 deny contains "amount_over_limit" if {

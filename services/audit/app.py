@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 import chain
 from ztcommon import db, mtls
 
-WRITERS = ("gateway", "auth", "account", "transaction", "risk")
+WRITERS = ("gateway", "auth", "account", "transaction", "risk", "responder")
 CHAIN_LOCK = 7_204_001  # pg advisory lock id: serialises chain appends
 
 

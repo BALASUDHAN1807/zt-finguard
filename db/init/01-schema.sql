@@ -16,17 +16,35 @@ CREATE TABLE users (
     failed_attempts INT NOT NULL DEFAULT 0,
     locked_until    TIMESTAMPTZ,
     last_login_ip   TEXT,
+    -- F19: customer-chosen inactivity timeout (capped by the admin maximum)
+    idle_timeout_minutes INT NOT NULL DEFAULT 15 CHECK (idle_timeout_minutes BETWEEN 1 AND 1440),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- F21: device registry. A device is trusted only after verification.
 CREATE TABLE known_devices (
     id          SERIAL PRIMARY KEY,
     user_id     INT NOT NULL REFERENCES users(id),
     fingerprint TEXT NOT NULL,
+    label       TEXT NOT NULL DEFAULT 'Unknown device',
+    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','trusted','revoked')),
+    first_ip    TEXT,
+    last_ip     TEXT,
     first_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    verified_at TIMESTAMPTZ,
+    verified_by TEXT,
     UNIQUE (user_id, fingerprint)
 );
+
+-- Security settings an administrator controls (F19: maximum idle timeout).
+CREATE TABLE security_settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_by  TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO security_settings (key, value, updated_by) VALUES ('max_idle_minutes', '30', 'system');
 
 CREATE TABLE accounts (
     id          SERIAL PRIMARY KEY,
@@ -86,7 +104,9 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO auth, account, transaction, audit;
 
 -- auth: identities and devices only
-GRANT SELECT, INSERT, UPDATE ON users, known_devices TO auth;
+GRANT SELECT, INSERT, UPDATE ON users TO auth;
+GRANT SELECT, INSERT, UPDATE, DELETE ON known_devices TO auth;
+GRANT SELECT, UPDATE ON security_settings TO auth;
 GRANT INSERT ON risk_scores TO auth;
 GRANT USAGE ON SEQUENCE users_id_seq, known_devices_id_seq, risk_scores_id_seq TO auth;
 

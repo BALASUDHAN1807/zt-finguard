@@ -10,10 +10,10 @@ Run:  streamlit run app.py
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import ssl
 import time
-import uuid
 from datetime import datetime
 
 import altair as alt
@@ -29,9 +29,20 @@ st.set_page_config(page_title="ZT-FinGuard", page_icon="🛡️", layout="wide")
 
 
 # ------------------------------------------------------------------ session
+def browser_identity() -> tuple[str, str]:
+    """F21: identify the *browser*, not the Streamlit session, so the same browser is the
+    same device on every visit. Derived from the browser's own request headers (a light
+    fingerprint - see docs for its limits)."""
+    h = {k.lower(): v for k, v in (st.context.headers or {}).items()}
+    ua = h.get("user-agent", "unknown-browser")
+    basis = "|".join([ua, h.get("accept-language", ""), h.get("sec-ch-ua-platform", "")])
+    return "web-" + hashlib.sha256(basis.encode()).hexdigest()[:24], ua
+
+
 def S():
     ss = st.session_state
-    ss.setdefault("device_id", "dash-" + uuid.uuid4().hex)
+    if "device_id" not in ss:
+        ss.device_id, ss.browser_ua = browser_identity()
     ss.setdefault("token", None)
     ss.setdefault("refresh", None)
     ss.setdefault("user", None)
@@ -48,12 +59,28 @@ def http() -> httpx.Client:
     return httpx.Client(base_url=GATEWAY, verify=ssl.create_default_context(cafile=CA_FILE), timeout=30)
 
 
-def headers() -> dict:
+def headers(background: bool = False) -> dict:
     ss = S()
-    h = {"X-Device-Id": ss.device_id, "User-Agent": f"ZT-FinGuard-Dashboard/1.0 ({ss.device_id[:13]})"}
+    h = {"X-Device-Id": ss.device_id, "User-Agent": ss.browser_ua}
     if ss.token:
         h["Authorization"] = f"Bearer {ss.token}"
+    if background:
+        h["X-ZT-Background"] = "1"   # auto-refresh: not user activity (F19)
     return h
+
+
+REASONS = {
+    "device_revoked": "This device was revoked from your device list.",
+    "session_expired": "Your session expired.",
+    "token_used_from_different_device": "This session belongs to another device.",
+}
+
+
+def friendly(reason: str) -> str:
+    if reason.startswith("session_idle_timeout_"):
+        mins = reason.rsplit("_", 1)[-1].rstrip("m")
+        return f"You were signed out after **{mins} minute(s) of inactivity**. Please sign in again."
+    return REASONS.get(reason, f"Session ended by the gateway: **{reason}**")
 
 
 def end_session(reason: str) -> None:
@@ -68,25 +95,26 @@ def maybe_refresh() -> None:
     """Silently rotate the access token shortly before it expires."""
     ss = S()
     if ss.token and ss.refresh and ss.expires_at - time.time() < 60:
-        r = http().post("/api/auth/refresh", json={"refresh_token": ss.refresh}, headers=headers())
+        r = http().post("/api/auth/refresh", json={"refresh_token": ss.refresh}, headers=headers(True))
         if r.status_code == 200:
             d = r.json()
             ss.token, ss.refresh = d["access_token"], d["refresh_token"]
             ss.expires_at = time.time() + d["expires_in"]
         else:
-            end_session("Your session expired. Please sign in again.")
+            end_session(friendly(str(r.json().get("detail", "session_expired"))))
 
 
-def api(method: str, path: str, **kw) -> httpx.Response | None:
+def api(method: str, path: str, background: bool = False, **kw) -> httpx.Response | None:
     maybe_refresh()
+    if S().token is None and path not in ("/api/auth/login", "/api/auth/register"):
+        st.rerun()
     try:
-        r = http().request(method, path, headers=headers(), **kw)
+        r = http().request(method, path, headers=headers(background), **kw)
     except httpx.HTTPError as exc:
         st.error(f"Gateway unreachable: {exc.__class__.__name__}")
         return None
     if r.status_code == 401 and S().token:
-        detail = r.json().get("detail", "session ended")
-        end_session(f"Session ended by the gateway: **{detail}**")
+        end_session(friendly(str(r.json().get("detail", "session ended"))))
         st.rerun()
     return r
 
@@ -193,12 +221,19 @@ def sidebar() -> str:
     with st.sidebar:
         st.markdown("### 🛡️ ZT-FinGuard")
         st.markdown(f"**{ss.user}** · `{ss.role}`")
-        left = int(ss.expires_at - time.time())
-        st.caption(f"MFA verified · token rotates in {max(left, 0) // 60}m {max(left, 0) % 60:02d}s")
+        me = api("GET", "/api/me", background=True)
+        info = me.json() if me is not None and me.status_code == 200 else {}
+        trust = info.get("device_trust", "pending")
+        icon = {"trusted": "🟢 trusted device", "pending": "🟡 device pending approval"}.get(trust, trust)
+        st.caption(f"MFA verified · {icon}")
+        if ss.role == "customer" and trust != "trusted":
+            st.info("New device: you can view your account, but transfers stay blocked until you approve "
+                    "this device from a trusted one (Security settings).")
         pages = {
-            "customer": ["My account", "Send money"],
-            "teller": ["Account lookup"],
-            "admin": ["Security overview", "Access decisions", "Risk model", "Audit integrity"],
+            "customer": ["My account", "Send money", "Security settings"],
+            "teller": ["Account lookup", "Security settings"],
+            "admin": ["Security overview", "Access decisions", "Risk model", "Audit integrity",
+                      "Session & device policy", "Containers & quarantine", "Security settings"],
         }[ss.role]
         page = st.radio("Navigate", pages, label_visibility="collapsed")
         st.divider()
@@ -206,7 +241,7 @@ def sidebar() -> str:
             api("POST", "/api/auth/logout", json={"refresh_token": ss.refresh})
             end_session("Signed out. Your token was revoked on the server.")
             st.rerun()
-        st.caption(f"Device session `{ss.device_id[:13]}`")
+        st.caption(f"Device `{ss.device_id[:16]}`")
     return page
 
 
@@ -245,6 +280,10 @@ def send_money() -> None:
     ss = S()
     st.title("Send money")
     st.caption("Every transfer is risk-scored and checked against policy before any money moves.")
+    me = api("GET", "/api/me", background=True)
+    if me is not None and me.status_code == 200 and me.json().get("device_trust") != "trusted":
+        st.warning("This device is **not trusted yet**, so transfers from it will be refused. "
+                   "Approve it from a trusted device under *Security settings*.")
     with st.form("transfer"):
         to = st.text_input("To account", placeholder="ZT10000000xx")
         amt = st.number_input("Amount (₹)", min_value=1.0, step=100.0, value=1000.0)
@@ -346,7 +385,7 @@ def account_lookup() -> None:
 # ------------------------------------------------------------------- admin
 @st.fragment(run_every=5)
 def security_overview() -> None:
-    r = api("GET", "/api/admin/overview")
+    r = api("GET", "/api/admin/overview", background=True)
     if r is None or r.status_code != 200:
         st.error(detail(r) if r is not None else "unavailable")
         return
@@ -424,7 +463,7 @@ def access_decisions() -> None:
     params = {"limit": 200}
     if f and f != "all":
         params["decision"] = f
-    r = api("GET", "/api/admin/events", params=params)
+    r = api("GET", "/api/admin/events", background=True, params=params)
     if r is None or r.status_code != 200:
         st.error(detail(r) if r is not None else "unavailable")
         return
@@ -492,6 +531,196 @@ def audit_integrity() -> None:
                      f"(checked {v['checked']:,} entries)")
 
 
+
+# ------------------------------------------------- F19 / F21: self-service
+def security_settings() -> None:
+    st.title("Security settings")
+    tab_s, tab_d = st.tabs(["Session timeout", "My devices"])
+
+    with tab_s:
+        r = api("GET", "/api/me/session")
+        if r is None or r.status_code != 200:
+            st.error(detail(r) if r is not None else "unavailable")
+        else:
+            cfg = r.json()
+            st.markdown("Choose how long you can stay inactive before you are signed out automatically. "
+                        f"Your administrator allows at most **{cfg['admin_max_minutes']} minutes**.")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Your choice", f"{cfg['preferred_minutes']} min")
+            c2.metric("Effective timeout", f"{cfg['effective_minutes']} min")
+            c3.metric("Administrator maximum", f"{cfg['admin_max_minutes']} min")
+            with st.form("idle"):
+                choices = cfg["choices"] or [cfg["effective_minutes"]]
+                current = min(choices, key=lambda c: abs(c - cfg["effective_minutes"]))
+                pick = st.select_slider("Sign me out after this many minutes of inactivity",
+                                        options=choices, value=current)
+                if st.form_submit_button("Save", type="primary"):
+                    u = api("PUT", "/api/me/session", json={"idle_timeout_minutes": pick})
+                    if u is not None and u.status_code == 200:
+                        st.success(f"Saved. You will be signed out after {u.json()['effective_minutes']} "
+                                   "minute(s) without activity.")
+                    elif u is not None:
+                        st.error(detail(u))
+            st.caption("Automatic page refreshes do not count as activity. After a timeout you must sign in "
+                       "again with your password and authenticator code.")
+
+    with tab_d:
+        r = api("GET", "/api/me/devices")
+        if r is None or r.status_code != 200:
+            st.error(detail(r) if r is not None else "unavailable")
+            return
+        data = r.json()
+        devices = data["devices"]
+        me = next((d for d in devices if d["current"]), None)
+        st.markdown("Money can only be moved from a **trusted** device. A new device stays *pending* until you "
+                    "approve it from a device you already trust (with a fresh authenticator code).")
+        if me and me["status"] == "pending":
+            if data["has_trusted"]:
+                st.warning("This device is pending. Open *Security settings → My devices* on one of your "
+                           "trusted devices and approve it.")
+            else:
+                st.warning("You have no trusted device left. Verify this one with a fresh authenticator code.")
+                with st.form("selfverify"):
+                    code = st.text_input("Authenticator code", max_chars=6)
+                    if st.form_submit_button("Verify this device", type="primary"):
+                        v = api("POST", "/api/me/devices/verify-current", json={"totp": code.strip()})
+                        if v is not None and v.status_code == 200:
+                            st.success("This device is now trusted.")
+                            st.rerun()
+                        elif v is not None:
+                            st.error(detail(v))
+        icons = {"trusted": "🟢", "pending": "🟡", "revoked": "🔴"}
+        df = pd.DataFrame([{
+            "": icons.get(d["status"], ""), "device": d["label"] + ("  (this device)" if d["current"] else ""),
+            "status": d["status"], "last IP": d["last_ip"], "last seen": (d["last_seen"] or "")[:16].replace("T", " "),
+            "verified": d["verified_by"] or "-", "id": d["id"]} for d in devices])
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+        can_manage = bool(me and me["status"] == "trusted")
+        if not can_manage:
+            st.caption("Device approvals and revocations can only be made from a trusted device.")
+            return
+        others = [d for d in devices if not d["current"]]
+        if not others:
+            st.info("Only this device is registered. Sign in from another browser or phone to see it here.")
+            return
+        with st.form("devop"):
+            options = {f"{d['label']} · {d['status']} · #{d['id']}": d for d in others}
+            choice = st.selectbox("Device", list(options))
+            code = st.text_input("Fresh authenticator code (confirms it's you)", max_chars=6)
+            c1, c2, c3 = st.columns(3)
+            approve = c1.form_submit_button("Approve", type="primary")
+            revoke = c2.form_submit_button("Revoke")
+            forget = c3.form_submit_button("Remove revoked")
+        if approve or revoke or forget:
+            dev = options[choice]
+            if forget:
+                res = api("DELETE", f"/api/me/devices/{dev['id']}")
+            else:
+                op = "approve" if approve else "revoke"
+                res = api("POST", f"/api/me/devices/{dev['id']}/{op}", json={"totp": code.strip()})
+            if res is not None and res.status_code == 200:
+                st.success("Done.")
+                st.rerun()
+            elif res is not None:
+                st.error(detail(res))
+
+
+# ----------------------------------------------- F19 / F21: admin policy
+def session_device_policy() -> None:
+    st.title("Session & device policy")
+    r = api("GET", "/api/admin/session-policy")
+    if r is not None and r.status_code == 200:
+        pol = r.json()
+        st.subheader("Maximum inactivity timeout")
+        st.markdown(f"Customers choose their own timeout, up to this maximum. Currently **{pol['max_idle_minutes']} "
+                    f"minutes** (set by {pol['updated_by']}). Lowering it applies to every active session "
+                    "immediately.")
+        with st.form("maxidle"):
+            pick = st.select_slider("Maximum minutes of inactivity", options=pol["choices"],
+                                    value=min(pol["choices"], key=lambda c: abs(c - pol["max_idle_minutes"])))
+            if st.form_submit_button("Apply", type="primary"):
+                u = api("PUT", "/api/admin/session-policy", json={"max_idle_minutes": pick})
+                if u is not None and u.status_code == 200:
+                    st.success(f"Maximum set to {pick} minutes.")
+                elif u is not None:
+                    st.error(detail(u))
+    st.subheader("Device inventory")
+    d = api("GET", "/api/admin/devices")
+    if d is None or d.status_code != 200:
+        st.error(detail(d) if d is not None else "unavailable")
+        return
+    inv = d.json()
+    c = st.columns(3)
+    c[0].metric("Trusted", inv["counts"].get("trusted", 0))
+    c[1].metric("Pending approval", inv["counts"].get("pending", 0))
+    c[2].metric("Revoked", inv["counts"].get("revoked", 0))
+    if inv["devices"]:
+        df = pd.DataFrame(inv["devices"])
+        df["last_seen"] = df["last_seen"].str[:16].str.replace("T", " ")
+        st.dataframe(df[["username", "label", "status", "last_ip", "last_seen"]], hide_index=True,
+                     use_container_width=True)
+
+
+# --------------------------------------------- F20: container quarantine
+@st.fragment(run_every=5)
+def containers_quarantine() -> None:
+    st.title("Containers & quarantine")
+    st.caption("Falco alerts at or above the configured severity automatically cut the container off from "
+               "every network. It keeps running for forensics until an administrator releases it.")
+    r = api("GET", "/api/admin/quarantine", background=True)
+    if r is None or r.status_code != 200:
+        st.error("Responder unavailable: " + str(detail(r) if r is not None else "no response"))
+        return
+    q = r.json()
+    if not q["engine_connected"]:
+        st.warning("The responder cannot reach the container engine socket, so quarantine is unavailable "
+                   "(this is expected when running without containers).")
+    k = st.columns(3)
+    k[0].metric("Containers", len(q["containers"]))
+    k[1].metric("Quarantined", len(q["quarantined"]))
+    k[2].metric("Auto-quarantine at", q["min_priority"])
+    for svc, rec in q["quarantined"].items():
+        st.error(f"**{svc}** quarantined at {rec['at']} by {rec['actor']}: {rec['reason']}  \n"
+                 f"Disconnected from: {', '.join(rec['networks'])}")
+    if q["containers"]:
+        df = pd.DataFrame(q["containers"])
+        df["networks"] = df["networks"].apply(lambda n: ", ".join(x.split("_", 1)[-1] for x in n) or "none")
+        df["quarantined"] = df["quarantined"].map({True: "🔒 isolated", False: "-"})
+        st.dataframe(df[["service", "state", "status", "networks", "quarantined"]], hide_index=True,
+                     use_container_width=True)
+
+
+def quarantine_controls() -> None:
+    st.subheader("Manual response")
+    r = api("GET", "/api/admin/quarantine", background=True)
+    q = r.json() if r is not None and r.status_code == 200 else {"containers": [], "quarantined": {}}
+    services = [c["service"] for c in q["containers"] if c["service"] not in ("responder", "falco")]
+    c1, c2 = st.columns(2)
+    with c1, st.form("quarantine"):
+        svc = st.selectbox("Isolate a container", services or ["-"])
+        reason = st.text_input("Reason", value="suspicious behaviour reported")
+        if st.form_submit_button("Quarantine", type="primary") and services:
+            res = api("POST", "/api/admin/quarantine", json={"service": svc, "reason": reason})
+            if res is not None and res.status_code == 200:
+                st.success(f"{svc} isolated from its networks.")
+            elif res is not None:
+                st.error(detail(res))
+    with c2, st.form("release"):
+        isolated = list(q["quarantined"])
+        rel = st.selectbox("Release a container", isolated or ["-"])
+        if st.form_submit_button("Release") and isolated:
+            res = api("POST", f"/api/admin/quarantine/{rel}/release")
+            if res is not None and res.status_code == 200:
+                st.success(f"{rel} reconnected to: {', '.join(res.json()['networks'])}")
+            elif res is not None:
+                st.error(detail(res))
+
+
+def containers_page() -> None:
+    containers_quarantine()
+    quarantine_controls()
+
 # -------------------------------------------------------------------- main
 ss = S()
 if not ss.token:
@@ -506,4 +735,7 @@ else:
         "Access decisions": access_decisions,
         "Risk model": risk_model,
         "Audit integrity": audit_integrity,
+        "Security settings": security_settings,
+        "Session & device policy": session_device_policy,
+        "Containers & quarantine": containers_page,
     }[page]()

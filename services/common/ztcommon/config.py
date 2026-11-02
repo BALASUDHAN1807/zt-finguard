@@ -36,6 +36,7 @@ URLS = {
     "audit": os.environ.get("AUDIT_URL", "https://audit:8443"),
     "opa": os.environ.get("OPA_URL", "https://opa:8181"),
     "gateway": os.environ.get("GATEWAY_URL", "https://gateway:8443"),
+    "responder": os.environ.get("RESPONDER_URL", "https://responder:8443"),
 }
 
 PG_HOST = os.environ.get("PG_HOST", "postgres")
