@@ -5,7 +5,8 @@ cd "$(dirname "$0")/.."
 LOG=.devcontainer/deploy.log
 export COMPOSE_FILE=compose.yaml:.devcontainer/compose.codespaces.yaml
 echo "ZT-FinGuard: building and starting the stack (first start: 5-10 minutes). Log: $LOG"
-for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+docker info >/dev/null 2>&1 || { echo "Docker is not running in this codespace"; exit 1; }
 if ./deploy.sh > "$LOG" 2>&1; then
   tail -n 25 "$LOG"
   echo
