@@ -71,6 +71,15 @@ class Client:
         r = self.req("POST", "/api/auth/login", json={
             "username": username, "password": USERS[username]["password"],
             "totp": code or fresh_code(username)})
+        if r.status_code == 401 and code is None:
+            # the code collided with one an earlier test used (the server rejects
+            # replays for 2 minutes): wait for the next 30 s window, like a person would
+            time.sleep(30 - time.time() % 30 + 0.5)
+            totp = pyotp.TOTP(USERS[username]["totp_secret"])
+            _used.setdefault(username, set()).add(int(time.time() // 30))
+            r = self.req("POST", "/api/auth/login", json={
+                "username": username, "password": USERS[username]["password"],
+                "totp": totp.now()})
         if r.status_code == 200:
             self.last_login = r.json()
             self.token = r.json()["access_token"]
