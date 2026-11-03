@@ -69,6 +69,18 @@ Open **https://localhost:8501** (import `certs/ca.crt` into your browser to remo
 
 Each code works once. Add the TOTP secret from `make users` to Google Authenticator to sign in from your phone.
 
+## Live 24/7 on Oracle Cloud Always Free (one command, free forever)
+
+In the Oracle console's Cloud Shell (`>_`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BALASUDHAN1807/zt-finguard/main/deploy/oracle-cloudshell.sh | bash
+```
+
+It creates the network and a free ARM VM (4 CPU / 24 GB), deploys everything and prints the
+public `https://<ip>.sslip.io` address. Guide: **[docs/deploy-oracle.md](docs/deploy-oracle.md)**.
+Using Azure for Students instead: the same works in Azure Cloud Shell with `deploy/azure-cloudshell.sh`.
+
 ## Deploy to the cloud (Docker)
 
 On any Ubuntu 22.04/24.04 VM with 4 GB+ RAM (Azure for Students, Oracle Always Free, AWS t3.medium...):
