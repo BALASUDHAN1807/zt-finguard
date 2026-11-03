@@ -25,6 +25,7 @@ Runs unchanged on **Docker** or **rootless Podman**.
 | **Customer-controlled session timeout** | customer picks the inactivity timeout, admin sets the maximum, gateway expires idle sessions; re-sign-in required (auto-refresh never counts as activity) |
 | **Automatic container quarantine** | Falco alert ≥ Critical → `responder` disconnects the container from every network, alerts the admin; one-click release |
 | **Device trust verification** | first device trusted; new devices are *pending* (view only, no transfers) until approved from a trusted device + TOTP; revoke ends sessions |
+| **Mobile + SMS OTP sign-in** | mobile number at sign-up; sign in with a one-time SMS code (5 min, single use, 3 tries); new device / unusual sign-in also needs the authenticator code. Simulated SMS inbox for the demo ([docs/mobile-otp.md](docs/mobile-otp.md)) |
 
 ## Architecture
 
@@ -61,7 +62,7 @@ Open **https://localhost:8501** (import `certs/ca.crt` into your browser to remo
 
 | User | Role | Try |
 |---|---|---|
-| `alice` | customer | send ₹750 to `ZT1000000004` → allowed (low risk) |
+| `alice` (mobile 9876500001) | customer | sign in with mobile + SMS code; send ₹750 to `ZT1000000004` → allowed (low risk) |
 | `alice` | customer | send ₹20,000 to a new payee → **step-up** code required |
 | `bob` | customer | send his whole balance → **blocked + all sessions ended** |
 | `teller` | teller | look up any account; cannot transfer |
@@ -118,8 +119,8 @@ through the same checks as any API call.
 ## Tests
 
 ```bash
-make opa-test     # 14 policy unit tests
-make test         # 19 end-to-end tests through the gateway (stack must be running)
+make opa-test     # 19 policy unit tests
+make test         # 30 end-to-end tests through the gateway (stack must be running)
 make scan         # Trivy; fails on CRITICAL vulnerabilities or leaked secrets
 ```
 
@@ -127,7 +128,7 @@ The end-to-end suite checks, against the live system: TLS 1.3 only, MFA, TOTP re
 enumeration, device binding, logout revocation, `alg:none` forgery, refresh-token reuse detection,
 broken object-level authorisation, teller/admin separation of duties, low/medium/high-risk transfer
 paths, step-up token binding, session revocation after a high-risk transfer, audit chain integrity
-and account lockout.
+account lockout, SMS OTP sign-in (single use, 3 tries, step-up on new devices, no enumeration).
 
 ## Linux & container features used
 

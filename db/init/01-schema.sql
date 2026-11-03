@@ -18,6 +18,8 @@ CREATE TABLE users (
     last_login_ip   TEXT,
     -- F19: customer-chosen inactivity timeout (capped by the admin maximum)
     idle_timeout_minutes INT NOT NULL DEFAULT 15 CHECK (idle_timeout_minutes BETWEEN 1 AND 1440),
+    -- F22: registered mobile number for SMS one-time-password sign-in (10-digit Indian number)
+    mobile          TEXT UNIQUE CHECK (mobile ~ '^[6-9][0-9]{9}$'),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

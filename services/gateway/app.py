@@ -29,6 +29,7 @@ from ztcommon import clients, mtls, sessions, tokens
 REPORTS_DIR = os.environ.get("REPORTS_DIR", "/reports")
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", "240"))
 LOGIN_RATE_LIMIT = int(os.environ.get("LOGIN_RATE_LIMIT_PER_MIN", "10"))
+SIGN_IN_PATHS = {"/api/auth/login", "/api/auth/otp/request", "/api/auth/login/otp"}
 SERVICES = ["auth", "account", "transaction", "risk", "audit", "responder"]
 
 app = FastAPI(title="ZT-FinGuard gateway", docs_url=None, redoc_url=None, openapi_url=None)
@@ -73,7 +74,7 @@ async def zero_trust_edge(request: Request, call_next):
             if n == 1:
                 await r.expire(f"rl:{ip}:{window}", 70)
             limited = n > RATE_LIMIT
-            if path == "/api/auth/login" and request.method == "POST":
+            if path in SIGN_IN_PATHS and request.method == "POST":
                 m = await r.incr(f"rl:login:{ip}:{window}")
                 if m == 1:
                     await r.expire(f"rl:login:{ip}:{window}", 70)
@@ -167,9 +168,37 @@ async def login(body: LoginBody, request: Request, x_device_id: str | None = Hea
                          body=body.model_dump() | {"client": ctx(request, x_device_id)})
 
 
+class OtpRequestBody(BaseModel):
+    mobile: str = Field(max_length=20)
+
+
+@app.post("/api/auth/otp/request")
+async def otp_request(body: OtpRequestBody, request: Request, x_device_id: str | None = Header(None)):
+    return await forward("POST", "auth", "/otp/request",
+                         body=body.model_dump() | {"client": ctx(request, x_device_id)})
+
+
+class OtpLoginBody(BaseModel):
+    mobile: str = Field(max_length=20)
+    otp: str = Field(max_length=10)
+    totp: str | None = Field(default=None, max_length=10)
+
+
+@app.post("/api/auth/login/otp")
+async def login_otp(body: OtpLoginBody, request: Request, x_device_id: str | None = Header(None)):
+    return await forward("POST", "auth", "/login/otp",
+                         body=body.model_dump() | {"client": ctx(request, x_device_id)})
+
+
+@app.post("/api/demo/sms-inbox")
+async def sms_inbox(body: OtpRequestBody):
+    return await forward("POST", "auth", "/demo/sms-inbox", body=body.model_dump())
+
+
 class RegisterBody(BaseModel):
     username: str = Field(max_length=40)
     password: str = Field(max_length=200)
+    mobile: str = Field(max_length=20)
 
 
 @app.post("/api/auth/register")

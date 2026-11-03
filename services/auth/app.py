@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import re
@@ -32,6 +33,7 @@ import pyotp
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+import sms
 from passwords import DUMMY_HASH, hash_password, verify_password
 from ztcommon import clients, config, db, mtls, sessions, tokens
 
@@ -44,20 +46,51 @@ REVOKE_TTL = 24 * 3600
 MAX_FAILURES = 5
 LOCK_MINUTES = 15
 USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
+MOBILE_RE = re.compile(r"^[6-9][0-9]{9}$")          # Indian mobile numbers
+# Demo mobile numbers when seed_users.json predates F22 (same as scripts/gen-secrets.sh)
+DEMO_MOBILES = {"admin": "9000000001", "teller": "9000000002", "alice": "9876500001",
+                "bob": "9876500002", "victim_demo": "9876500003"}
+
+
+def seed_mobile(u: dict) -> str | None:
+    return u.get("mobile") or DEMO_MOBILES.get(u["username"])
+
+
+def normalize_mobile(raw: str) -> str | None:
+    """'+91 98765-00001' / '098765 00001' / '9876500001' -> '9876500001' (None if invalid)."""
+    d = re.sub(r"\D", "", raw or "")
+    if len(d) == 12 and d.startswith("91"):
+        d = d[2:]
+    elif len(d) == 11 and d.startswith("0"):
+        d = d[1:]
+    return d if MOBILE_RE.fullmatch(d) else None
+
+
+def mask_mobile(m: str) -> str:
+    return f"{m[:2]}xxxxxx{m[-2:]}"
 
 
 # ------------------------------------------------------------------ startup
 async def seed_users() -> None:
     p = await db.pool()
     async with p.connection() as conn:
+        users = json.load(open(SEED_FILE))["users"]
         cur = await conn.execute("SELECT count(*) AS n FROM users")
         if (await cur.fetchone())["n"] > 0:
+            # F22 on an existing database: give the demo users their mobile numbers
+            try:
+                for u in users:
+                    await conn.execute("UPDATE users SET mobile = %s WHERE username = %s AND mobile IS NULL",
+                                       (seed_mobile(u), u["username"]))
+                await conn.commit()
+            except Exception as exc:  # noqa: BLE001 - column added by db/migrations (deploy.sh)
+                await conn.rollback()
+                log.warning("mobile numbers not seeded yet (%r)", exc)
             return
-        users = json.load(open(SEED_FILE))["users"]
         for u in users:
             await conn.execute(
-                "INSERT INTO users (username, password_hash, totp_secret, role) VALUES (%s,%s,%s,%s)",
-                (u["username"], hash_password(u["password"]), u["totp_secret"], u["role"]))
+                "INSERT INTO users (username, password_hash, totp_secret, role, mobile) VALUES (%s,%s,%s,%s,%s)",
+                (u["username"], hash_password(u["password"]), u["totp_secret"], u["role"], seed_mobile(u)))
         await conn.commit()
         log.info("seeded %d demo users", len(users))
 
@@ -106,13 +139,13 @@ gateway_only = Depends(mtls.require_caller("gateway"))
 
 
 # ------------------------------------------------------------------- tokens
-def issue_access(user: dict, dfp: str, sid: str) -> tuple[str, dict]:
+def issue_access(user: dict, dfp: str, sid: str, amr: list[str] | None = None) -> tuple[str, dict]:
     now_ms = int(time.time() * 1000)
     now = now_ms // 1000
     claims = {
         "iss": tokens.ISSUER, "aud": tokens.AUDIENCE, "typ": "access", "iat_ms": now_ms,
         "sub": str(user["id"]), "usr": user["username"], "role": user["role"],
-        "mfa": True, "amr": ["pwd", "otp"], "dfp": dfp, "sid": sid,
+        "mfa": True, "amr": amr or ["pwd", "otp"], "dfp": dfp, "sid": sid,
         "jti": uuid.uuid4().hex, "iat": now, "exp": now + tokens.ACCESS_TTL_SECONDS,
     }
     return jwt.encode(claims, PRIVATE_KEY, algorithm="RS256"), claims
@@ -229,6 +262,81 @@ class LoginIn(BaseModel):
 INVALID = HTTPException(401, "invalid credentials or account locked")
 
 
+async def assess_login(user: dict, ctx: ClientCtx, dfp: str, actor: str) -> tuple[bool, str | None, dict]:
+    """Device check (F21: revoked devices cannot sign in) + login risk score (fail closed)."""
+    # device trust (F21): a revoked device cannot sign in again
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            "SELECT status FROM known_devices WHERE user_id = %s AND fingerprint = %s", (user["id"], dfp))
+        existing = await cur.fetchone()
+    known = existing is not None
+    if existing and existing["status"] == "revoked":
+        clients.audit(actor=actor, action="auth.login", resource="device", decision="deny",
+                      reason="device_revoked", details={"ip": ctx.ip})
+        raise HTTPException(403, "this device was revoked - remove it from 'My devices' on a trusted device first")
+    try:
+        rr = await mtls.client().post(mtls.url("risk", "/score/login"), json={
+            "new_device": not known,
+            "recent_failures": user["failed_attempts"],
+            "hour": datetime.now().hour,
+            "ip_changed": bool(user["last_login_ip"]) and user["last_login_ip"] != ctx.ip,
+        })
+        rr.raise_for_status()
+        risk = rr.json()
+    except Exception:  # noqa: BLE001
+        clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
+                      reason="risk_engine_unavailable")
+        raise HTTPException(503, "risk engine unavailable - sign-in refused (fail closed)")
+
+    return known, (existing["status"] if existing else None), risk
+
+
+async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known: bool, risk: dict,
+                         method: str, amr: list[str]) -> dict:
+    """Shared by password and SMS-OTP sign-in: block high risk, register the device, issue tokens."""
+    p = await db.pool()
+    async with p.connection() as conn:
+        await conn.execute(
+            "INSERT INTO risk_scores (subject, kind, score, level, reasons) VALUES (%s,'login',%s,%s,%s)",
+            (actor, risk["score"], risk["level"], json.dumps(risk["reasons"])))
+        if risk["level"] == "high":
+            await conn.commit()
+            clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
+                          reason="login_risk_high", risk=risk["score"],
+                          details={"ip": ctx.ip, "reasons": risk["reasons"]})
+            raise HTTPException(403, {"error": "sign-in blocked: risk too high", "risk": risk})
+        await conn.execute(
+            "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_ip = %s WHERE id = %s",
+            (ctx.ip, user["id"]))
+        device = await register_device(conn, user, dfp, ctx)
+        await conn.commit()
+
+    r = clients.redis()
+    sid = uuid.uuid4().hex
+    await publish_device(user["id"], dfp, device["status"])
+    await r.set(f"idle:{user['id']}", user["idle_timeout_minutes"], ex=sessions.SESSION_TTL)
+    await sessions.start(r, sid)
+    _, cap, effective = await sessions.limits(r, str(user["id"]))
+    access, claims = issue_access(user, dfp, sid, amr)
+    refresh = await issue_refresh(user, dfp, family=sid)
+    clients.audit(actor=actor, action="auth.login", resource="session", decision="allow",
+                  reason=method, risk=risk["score"],
+                  details={"ip": ctx.ip, "new_device": not known, "device_status": device["status"],
+                           "jti": claims["jti"], "reasons": risk["reasons"]})
+    if device.get("new") and device["status"] == "pending":
+        clients.audit(actor=actor, action="device.new_pending", resource=device["label"], decision="alert",
+                      reason="new_device_needs_verification", details={"ip": ctx.ip})
+    return {
+        "access_token": access, "refresh_token": refresh,
+        "expires_in": tokens.ACCESS_TTL_SECONDS, "token_type": "Bearer",
+        "username": user["username"], "role": user["role"],
+        "login_risk": risk,
+        "device": {"id": device["id"], "status": device["status"], "label": device["label"]},
+        "session": {"idle_timeout_minutes": effective, "admin_max_minutes": cap},
+    }
+
+
 @app.post("/login", dependencies=[gateway_only])
 async def login(body: LoginIn):
     ctx = body.client
@@ -258,70 +366,148 @@ async def login(body: LoginIn):
                       reason="bad_or_replayed_totp", details={"ip": ctx.ip})
         raise INVALID
 
-    # ---- device trust (F21): a revoked device cannot sign in again
+    known, _status, risk = await assess_login(user, ctx, dfp, actor)
+    return await complete_login(user, ctx, dfp, actor, known, risk, "password+totp", ["pwd", "otp"])
+
+
+# ------------------------------------------------- F22: mobile + SMS OTP sign-in
+OTP_TTL = 300            # a code is valid for 5 minutes
+OTP_MAX_TRIES = 3        # wrong guesses before the code is destroyed
+OTP_SENDS_PER_10MIN = 3  # SMS sent per number per 10 minutes
+OTP_RESEND_AFTER = 30    # seconds between two SMS to the same number
+
+
+async def get_user_by_mobile(mobile: str) -> dict | None:
     p = await db.pool()
     async with p.connection() as conn:
-        cur = await conn.execute(
-            "SELECT status FROM known_devices WHERE user_id = %s AND fingerprint = %s", (user["id"], dfp))
-        existing = await cur.fetchone()
-    known = existing is not None
-    if existing and existing["status"] == "revoked":
-        clients.audit(actor=actor, action="auth.login", resource="device", decision="deny",
-                      reason="device_revoked", details={"ip": ctx.ip})
-        raise HTTPException(403, "this device was revoked - remove it from 'My devices' on a trusted device first")
-    try:
-        rr = await mtls.client().post(mtls.url("risk", "/score/login"), json={
-            "new_device": not known,
-            "recent_failures": user["failed_attempts"],
-            "hour": datetime.now().hour,
-            "ip_changed": bool(user["last_login_ip"]) and user["last_login_ip"] != ctx.ip,
-        })
-        rr.raise_for_status()
-        risk = rr.json()
-    except Exception:  # noqa: BLE001
-        clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
-                      reason="risk_engine_unavailable")
-        raise HTTPException(503, "risk engine unavailable - sign-in refused (fail closed)")
+        cur = await conn.execute("SELECT * FROM users WHERE mobile = %s", (mobile,))
+        return await cur.fetchone()
 
-    async with p.connection() as conn:
-        await conn.execute(
-            "INSERT INTO risk_scores (subject, kind, score, level, reasons) VALUES (%s,'login',%s,%s,%s)",
-            (actor, risk["score"], risk["level"], json.dumps(risk["reasons"])))
-        if risk["level"] == "high":
-            await conn.commit()
-            clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
-                          reason="login_risk_high", risk=risk["score"],
-                          details={"ip": ctx.ip, "reasons": risk["reasons"]})
-            raise HTTPException(403, {"error": "sign-in blocked: risk too high", "risk": risk})
-        await conn.execute(
-            "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_ip = %s WHERE id = %s",
-            (ctx.ip, user["id"]))
-        device = await register_device(conn, user, dfp, ctx)
-        await conn.commit()
+
+def otp_digest(user_id: int, code: str, salt: str) -> str:
+    return hashlib.sha256(f"{user_id}:{salt}:{code}".encode()).hexdigest()
+
+
+class OtpRequestIn(BaseModel):
+    mobile: str = Field(max_length=20)
+    client: ClientCtx
+
+
+@app.post("/otp/request", dependencies=[gateway_only])
+async def otp_request(body: OtpRequestIn):
+    """Send a 6-digit code by SMS. The answer is the same whether or not the number is
+    registered, so the endpoint cannot be used to find out who banks here."""
+    mobile = normalize_mobile(body.mobile)
+    if mobile is None:
+        raise HTTPException(400, "enter a valid 10-digit Indian mobile number")
+    generic = {"sent": True, "to": mask_mobile(mobile), "expires_in": OTP_TTL, "resend_after": OTP_RESEND_AFTER}
+    user = await get_user_by_mobile(mobile)
+    if user is None:
+        clients.audit(actor=mask_mobile(mobile), action="auth.otp_request", resource="sms", decision="deny",
+                      reason="unknown_mobile", details={"ip": body.client.ip})
+        return generic
+    actor = user["username"]
+    r = clients.redis()
+    if not await r.set(f"otpcd:{user['id']}", 1, nx=True, ex=OTP_RESEND_AFTER):
+        raise HTTPException(429, f"wait {OTP_RESEND_AFTER} seconds before asking for another code")
+    sent = await r.incr(f"otprl:{user['id']}")
+    if sent == 1:
+        await r.expire(f"otprl:{user['id']}", 600)
+    if sent > OTP_SENDS_PER_10MIN:
+        clients.audit(actor=actor, action="auth.otp_request", resource="sms", decision="deny",
+                      reason="otp_rate_limited", details={"ip": body.client.ip})
+        raise HTTPException(429, "too many codes requested - try again in 10 minutes")
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    salt = secrets.token_hex(8)
+    await r.delete(f"otp:{user['id']}")
+    await r.hset(f"otp:{user['id']}", mapping={"h": otp_digest(user["id"], code, salt), "salt": salt, "tries": 0})
+    await r.expire(f"otp:{user['id']}", OTP_TTL)
+    try:
+        await sms.send(r, mobile, f"{code} is your ZT-FinGuard sign-in code. Valid 5 minutes. "
+                                  "Never share it - the bank will never ask for it.")
+    except sms.SmsUnavailable as exc:
+        await r.delete(f"otp:{user['id']}")
+        raise HTTPException(503, f"SMS unavailable - sign-in refused (fail closed): {exc}")
+    clients.audit(actor=actor, action="auth.otp_request", resource="sms", decision="info",
+                  reason=f"otp_sent_{sms.PROVIDER}", details={"ip": body.client.ip, "to": mask_mobile(mobile)})
+    return generic
+
+
+class OtpLoginIn(BaseModel):
+    mobile: str = Field(max_length=20)
+    otp: str = Field(max_length=10)
+    totp: str | None = Field(default=None, max_length=10)
+    client: ClientCtx
+
+
+@app.post("/login/otp", dependencies=[gateway_only])
+async def login_otp(body: OtpLoginIn):
+    """Mobile + SMS code. From a trusted device with no risk signals that is enough
+    (something you have: the phone + the bound device). A new or pending device, a new
+    network, failed attempts or an odd hour also require the authenticator code (step-up)."""
+    ctx = body.client
+    mobile = normalize_mobile(body.mobile)
+    bad = HTTPException(401, "wrong or expired code")
+    if mobile is None:
+        raise bad
+    user = await get_user_by_mobile(mobile)
+    if user is None:
+        raise bad
+    actor = user["username"]
+    if user["locked_until"] and user["locked_until"] > datetime.now(timezone.utc):
+        clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
+                      reason="account_locked", details={"ip": ctx.ip, "method": "sms_otp"})
+        raise INVALID
 
     r = clients.redis()
-    sid = uuid.uuid4().hex
-    await publish_device(user["id"], dfp, device["status"])
-    await r.set(f"idle:{user['id']}", user["idle_timeout_minutes"], ex=sessions.SESSION_TTL)
-    await sessions.start(r, sid)
-    _, cap, effective = await sessions.limits(r, str(user["id"]))
-    access, claims = issue_access(user, dfp, sid)
-    refresh = await issue_refresh(user, dfp, family=sid)
-    clients.audit(actor=actor, action="auth.login", resource="session", decision="allow",
-                  reason="password+totp", risk=risk["score"],
-                  details={"ip": ctx.ip, "new_device": not known, "device_status": device["status"],
-                           "jti": claims["jti"], "reasons": risk["reasons"]})
-    if device.get("new") and device["status"] == "pending":
-        clients.audit(actor=actor, action="device.new_pending", resource=device["label"], decision="alert",
-                      reason="new_device_needs_verification", details={"ip": ctx.ip})
-    return {
-        "access_token": access, "refresh_token": refresh,
-        "expires_in": tokens.ACCESS_TTL_SECONDS, "token_type": "Bearer",
-        "username": user["username"], "role": user["role"],
-        "login_risk": risk,
-        "device": {"id": device["id"], "status": device["status"], "label": device["label"]},
-        "session": {"idle_timeout_minutes": effective, "admin_max_minutes": cap},
-    }
+    key = f"otp:{user['id']}"
+    rec = await r.hgetall(key)
+    if not rec:
+        raise bad
+    if not hmac.compare_digest(rec["h"], otp_digest(user["id"], body.otp.strip(), rec["salt"])):
+        tries = await r.hincrby(key, "tries", 1)
+        if tries >= OTP_MAX_TRIES:
+            await r.delete(key)
+        await record_failure(user)
+        clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
+                      reason="bad_sms_otp", details={"ip": ctx.ip, "tries": tries})
+        raise HTTPException(401, "wrong code - request a new one" if tries >= OTP_MAX_TRIES
+                            else f"wrong code ({OTP_MAX_TRIES - tries} tries left)")
+
+    dfp = tokens.device_fingerprint(ctx.device_id, ctx.user_agent)
+    known, status, risk = await assess_login(user, ctx, dfp, actor)
+    step_up = bool(risk["reasons"]) or status != "trusted"
+    if step_up and not body.totp:
+        clients.audit(actor=actor, action="auth.login", resource="session", decision="step_up",
+                      reason="sms_otp_needs_authenticator", risk=risk["score"],
+                      details={"ip": ctx.ip, "reasons": risk["reasons"], "device_status": status or "new"})
+        raise HTTPException(401, {"error": "authenticator code required for this sign-in",
+                                  "step_up": "totp", "risk": risk})
+    if step_up and not await totp_ok(user, body.totp):
+        await record_failure(user)
+        clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
+                      reason="bad_or_replayed_totp", details={"ip": ctx.ip, "method": "sms_otp"})
+        raise HTTPException(401, {"error": "wrong authenticator code", "step_up": "totp", "risk": risk})
+    if await r.delete(key) != 1:       # the code works exactly once
+        raise bad
+    method, amr = ("sms_otp+totp", ["sms", "otp"]) if step_up else ("sms_otp+trusted_device", ["sms", "dev"])
+    return await complete_login(user, ctx, dfp, actor, known, risk, method, amr)
+
+
+class SmsInboxIn(BaseModel):
+    mobile: str = Field(max_length=20)
+
+
+@app.post("/demo/sms-inbox", dependencies=[gateway_only])
+async def sms_inbox(body: SmsInboxIn):
+    """Simulated phone for the demo. Disabled (404) as soon as a real SMS provider is set."""
+    if sms.PROVIDER != "simulated":
+        raise HTTPException(404, "not available")
+    mobile = normalize_mobile(body.mobile)
+    if mobile is None:
+        raise HTTPException(400, "enter a valid 10-digit Indian mobile number")
+    return {"mobile": mask_mobile(mobile), "provider": sms.PROVIDER,
+            "messages": await sms.inbox(clients.redis(), mobile)}
 
 
 # ------------------------------------------------------------------ refresh
@@ -449,29 +635,37 @@ async def revoke_user(body: RevokeIn, caller: str = Depends(mtls.require_caller(
 class RegisterIn(BaseModel):
     username: str
     password: str = Field(min_length=10, max_length=200)
+    mobile: str = Field(max_length=20)
 
 
 @app.post("/register", dependencies=[gateway_only])
 async def register(body: RegisterIn):
     if not USERNAME_RE.fullmatch(body.username):
         raise HTTPException(400, "username must be 3-20 chars: a-z, 0-9, _")
+    mobile = normalize_mobile(body.mobile)
+    if mobile is None:
+        raise HTTPException(400, "enter a valid 10-digit Indian mobile number")
     secret = pyotp.random_base32()
     p = await db.pool()
     async with p.connection() as conn:
+        cur = await conn.execute("SELECT 1 FROM users WHERE mobile = %s", (mobile,))
+        if await cur.fetchone():
+            raise HTTPException(409, "this mobile number is already registered")
         cur = await conn.execute(
-            """INSERT INTO users (username, password_hash, totp_secret, role)
-               VALUES (%s,%s,%s,'customer') ON CONFLICT (username) DO NOTHING RETURNING id""",
-            (body.username, hash_password(body.password), secret))
+            """INSERT INTO users (username, password_hash, totp_secret, role, mobile)
+               VALUES (%s,%s,%s,'customer',%s) ON CONFLICT DO NOTHING RETURNING id""",
+            (body.username, hash_password(body.password), secret, mobile))
         row = await cur.fetchone()
         await conn.commit()
     if row is None:
-        raise HTTPException(409, "username not available")
+        raise HTTPException(409, "username or mobile number not available")
     r = await mtls.client().post(mtls.url("account", "/internal/open"),
                                  json={"user_id": row["id"], "username": body.username})
     r.raise_for_status()
     clients.audit(actor=body.username, action="auth.register", resource="user", decision="allow")
     return {
         "username": body.username,
+        "mobile": mask_mobile(mobile),
         "totp_secret": secret,
         "otpauth_uri": pyotp.TOTP(secret).provisioning_uri(name=body.username, issuer_name="ZT-FinGuard"),
         "account": r.json(),

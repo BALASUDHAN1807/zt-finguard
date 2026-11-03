@@ -51,6 +51,10 @@ def S():
     ss.setdefault("notice", None)
     ss.setdefault("pending_stepup", None)
     ss.setdefault("last_transfer", None)
+    ss.setdefault("otp_mobile", "")       # F22 sign-in in progress
+    ss.setdefault("otp_sent", False)
+    ss.setdefault("otp_need_totp", False)
+    ss.setdefault("otp_msg", None)
     return ss
 
 
@@ -104,9 +108,12 @@ def maybe_refresh() -> None:
             end_session(friendly(str(r.json().get("detail", "session_expired"))))
 
 
+PUBLIC_PATHS = ("/api/auth/login", "/api/auth/register", "/api/auth/otp/request", "/api/auth/login/otp")
+
+
 def api(method: str, path: str, background: bool = False, **kw) -> httpx.Response | None:
     maybe_refresh()
-    if S().token is None and path not in ("/api/auth/login", "/api/auth/register"):
+    if S().token is None and path not in PUBLIC_PATHS:
         st.rerun()
     try:
         r = http().request(method, path, headers=headers(background), **kw)
@@ -156,6 +163,120 @@ def show_reasons(risk: dict) -> None:
         st.caption("No risk factors found.")
 
 
+# ------------------------------------------------------- sign-in (F22 + MFA)
+def signed_in(d: dict) -> None:
+    ss = S()
+    ss.token, ss.refresh = d["access_token"], d["refresh_token"]
+    ss.user, ss.role = d["username"], d["role"]
+    ss.expires_at = time.time() + d["expires_in"]
+    ss.notice = None
+    ss.last_transfer = None
+    ss.otp_sent, ss.otp_need_totp, ss.otp_msg = False, False, None
+    st.rerun()
+
+
+def show_error(r: httpx.Response) -> None:
+    d = detail(r)
+    st.error(d["error"] if isinstance(d, dict) and "error" in d else d)
+    if isinstance(d, dict) and "risk" in d:
+        show_reasons(d["risk"])
+
+
+def password_signin() -> None:
+    with st.form("login"):
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        c = st.text_input("Authenticator code", max_chars=6, placeholder="6 digits")
+        go = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+    if go:
+        r = api("POST", "/api/auth/login", json={"username": u.strip(), "password": p, "totp": c.strip()})
+        if r is not None and r.status_code == 200:
+            signed_in(r.json())
+        elif r is not None:
+            show_error(r)
+
+
+def send_otp(mobile: str) -> bool:
+    r = api("POST", "/api/auth/otp/request", json={"mobile": mobile})
+    if r is not None and r.status_code == 200:
+        ss = S()
+        ss.otp_mobile, ss.otp_sent, ss.otp_need_totp = mobile, True, False
+        ss.otp_msg = ("info", f"Code sent to {r.json()['to']}. It is valid for 5 minutes and works once.")
+        return True
+    if r is not None:
+        show_error(r)
+    return False
+
+
+def otp_signin() -> None:
+    ss = S()
+    if not ss.otp_sent:
+        with st.form("otp_request"):
+            m = st.text_input("Mobile number", placeholder="10-digit mobile number")
+            go = st.form_submit_button("Send code", type="primary", use_container_width=True)
+        if go and send_otp(m.strip()):
+            st.rerun()
+        return
+    if ss.otp_msg:
+        kind, text = ss.otp_msg
+        getattr(st, kind)(text)
+    with st.form("otp_login"):
+        code = st.text_input("SMS code", max_chars=6, placeholder="6 digits from the SMS")
+        totp = None
+        if ss.otp_need_totp:
+            totp = st.text_input("Authenticator code", max_chars=6, placeholder="6 digits from your app",
+                                 help="Asked when the sign-in looks unusual: new device, new network, "
+                                      "failed attempts or an odd hour")
+        go = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+    if go:
+        r = api("POST", "/api/auth/login/otp",
+                json={"mobile": ss.otp_mobile, "otp": code.strip(), "totp": (totp or "").strip() or None})
+        if r is not None and r.status_code == 200:
+            signed_in(r.json())
+        elif r is not None:
+            d = detail(r)
+            if isinstance(d, dict) and d.get("step_up") == "totp" and not ss.otp_need_totp:
+                ss.otp_need_totp = True
+                reasons = ", ".join(x["text"] for x in d.get("risk", {}).get("reasons", [])) or "unverified device"
+                ss.otp_msg = ("warning", f"Extra check needed ({reasons}). Enter the SMS code again "
+                                         "and the code from your authenticator app.")
+                st.rerun()
+            show_error(r)
+    c1, c2 = st.columns(2)
+    if c1.button("Resend code", use_container_width=True) and send_otp(ss.otp_mobile):
+        st.rerun()
+    if c2.button("Change number", use_container_width=True):
+        ss.otp_sent, ss.otp_need_totp, ss.otp_msg = False, False, None
+        st.rerun()
+    sms_inbox(ss.otp_mobile)
+
+
+def sms_inbox(mobile: str) -> None:
+    """Simulated phone (SMS_PROVIDER=simulated). Hidden when a real SMS gateway is configured."""
+    try:
+        r = http().post("/api/demo/sms-inbox", json={"mobile": mobile}, headers=headers(True))
+    except httpx.HTTPError:
+        return
+    if r.status_code != 200:
+        return
+    with st.expander(f"📱 Simulated phone {r.json()['mobile']} - SMS inbox", expanded=True):
+        st.caption("Demo only: stands in for a real SMS gateway (Twilio / MSG91), which needs a paid account.")
+        sms_messages(mobile)
+
+
+@st.fragment(run_every=3)
+def sms_messages(mobile: str) -> None:
+    try:
+        r = http().post("/api/demo/sms-inbox", json={"mobile": mobile}, headers=headers(True))
+        msgs = r.json().get("messages", []) if r.status_code == 200 else []
+    except (httpx.HTTPError, ValueError):
+        msgs = []
+    if not msgs:
+        st.write("No messages yet.")
+    for m in msgs[:3]:
+        st.markdown(f"**{m['from']}** · {m['at'][11:19]} UTC  \n{m['text']}")
+
+
 # -------------------------------------------------------------------- login
 def login_page() -> None:
     ss = S()
@@ -165,7 +286,7 @@ def login_page() -> None:
         st.markdown("#### Zero Trust banking demo\nEvery request is authenticated, authorised by policy and risk-scored. "
                     "Nothing is trusted because of where it comes from.")
         st.markdown("""
-- Password **+** authenticator code (TOTP) on every sign-in
+- Sign in with your **mobile number + SMS code**; unusual sign-ins also need the authenticator code
 - 15-minute tokens, locked to this browser session
 - Policy check (OPA) and fraud-risk score on every transfer
 - Service-to-service traffic over mutual TLS
@@ -178,36 +299,26 @@ def login_page() -> None:
             ss.last_transfer = None
         tab_in, tab_reg = st.tabs(["Sign in", "Open an account"])
         with tab_in:
-            with st.form("login"):
-                u = st.text_input("Username")
-                p = st.text_input("Password", type="password")
-                c = st.text_input("Authenticator code", max_chars=6, placeholder="6 digits")
-                go = st.form_submit_button("Sign in", type="primary", use_container_width=True)
-            if go:
-                r = api("POST", "/api/auth/login", json={"username": u.strip(), "password": p, "totp": c.strip()})
-                if r is not None and r.status_code == 200:
-                    d = r.json()
-                    ss.token, ss.refresh = d["access_token"], d["refresh_token"]
-                    ss.user, ss.role = d["username"], d["role"]
-                    ss.expires_at = time.time() + d["expires_in"]
-                    ss.notice = None
-                    ss.last_transfer = None
-                    st.rerun()
-                elif r is not None:
-                    d = detail(r)
-                    st.error(d["error"] if isinstance(d, dict) and "error" in d else d)
-                    if isinstance(d, dict) and "risk" in d:
-                        show_reasons(d["risk"])
+            how = st.radio("Sign in with", ["Mobile number + SMS code", "Username + password"],
+                           horizontal=True, label_visibility="collapsed")
+            if how.startswith("Mobile"):
+                otp_signin()
+            else:
+                password_signin()
         with tab_reg:
             with st.form("register"):
                 nu = st.text_input("Choose a username", help="3-20 characters: a-z, 0-9, _")
+                nm = st.text_input("Mobile number", placeholder="10-digit mobile number",
+                                   help="Used to sign in with a one-time SMS code")
                 np_ = st.text_input("Choose a password", type="password", help="At least 10 characters")
                 reg = st.form_submit_button("Create account", use_container_width=True)
             if reg:
-                r = api("POST", "/api/auth/register", json={"username": nu.strip(), "password": np_})
+                r = api("POST", "/api/auth/register", json={"username": nu.strip(), "password": np_,
+                                                         "mobile": nm.strip()})
                 if r is not None and r.status_code == 200:
                     d = r.json()
-                    st.success(f"Account **{d['account']['account_no']}** opened for {d['username']}.")
+                    st.success(f"Account **{d['account']['account_no']}** opened for {d['username']} "
+                               f"(mobile {d['mobile']}).")
                     st.markdown("Add this key to Google Authenticator / Authy (enter manually), then sign in:")
                     st.code(d["totp_secret"])
                     st.caption(d["otpauth_uri"])

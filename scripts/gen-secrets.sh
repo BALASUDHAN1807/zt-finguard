@@ -26,11 +26,11 @@ def totp_secret():
 def pw():
     return "Zt-" + secrets.token_urlsafe(9)
 users = [
-    {"username": "admin",       "role": "admin"},
-    {"username": "teller",      "role": "teller"},
-    {"username": "alice",       "role": "customer"},
-    {"username": "bob",         "role": "customer"},
-    {"username": "victim_demo", "role": "customer"},
+    {"username": "admin",       "role": "admin", "mobile": "9000000001"},
+    {"username": "teller",      "role": "teller", "mobile": "9000000002"},
+    {"username": "alice",       "role": "customer", "mobile": "9876500001"},
+    {"username": "bob",         "role": "customer", "mobile": "9876500002"},
+    {"username": "victim_demo", "role": "customer", "mobile": "9876500003"},
 ]
 for u in users:
     u["password"] = pw()

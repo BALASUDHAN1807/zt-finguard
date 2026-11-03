@@ -8,6 +8,8 @@ client would. Uses the generated demo users in secrets/seed_users.json.
 from __future__ import annotations
 
 import base64
+import random
+import re
 import json
 import os
 import socket
@@ -26,6 +28,11 @@ CA_FILE = os.environ.get("CA_FILE", os.path.join(ROOT, "certs", "ca.crt"))
 CA = ssl.create_default_context(cafile=CA_FILE)
 USERS = {u["username"]: u for u in json.load(open(os.path.join(ROOT, "secrets", "seed_users.json")))["users"]}
 _used: dict[str, set[int]] = {}
+
+
+def new_mobile() -> str:
+    """A random, valid Indian mobile number for users created by the tests."""
+    return f"7{random.randint(0, 999_999_999):09d}"
 
 
 def fresh_code(username: str) -> str:
@@ -232,7 +239,8 @@ def test_small_transfer_to_known_pattern_is_allowed():
 
 def new_payee_account() -> str:
     name = "payee_" + uuid.uuid4().hex[:8]
-    r = Client().req("POST", "/api/auth/register", json={"username": name, "password": "Long-enough-pw-1"})
+    r = Client().req("POST", "/api/auth/register", json={"username": name, "password": "Long-enough-pw-1",
+                                                           "mobile": new_mobile()})
     assert r.status_code == 200, r.text
     return r.json()["account"]["account_no"]
 
@@ -278,7 +286,8 @@ def test_audit_chain_verifies():
 def test_lockout_after_five_failures():
     name = "lock_" + uuid.uuid4().hex[:8]
     c = Client()
-    reg = c.req("POST", "/api/auth/register", json={"username": name, "password": "Long-enough-pw-1"})
+    reg = c.req("POST", "/api/auth/register", json={"username": name, "password": "Long-enough-pw-1",
+                                                           "mobile": new_mobile()})
     assert reg.status_code == 200, reg.text
     secret = reg.json()["totp_secret"]
     for _ in range(5):
@@ -332,7 +341,8 @@ def test_revoking_a_device_ends_its_session_and_blocks_sign_in():
 # ----------------------------------------- F19: customer session timeout
 def _new_user() -> tuple[str, str]:
     name = "idle_" + uuid.uuid4().hex[:8]
-    r = Client().req("POST", "/api/auth/register", json={"username": name, "password": "Long-enough-pw-1"})
+    r = Client().req("POST", "/api/auth/register", json={"username": name, "password": "Long-enough-pw-1",
+                                                           "mobile": new_mobile()})
     assert r.status_code == 200, r.text
     USERS[name] = {"password": "Long-enough-pw-1", "totp_secret": r.json()["totp_secret"]}
     return name, r.json()["totp_secret"]
@@ -365,3 +375,95 @@ def test_inactive_session_expires_and_background_polling_does_not_keep_it_alive(
     # the refresh token cannot revive it - the user must sign in again
     assert c.req("POST", "/api/auth/refresh", json={"refresh_token": c.refresh}).status_code == 401
     assert Client(device=c.device).login(name).status_code == 200
+
+
+# ------------------------------------------- F22: mobile number + SMS OTP
+def sms_code(c: Client, mobile: str) -> str:
+    msgs = c.req("POST", "/api/demo/sms-inbox", json={"mobile": mobile}).json()["messages"]
+    assert msgs, "no SMS received"
+    return re.match(r"(\d{6}) ", msgs[0]["text"]).group(1)
+
+
+def otp_user() -> tuple[str, str, str]:
+    """Register a fresh customer; returns (username, mobile, totp_secret)."""
+    name, mobile = f"otp_{uuid.uuid4().hex[:8]}", new_mobile()
+    r = Client().req("POST", "/api/auth/register",
+                     json={"username": name, "password": "Long-enough-pw-1", "mobile": mobile})
+    assert r.status_code == 200, r.text
+    assert r.json()["mobile"] == f"{mobile[:2]}xxxxxx{mobile[-2:]}"
+    return name, mobile, r.json()["totp_secret"]
+
+
+def test_register_needs_a_valid_unique_mobile():
+    c = Client()
+    bad = c.req("POST", "/api/auth/register",
+                json={"username": f"m_{uuid.uuid4().hex[:8]}", "password": "Long-enough-pw-1", "mobile": "12345"})
+    assert bad.status_code == 400
+    _, mobile, _ = otp_user()
+    dup = c.req("POST", "/api/auth/register",
+                json={"username": f"m_{uuid.uuid4().hex[:8]}", "password": "Long-enough-pw-1",
+                      "mobile": f"+91 {mobile}"})
+    assert dup.status_code == 409
+
+
+def test_otp_request_does_not_reveal_who_is_registered():
+    c = Client(device="e2e-otp-probe")
+    unknown = c.req("POST", "/api/auth/otp/request", json={"mobile": "6000000000"})
+    _, mobile, _ = otp_user()
+    known = c.req("POST", "/api/auth/otp/request", json={"mobile": mobile})
+    assert unknown.status_code == known.status_code == 200
+    assert unknown.json().keys() == known.json().keys()
+    assert c.req("POST", "/api/auth/otp/request", json={"mobile": "abc"}).status_code == 400
+    # 30 s between two codes to the same number
+    assert c.req("POST", "/api/auth/otp/request", json={"mobile": mobile}).status_code == 429
+
+
+def test_otp_new_device_needs_authenticator_then_trusted_device_needs_only_sms():
+    name, mobile, secret = otp_user()
+    phone = Client(device=f"e2e-otp-{name}")
+    assert phone.req("POST", "/api/auth/otp/request", json={"mobile": mobile}).status_code == 200
+    code = sms_code(phone, mobile)
+    # first sign-in from this browser: new device -> SMS alone is not enough
+    r = phone.req("POST", "/api/auth/login/otp", json={"mobile": mobile, "otp": code})
+    assert r.status_code == 401 and r.json()["detail"]["step_up"] == "totp", r.text
+    bad = phone.req("POST", "/api/auth/login/otp", json={"mobile": mobile, "otp": code, "totp": "000000"})
+    assert bad.status_code == 401
+    ok = phone.req("POST", "/api/auth/login/otp",
+                   json={"mobile": mobile, "otp": code, "totp": pyotp.TOTP(secret).now()})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["device"]["status"] == "trusted"          # first device of a new customer
+    phone.token = ok.json()["access_token"]
+    assert phone.req("GET", "/api/me").json()["amr"] == ["sms", "otp"]
+    # the SMS code worked once
+    again = phone.req("POST", "/api/auth/login/otp",
+                      json={"mobile": mobile, "otp": code, "totp": pyotp.TOTP(secret).now()})
+    assert again.status_code == 401
+
+    # same, now trusted, browser: the SMS code alone signs in (unless the hour itself is unusual)
+    time.sleep(31)                                              # resend cool-down
+    phone.token = None
+    assert phone.req("POST", "/api/auth/otp/request", json={"mobile": mobile}).status_code == 200
+    code2 = sms_code(phone, mobile)
+    r2 = phone.req("POST", "/api/auth/login/otp", json={"mobile": mobile, "otp": code2})
+    if r2.status_code == 401:                                   # 00:00-06:00: odd-hour risk factor
+        reasons = [x["factor"] for x in r2.json()["detail"]["risk"]["reasons"]]
+        assert reasons == ["odd_hour"], r2.text
+        return
+    assert r2.status_code == 200, r2.text
+    phone.token = r2.json()["access_token"]
+    me = phone.req("GET", "/api/me").json()
+    assert me["amr"] == ["sms", "dev"] and me["mfa"] is True
+    acct = phone.req("GET", "/api/accounts/me")
+    assert acct.status_code == 200, acct.text
+
+
+def test_three_wrong_sms_codes_destroy_the_code():
+    _, mobile, _ = otp_user()
+    c = Client(device="e2e-otp-guess")
+    assert c.req("POST", "/api/auth/otp/request", json={"mobile": mobile}).status_code == 200
+    code = sms_code(c, mobile)
+    wrong = f"{(int(code) + 1) % 1_000_000:06d}"
+    for _ in range(3):
+        assert c.req("POST", "/api/auth/login/otp", json={"mobile": mobile, "otp": wrong}).status_code == 401
+    r = c.req("POST", "/api/auth/login/otp", json={"mobile": mobile, "otp": code})
+    assert r.status_code == 401 and "step_up" not in r.text      # gone, not "needs authenticator"

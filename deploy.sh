@@ -179,6 +179,17 @@ until health_report >/dev/null 2>&1; do
 done
 echo; health_report || true
 
+# ------------------------------------------- schema migrations (idempotent)
+# db/init runs only when the data volume is new; db/migrations brings older databases up to date
+for f in db/migrations/*.sql; do
+  [[ -e "$f" ]] || continue
+  if $COMPOSE exec -T -u postgres postgres psql -q -v ON_ERROR_STOP=1 -d finguard < "$f" >/dev/null; then
+    c_ok "migration $(basename "$f") applied"
+  else
+    c_err "migration $f failed"; exit 1
+  fi
+done
+
 # -------------------------------------------------------------- smoke test
 if python3 - <<'PY'
 import ssl, urllib.request

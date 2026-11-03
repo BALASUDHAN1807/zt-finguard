@@ -18,7 +18,7 @@ from test_e2e import ROOT, account_of, logged_in
 pytestmark = pytest.mark.skipif(os.environ.get("ZT_DOCKER") != "1",
                                 reason="needs the Docker deployment (ZT_DOCKER=1)")
 PROJECT = "zt-finguard"
-HELPER_IMAGE = f"{os.environ.get('IMAGE_PREFIX', 'zt-finguard/')}gateway:{os.environ.get('IMAGE_TAG', 'latest')}"
+HELPER_IMAGE = f"{os.environ.get('IMAGE_PREFIX') or 'zt-finguard/'}gateway:{os.environ.get('IMAGE_TAG', 'latest')}"
 
 
 def compose(*args: str) -> str:
