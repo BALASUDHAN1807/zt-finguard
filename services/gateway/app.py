@@ -615,6 +615,58 @@ async def release(service: str, claims: dict = Depends(session)):
     return await forward("POST", "responder", f"/quarantine/{service}/release", body={"actor": claims["usr"]})
 
 
+# ------------------------------------------- module 6: threat detection center
+INCIDENT_ID = Path(pattern=r"^INC-\d{1,12}$")
+
+
+class IncidentActionBody(BaseModel):
+    note: str = Field(default="", max_length=500)
+    assignee: str | None = Field(default=None, pattern=r"^[a-z0-9_]{3,20}$")
+    status: str | None = Field(default=None, pattern=r"^(acknowledged|investigating|contained)$")
+
+
+@app.get("/api/admin/threats")
+async def admin_threats(days: int = 7, claims: dict = Depends(session)):
+    await require_admin_action("admin.threats", claims)
+    data = await get_json("audit", "/threats", params={"days": max(1, min(days, 90))}, timeout=30)
+    if data is None:
+        raise HTTPException(502, "audit service unavailable")
+    users = await get_json("auth", "/admin/users", claims) or []
+    return data | {"analysts": sorted(u["username"] for u in users if u["role"] == "admin")}
+
+
+@app.get("/api/admin/threats/incidents/{incident_id}")
+async def admin_incident(incident_id: str = INCIDENT_ID, claims: dict = Depends(session)):
+    await require_admin_action("admin.threats", claims)
+    return await forward("GET", "audit", f"/threats/incidents/{incident_id}")
+
+
+@app.post("/api/admin/threats/incidents/{incident_id}/{op}")
+async def admin_incident_action(body: IncidentActionBody, incident_id: str = INCIDENT_ID,
+                                op: str = Path(pattern=r"^(ack|assign|status|note|resolve)$"),
+                                claims: dict = Depends(session)):
+    """Analyst actions are audit events: the incident's whole history is hash-chained."""
+    await require_admin_action("admin.threats", claims)
+    inc = await get_json("audit", f"/threats/incidents/{incident_id}", timeout=30)
+    if inc is None:
+        raise HTTPException(404, "incident not found")
+    if inc["status"] == "resolved" and op != "note":
+        raise HTTPException(409, "incident is already resolved")
+    if op == "assign":
+        users = await get_json("auth", "/admin/users", claims) or []
+        if body.assignee not in {u["username"] for u in users if u["role"] == "admin"}:
+            raise HTTPException(400, "assign to a security administrator")
+    if op == "status" and not body.status:
+        raise HTTPException(400, "status required")
+    if op in ("note", "resolve") and not body.note.strip():
+        raise HTTPException(400, "write a note" if op == "note" else "describe the resolution")
+    clients.audit(actor=claims["usr"], action=f"incident.{op}", resource=incident_id,
+                  decision="info", reason=op,
+                  details={"incident_id": incident_id, "note": body.note, "assignee": body.assignee,
+                           "status": body.status})
+    return {"incident_id": incident_id, "action": op}
+
+
 # ------------------------------------------- module 5: container security
 SERVICE_NAME = Path(pattern=r"^[a-z][a-z0-9_-]{1,30}$")
 

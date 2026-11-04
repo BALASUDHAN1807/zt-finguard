@@ -279,7 +279,8 @@ def pill(decision: str) -> str:
     cls = {"allow": "zt-allow", "deny": "zt-deny", "step_up": "zt-step", "alert": "zt-deny",
            "pending_approval": "zt-step",
            "critical": "zt-critical", "high": "zt-high", "medium": "zt-medium", "low": "zt-low",
-           "info": "zt-info"}.get(decision, "")
+           "info": "zt-info", "new": "zt-high", "acknowledged": "zt-step", "investigating": "zt-step",
+           "contained": "zt-low", "resolved": "zt-allow"}.get(decision, "")
     return f'<span class="zt-pill {cls}">{decision.upper()}</span>'
 
 
@@ -470,8 +471,9 @@ def sidebar() -> str:
             "customer": ["My account", "Send money", "Security settings"],
             "teller": ["Account lookup", "Security settings"],
             "operations": ["Banking & transactions", "Security settings"],
-            "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Access decisions", "Audit integrity",
-                      "Session & device policy", "Container security", "Security settings"],
+            "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Container security",
+                      "Threat center", "Access decisions", "Audit integrity", "Session & device policy",
+                      "Security settings"],
         }[ss.role]
         page = st.radio("Navigate", pages, label_visibility="collapsed")
         st.divider()
@@ -2144,6 +2146,186 @@ def cont_actions(cs: list[dict]) -> None:
         st.caption("No quarantines, restarts, recoveries or runtime alerts yet.")
 
 
+# ------------------------------------------- admin module 6: threat detection center
+CATEGORY_SHORT = {"suspicious_process": "Suspicious process", "unauthorized_shell": "Unauthorized shell",
+                  "privilege_escalation": "Privilege escalation", "network_connection": "Unexpected connection",
+                  "file_modification": "File modification", "credential_access": "Secret access",
+                  "jwt_theft": "JWT theft / forgery", "suspicious_login": "Suspicious sign-in",
+                  "container_compromise": "Container compromise", "account_takeover": "Account takeover"}
+STATUS_ORDER = ["new", "acknowledged", "investigating", "contained", "resolved"]
+
+
+def threat_center() -> None:
+    st.title("Threat center")
+    top = st.columns([3, 1])
+    top[0].caption("Detections from Falco (runtime), the gateway (tokens), auth (sign-ins), the risk engine and the "
+                   "responder, grouped into incidents. Every analyst action is written to the hash-chained audit "
+                   "log, so an incident's history cannot be quietly rewritten.")
+    days = top[1].selectbox("Window", [1, 7, 30, 90], index=1, key="thr_days",
+                            format_func=lambda d: f"Last {d} day{'s' * (d > 1)}")
+    r = api("GET", "/api/admin/threats", params={"days": days})
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    t = r.json()
+    incs = t["incidents"]
+    k = st.columns(5)
+    k[0].metric("Open incidents", t["open"])
+    k[1].metric("Critical open", sum(1 for i in incs if i["severity"] == "critical" and i["status"] != "resolved"))
+    k[2].metric("Unassigned", sum(1 for i in incs if not i["assignee"] and i["status"] != "resolved"))
+    k[3].metric("Detections", sum(t["detections_by_severity"].values()))
+    k[4].metric("Falco runtime alerts", len(t["falco"]))
+    tabs = st.tabs(["Incidents", "Live runtime alerts", "Detections"])
+    with tabs[0]:
+        threat_incidents(t)
+    with tabs[1]:
+        threat_falco(t)
+    with tabs[2]:
+        threat_detections(t)
+
+
+def threat_falco(t: dict) -> None:
+    by = t["detections_by_category"]
+    st.subheader("Runtime detections (Falco)")
+    k = st.columns(6)
+    for i, c in enumerate(["suspicious_process", "unauthorized_shell", "privilege_escalation", "network_connection",
+                           "file_modification", "credential_access"]):
+        k[i].metric(CATEGORY_SHORT[c], by.get(c, 0))
+    if t["falco"]:
+        df = pd.DataFrame(t["falco"])
+        df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+        df["category"] = df["category"].map(CATEGORY_SHORT)
+        st.dataframe(df[["time", "severity", "category", "subject", "summary"]], hide_index=True,
+                     use_container_width=True, column_config={"subject": "container", "summary": "Falco output"})
+    else:
+        st.info("No Falco alerts in this window. Falco needs direct access to the host kernel (eBPF), so it runs "
+                "with `make falco` on a Linux host or VM, not inside Codespaces or Docker Desktop. The test suite "
+                "sends Falco-format alerts through the same mTLS path to prove the pipeline works.")
+    st.caption("Rules (falco/zt_rules.yaml): shell or download tool in a service container, write to the read-only "
+               "filesystem, secret read by an unexpected process, database connection from a non-database "
+               "service, privilege escalation, internet connection from an internal service. Critical alerts "
+               "quarantine the container automatically.")
+
+
+def threat_detections(t: dict) -> None:
+    by = t["detections_by_category"]
+    k = st.columns(4)
+    for i, c in enumerate(["jwt_theft", "suspicious_login", "container_compromise", "account_takeover"]):
+        k[i].metric(CATEGORY_SHORT[c], by.get(c, 0))
+    a, b = st.columns([1, 1.5])
+    with a:
+        sev = pd.DataFrame({"severity": SEV_ORDER, "detections": [t["detections_by_severity"].get(s, 0)
+                                                                  for s in SEV_ORDER]})
+        st.altair_chart(alt.Chart(sev).mark_bar(cornerRadiusEnd=2).encode(
+            y=alt.Y("severity:N", sort=SEV_ORDER, title=None),
+            x=alt.X("detections:Q", axis=alt.Axis(tickMinStep=1, format="d")),
+            color=alt.Color("severity:N", legend=None, scale=alt.Scale(domain=SEV_ORDER, range=SEV_COLORS)),
+            tooltip=["severity", "detections"]).properties(height=220, title="Severity classification"),
+            use_container_width=True)
+    with b:
+        cat = pd.DataFrame([{"category": CATEGORY_SHORT[c], "detections": n} for c, n in by.items() if n])
+        if not cat.empty:
+            st.altair_chart(alt.Chart(cat).mark_bar(color="#0B3D4A", cornerRadiusEnd=2).encode(
+                y=alt.Y("category:N", sort="-x", title=None),
+                x=alt.X("detections:Q", axis=alt.Axis(tickMinStep=1, format="d")),
+                tooltip=["category", "detections"]).properties(height=220, title="By category"),
+                use_container_width=True)
+    if t["recent"]:
+        df = pd.DataFrame(t["recent"])
+        df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+        df["category"] = df["category"].map(CATEGORY_SHORT)
+        st.dataframe(df[["time", "severity", "category", "subject", "source", "summary"]], hide_index=True,
+                     use_container_width=True, height=380)
+    st.caption("JWT theft: a token presented from another device, replayed after sign-out, forged/tampered, or a "
+               "refresh token reused. Suspicious sign-in: high login risk, lockout, revoked device, failed codes "
+               "(single failures are low severity; five or more in one incident raise it to medium).")
+
+
+def threat_incidents(t: dict) -> None:
+    incs = t["incidents"]
+    if not incs:
+        st.success("No incidents in this window.")
+        return
+    f = st.columns(3)
+    sf = f[0].multiselect("Status", STATUS_ORDER, default=[s for s in STATUS_ORDER if s != "resolved"])
+    vf = f[1].multiselect("Severity", ["critical", "high", "medium", "low"], placeholder="All severities")
+    cf = f[2].multiselect("Category", list(CATEGORY_SHORT), format_func=CATEGORY_SHORT.get, placeholder="All")
+    df = pd.DataFrame(incs)
+    view = df[df["status"].isin(sf or STATUS_ORDER)]
+    if vf:
+        view = view[view["severity"].isin(vf)]
+    if cf:
+        view = view[view["category"].isin(cf)]
+    if view.empty:
+        st.info("No incidents match these filters.")
+        return
+    show = view.assign(first=local_time(view["first_seen"], "%d %b %H:%M"), last=local_time(view["last_seen"], "%d %b %H:%M"),
+                       category=view["category"].map(CATEGORY_SHORT), assignee=view["assignee"].fillna("-"))
+    st.dataframe(show[["id", "severity", "status", "category", "subject", "detections", "assignee", "first", "last"]],
+                 hide_index=True, use_container_width=True, height=300)
+    pick = st.selectbox("Investigate", list(view["id"]),
+                        format_func=lambda i: f"{i} - {CATEGORY_SHORT[df.set_index('id').loc[i, 'category']]} - "
+                                              f"{df.set_index('id').loc[i, 'subject']}")
+    r = api("GET", f"/api/admin/threats/incidents/{pick}")
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    inc = r.json()
+    st.markdown(f"### {inc['id']} {pill(inc['severity'])} {pill(inc['status'])}", unsafe_allow_html=True)
+    st.markdown(f"**{inc['title']}** - subject **{inc['subject']}**")
+    k = st.columns(4)
+    k[0].metric("Detections", inc["detections"])
+    k[1].metric("First seen", local_time(pd.Series([inc["first_seen"]]), "%H:%M").iloc[0],
+                help=local_time(pd.Series([inc["first_seen"]]), "%d %b %Y %H:%M:%S IST").iloc[0])
+    k[2].metric("Last seen", local_time(pd.Series([inc["last_seen"]]), "%H:%M").iloc[0],
+                help=local_time(pd.Series([inc["last_seen"]]), "%d %b %Y %H:%M:%S IST").iloc[0])
+    k[3].metric("Assigned to", inc["assignee"] or "-")
+    st.caption(f"Sources: {', '.join(inc['sources'])}. Categories: "
+               f"{', '.join(CATEGORY_SHORT.get(c, c) for c in inc.get('categories', []))}.")
+    a, b = st.columns([1.5, 1])
+    with a:
+        st.markdown("**Timeline**")
+        tl = pd.DataFrame(inc["timeline"])
+        tl["time"] = local_time(tl["ts"], "%d %b %H:%M:%S")
+        tl["kind"] = tl["kind"].map({"detection": "detected", "analyst": "analyst", "response": "response"})
+        st.dataframe(tl[["time", "kind", "actor", "what", "detail"]], hide_index=True, use_container_width=True,
+                     height=min(420, 38 + 35 * len(tl)))
+        if inc.get("resolution"):
+            st.success(f"Resolved by {inc['resolved_by']}: {inc['resolution']}")
+    with b:
+        if inc["status"] == "resolved":
+            st.info("This incident is resolved. New detections for the same subject open a new incident.")
+        with st.form(f"inc_{inc['id']}"):
+            st.markdown("**Respond**")
+            assignee = st.selectbox("Assign to", ["-"] + t["analysts"],
+                                    index=(t["analysts"].index(inc["assignee"]) + 1)
+                                    if inc["assignee"] in t["analysts"] else 0)
+            status = st.selectbox("Status", ["acknowledged", "investigating", "contained"],
+                                  index=["acknowledged", "investigating", "contained"].index(inc["status"])
+                                  if inc["status"] in ("acknowledged", "investigating", "contained") else 0)
+            note = st.text_area("Note or resolution", placeholder="What you found or did", height=90)
+            c1, c2 = st.columns(2)
+            ack = c1.form_submit_button("Acknowledge", use_container_width=True, disabled=inc["status"] != "new")
+            upd = c2.form_submit_button("Update", type="primary", use_container_width=True)
+            c3, c4 = st.columns(2)
+            add = c3.form_submit_button("Add note", use_container_width=True)
+            res = c4.form_submit_button("Resolve", use_container_width=True)
+        base = f"/api/admin/threats/incidents/{inc['id']}"
+        if ack:
+            ok_or_error(api("POST", f"{base}/ack", json={}), "Acknowledged.")
+        if upd:
+            if assignee != "-" and assignee != inc["assignee"]:
+                ok_or_error(api("POST", f"{base}/assign", json={"assignee": assignee}), f"Assigned to {assignee}.")
+            if status != inc["status"]:
+                ok_or_error(api("POST", f"{base}/status", json={"status": status}), f"Status: {status}.")
+        if add:
+            ok_or_error(api("POST", f"{base}/note", json={"note": note}), "Note added.")
+        if res:
+            ok_or_error(api("POST", f"{base}/resolve", json={"note": note}), "Incident resolved.")
+        st.caption("Response actions on the subject (quarantine, release, restart, force sign-out, lock, device "
+                   "revoke, account freeze) appear in the timeline automatically.")
+
+
 # -------------------------------------------------------------------- main
 ss = S()
 topbar(bool(ss.token))
@@ -2167,5 +2349,6 @@ else:
         "Session & device policy": session_device_policy,
         "Containers & quarantine": containers_page,
         "Container security": container_security,
+        "Threat center": threat_center,
     }[page]()
     footer()

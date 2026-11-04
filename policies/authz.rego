@@ -60,6 +60,7 @@ permissions := {
 		"admin.user_control",
 		"admin.fraud",
 		"admin.containers",
+		"admin.threats",
 		"self.manage",
 	},
 }
@@ -78,6 +79,7 @@ trusted_callers := {
 	"admin.user_control": {"gateway"},
 	"admin.fraud": {"gateway"},
 	"admin.containers": {"gateway"},
+	"admin.threats": {"gateway"},
 	"self.manage": {"gateway"},
 	"ops.accounts": {"account"},
 	"ops.transactions": {"account"},

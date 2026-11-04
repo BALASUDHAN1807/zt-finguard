@@ -785,3 +785,46 @@ def test_container_restart_needs_admin_code_and_is_audited():
     assert risk_healthy()
     hist = admin.req("GET", "/api/admin/containers/history", params={"service": "risk"}).json()
     assert any(h["action"] == "container.restart" and h["actor"] == "admin" for h in hist)
+
+
+# ------------------------------------------- admin module 6: threat detection center
+def test_token_theft_and_forgery_become_incidents():
+    victim = logged_in("alice")
+    thief = Client(device="e2e-attacker-laptop")
+    thief.token = victim.token
+    assert thief.req("GET", "/api/accounts/me").status_code == 401        # stolen token, other device
+    forged = Client(device="e2e-forger")
+    forged.token = "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIiwidXNyIjoiYWRtaW4ifQ."
+    assert forged.req("GET", "/api/me").status_code == 401
+    time.sleep(1)
+    admin = logged_in("admin")
+    t = admin.req("GET", "/api/admin/threats", params={"days": 1}).json()
+    assert t["detections_by_category"]["jwt_theft"] >= 2
+    inc = [i for i in t["incidents"] if i["category"] == "jwt_theft" and i["subject"] == "alice"]
+    assert inc and inc[0]["severity"] in ("high", "critical")
+    assert logged_in("bob").req("GET", "/api/admin/threats").status_code == 403
+
+
+def test_incident_lifecycle_is_recorded_in_the_audit_chain():
+    name, _ = _drain_attempt()                              # account takeover attempt -> critical incident
+    time.sleep(1)
+    admin = logged_in("admin")
+    t = admin.req("GET", "/api/admin/threats", params={"days": 1}).json()
+    inc = next(i for i in t["incidents"] if i["category"] == "account_takeover" and i["subject"] == name)
+    assert inc["severity"] == "critical" and inc["status"] == "new"
+    base = f"/api/admin/threats/incidents/{inc['id']}"
+    assert admin.req("POST", f"{base}/ack", json={}).status_code == 200
+    assert admin.req("POST", f"{base}/assign", json={"assignee": "bob"}).status_code == 400   # not an analyst
+    assert admin.req("POST", f"{base}/assign", json={"assignee": "admin"}).status_code == 200
+    assert admin.req("POST", f"{base}/status", json={"status": "investigating"}).status_code == 200
+    assert admin.req("POST", f"{base}/note", json={"note": " "}).status_code == 400
+    assert admin.req("POST", f"{base}/resolve", json={}).status_code == 400                   # needs a resolution
+    assert admin.req("POST", f"{base}/resolve", json={"note": "confirmed with customer"}).status_code == 200
+    time.sleep(1)
+    d = admin.req("GET", base).json()
+    assert d["status"] == "resolved" and d["assignee"] == "admin" and d["resolution"] == "confirmed with customer"
+    steps = [x["what"] for x in d["timeline"] if x["kind"] == "analyst"]
+    assert steps == ["ack", "assign", "status", "resolve"]
+    assert any(x["kind"] == "detection" for x in d["timeline"])
+    assert admin.req("POST", f"{base}/ack", json={}).status_code == 409                       # closed
+    assert admin.req("GET", "/api/admin/threats/incidents/INC-0").status_code == 404

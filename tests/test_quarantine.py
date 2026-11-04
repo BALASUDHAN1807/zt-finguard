@@ -147,3 +147,14 @@ def test_tampered_image_manifest_is_detected():
         open(path, "w", encoding="utf-8").write(original)
     d = admin.req("GET", "/api/admin/containers").json()
     assert d["manifest_status"].startswith("valid")
+
+
+def test_runtime_alert_and_quarantine_form_one_incident():
+    """Admin module 6: the Falco shell alert and the automatic quarantine it caused are one incident."""
+    admin = logged_in("admin")
+    t = admin.req("GET", "/api/admin/threats", params={"days": 1}).json()
+    assert t["detections_by_category"]["unauthorized_shell"] >= 1
+    assert any(f["subject"] == "account" for f in t["falco"])
+    inc = [i for i in t["incidents"] if i["subject"] == "account"
+           and {"unauthorized_shell", "container_compromise"} <= set(i["categories"])]
+    assert inc and inc[0]["severity"] == "critical"
