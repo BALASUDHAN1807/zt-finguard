@@ -615,6 +615,49 @@ async def release(service: str, claims: dict = Depends(session)):
     return await forward("POST", "responder", f"/quarantine/{service}/release", body={"actor": claims["usr"]})
 
 
+# ------------------------------------------- module 5: container security
+SERVICE_NAME = Path(pattern=r"^[a-z][a-z0-9_-]{1,30}$")
+
+
+class ContainerActionBody(BaseModel):
+    totp: str = Field(max_length=10)
+    reason: str = Field(default="", max_length=200)
+
+
+@app.get("/api/admin/containers")
+async def admin_containers(claims: dict = Depends(session)):
+    await require_admin_action("admin.containers", claims)
+    data = await get_json("responder", "/containers", timeout=30)
+    if data is None:
+        raise HTTPException(502, "responder unavailable")
+    return data | {"trivy": read_report("trivy-summary.json")}
+
+
+@app.get("/api/admin/containers/history")
+async def admin_container_history(service: str | None = None, claims: dict = Depends(session)):
+    await require_admin_action("admin.containers", claims)
+    params = {"limit": 200} | ({"service": service[:40]} if service else {})
+    return await get_json("audit", "/container-history", params=params) or []
+
+
+@app.get("/api/admin/containers/{service}/processes")
+async def admin_container_processes(service: str = SERVICE_NAME, claims: dict = Depends(session)):
+    await require_admin_action("admin.containers", claims)
+    return await forward("GET", "responder", f"/containers/{service}/processes")
+
+
+@app.post("/api/admin/containers/{service}/{op}")
+async def admin_container_action(body: ContainerActionBody, service: str = SERVICE_NAME,
+                                 op: str = Path(pattern=r"^(restart|recover)$"), claims: dict = Depends(session)):
+    """Restarting a production container is sensitive: the admin's own authenticator code is required."""
+    await require_admin_action("admin.containers", claims)
+    v = await forward("POST", "auth", "/me/verify-totp", claims, {"totp": body.totp, "purpose": f"container_{op}"})
+    if v.status_code != 200:
+        return v
+    return await forward("POST", "responder", f"/containers/{service}/{op}",
+                         body={"actor": claims["usr"], "reason": body.reason})
+
+
 # ------------------------------------------- module 4: fraud intelligence
 class FraudLabelBody(BaseModel):
     tx_id: int = Field(gt=0)

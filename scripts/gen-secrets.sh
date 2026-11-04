@@ -14,6 +14,12 @@ if [[ ! -f "$OUT/jwt_private.pem" ]]; then
   openssl rsa -in "$OUT/jwt_private.pem" -pubout -out "$OUT/jwt_public.pem" 2>/dev/null
 fi
 
+if [[ ! -f "$OUT/image_signing.key" ]]; then
+  echo "[secrets] Ed25519 key that signs the deployed image digests (admin module 5)"
+  openssl genpkey -algorithm ed25519 -out "$OUT/image_signing.key" 2>/dev/null
+  openssl pkey -in "$OUT/image_signing.key" -pubout -out "$OUT/image_signing.pub" 2>/dev/null
+fi
+
 [[ -f "$OUT/redis_password" ]] || { openssl rand -hex 24 > "$OUT/redis_password"; echo "[secrets] redis password"; }
 [[ -f "$OUT/postgres_password" ]] || { openssl rand -hex 24 > "$OUT/postgres_password"; echo "[secrets] postgres superuser password (local socket only)"; }
 

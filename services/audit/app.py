@@ -504,6 +504,23 @@ async def fraud(days: int = Query(7, ge=1, le=90), _caller: str = Depends(mtls.r
     }
 
 
+# ---------------------------------------------- admin module 5: container history
+@app.get("/container-history")
+async def container_history(service: str | None = Query(None, max_length=40), limit: int = Query(200, ge=1, le=1000),
+                            _caller: str = Depends(mtls.require_caller("gateway"))):
+    """Quarantine, release, restart, recovery and Falco runtime alerts, newest first."""
+    sql = ("SELECT id, ts, service, actor, action, resource, decision, reason, risk, details FROM audit_log "
+           "WHERE (action LIKE 'container.%%' OR service = 'falco')")
+    args: list = []
+    if service:
+        sql += " AND (resource = %s OR details->'fields'->>'container.name' LIKE %s)"
+        args += [service, f"%-{service}-%"]
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(sql + " ORDER BY id DESC LIMIT %s", (*args, limit))
+        return [row_out(r) for r in await cur.fetchall()]
+
+
 @app.get("/verify")
 async def verify_chain(_caller: str = Depends(mtls.require_caller("gateway"))):
     p = await db.pool()

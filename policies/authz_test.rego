@@ -146,7 +146,7 @@ test_only_admin_sets_session_policy_or_quarantines if {
 }
 
 test_only_admin_searches_and_controls_users if {
-	every a in ["admin.search", "admin.user_control", "admin.fraud"] {
+	every a in ["admin.search", "admin.user_control", "admin.fraud", "admin.containers"] {
 		authz.decision.allow with input as {
 			"subject": {"user": "admin", "role": "admin", "mfa": true},
 			"action": a, "resource": {}, "context": {"caller": "gateway"},

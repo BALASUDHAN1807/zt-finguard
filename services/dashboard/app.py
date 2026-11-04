@@ -471,7 +471,7 @@ def sidebar() -> str:
             "teller": ["Account lookup", "Security settings"],
             "operations": ["Banking & transactions", "Security settings"],
             "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Access decisions", "Audit integrity",
-                      "Session & device policy", "Containers & quarantine", "Security settings"],
+                      "Session & device policy", "Container security", "Security settings"],
         }[ss.role]
         page = st.radio("Navigate", pages, label_visibility="collapsed")
         st.divider()
@@ -1935,6 +1935,215 @@ def fraud_model(f: dict) -> None:
         st.json({k: m[k] for k in ("dataset", "trained_at", "rows_transfer_cashout", "fraud_rate", "features")})
 
 
+# ------------------------------------------- admin module 5: container security
+CHECK_LABEL = {"non_root_user": "Non-root user", "read_only_rootfs": "Read-only filesystem",
+               "all_caps_dropped": "All capabilities dropped", "no_new_privileges": "No new privileges",
+               "not_privileged": "Not privileged", "memory_limit": "Memory limit", "pids_limit": "Process limit",
+               "cpu_limit": "CPU limit", "no_host_network": "Own network namespace"}
+
+
+def human_bytes(n) -> str:
+    if n is None or (isinstance(n, float) and pd.isna(n)):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def human_uptime(s) -> str:
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return "-"
+    s = int(s)
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m {s % 60}s"
+
+
+def container_security() -> None:
+    st.title("Container security")
+    r = api("GET", "/api/admin/containers")
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    d = r.json()
+    if not d.get("engine_connected"):
+        st.error("The responder cannot reach the container engine socket, so live container data is unavailable.")
+        return
+    cs, eng = d["containers"], d["engine"]
+    st.caption(f"{eng['name'].title()} {eng.get('version', '')} on {eng.get('os', '')}, kernel {eng.get('kernel', '')}, "
+               f"cgroup v{eng.get('cgroup', '?')}. Live from the engine API via the responder (the only service "
+               "with the container socket).")
+    running = [c for c in cs if c["state"] == "running"]
+    healthy = [c for c in cs if c["health"] in ("healthy", "no healthcheck") and c["state"] == "running"]
+    k = st.columns(6)
+    k[0].metric("Containers", len(cs))
+    k[1].metric("Running", f"{len(running)} / {len(cs)}")
+    k[2].metric("Healthy", f"{len(healthy)} / {len(cs)}")
+    k[3].metric("Quarantined", sum(1 for c in cs if c["quarantined"]))
+    k[4].metric("Signatures verified", f"{sum(1 for c in cs if c['signature'] == 'verified')} / {len(cs)}")
+    k[5].metric("Engine mode", "rootless" if eng["rootless"] else "rootful",
+                help="Rootless engines map container root to an unprivileged host user (user namespaces)")
+    t = st.tabs(["Containers", "Isolation & hardening", "Images & vulnerabilities", "Processes & network",
+                 "Actions & history"])
+    with t[0]:
+        cont_overview(cs)
+    with t[1]:
+        cont_isolation(cs, eng)
+    with t[2]:
+        cont_images(cs, d)
+    with t[3]:
+        cont_processes(cs)
+    with t[4]:
+        cont_actions(cs)
+
+
+def cont_overview(cs: list[dict]) -> None:
+    df = pd.DataFrame(cs)
+    df["uptime"] = df["uptime_seconds"].apply(human_uptime)
+    df["memory"] = df.apply(lambda x: f"{human_bytes(x['memory_bytes'])} / {human_bytes(x['memory_limit_bytes'])}",
+                            axis=1)
+    df["network I/O"] = df.apply(lambda x: f"{human_bytes(x['net_rx_bytes'])} in, {human_bytes(x['net_tx_bytes'])} out",
+                                 axis=1)
+    df["isolation"] = df["quarantined"].map({True: "QUARANTINED", False: "normal"})
+    st.dataframe(df[["service", "state", "health", "uptime", "cpu_percent", "memory_percent", "memory", "pids",
+                     "network I/O", "restart_count", "isolation", "hardening_score", "signature"]],
+                 hide_index=True, use_container_width=True, height=440,
+                 column_config={"cpu_percent": st.column_config.NumberColumn("CPU %", format="%.2f"),
+                                "memory_percent": st.column_config.ProgressColumn("memory used", min_value=0,
+                                                                                   max_value=100, format="%.1f%%"),
+                                "pids": "processes", "restart_count": "restarts", "hardening_score": "hardening"})
+    st.caption("CPU % is measured between two refreshes (the first view after a restart shows a dash). "
+               "Memory excludes the page cache. Limits come from the cgroup settings in compose.yaml.")
+    a, b = st.columns(2)
+    with a:
+        m = df[["service", "memory_bytes"]].assign(MB=df["memory_bytes"] / 1048576)
+        st.altair_chart(alt.Chart(m).mark_bar(color="#0B3D4A", cornerRadiusEnd=2).encode(
+            x=alt.X("MB:Q", title="memory (MB)"), y=alt.Y("service:N", sort="-x", title=None),
+            tooltip=["service", alt.Tooltip("MB:Q", format=".1f")]).properties(height=280), use_container_width=True)
+    with b:
+        c = df[["service", "cpu_percent"]].fillna(0)
+        st.altair_chart(alt.Chart(c).mark_bar(color="#B8892B", cornerRadiusEnd=2).encode(
+            x=alt.X("cpu_percent:Q", title="CPU %"), y=alt.Y("service:N", sort="-x", title=None),
+            tooltip=["service", "cpu_percent"]).properties(height=280), use_container_width=True)
+
+
+def cont_isolation(cs: list[dict], eng: dict) -> None:
+    rows = []
+    for c in cs:
+        row = {"service": c["service"], "user": c["user"]}
+        row.update({CHECK_LABEL[k]: ("yes" if v else "NO") for k, v in c["checks"].items() if k in CHECK_LABEL})
+        row["networks"] = ", ".join(n.split("_", 1)[-1] for n in c["networks"]) or "none (isolated)"
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True, use_container_width=True, height=440)
+    st.caption("Postgres starts as root only to fix its key file permissions, then drops to the postgres user; "
+               "it keeps the five capabilities it needs (CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID). OPA, Redis "
+               "and Postgres use their official images' own users. Check the real process users on the "
+               "Processes & network tab.")
+    k = st.columns(5)
+    k[0].metric("Engine rootless", "yes" if eng["rootless"] else "no")
+    k[1].metric("seccomp", "on" if eng["seccomp"] else "off")
+    k[2].metric("AppArmor", "on" if eng["apparmor"] else "off")
+    k[3].metric("SELinux", "on" if eng["selinux"] else "off")
+    k[4].metric("User namespaces", "on" if eng["userns"] else "off")
+    if not eng["rootless"]:
+        st.info("This engine runs rootful (as in Codespaces and Docker Desktop). Containers still run as non-root "
+                "users with every capability dropped; for full rootless mode run `./deploy.sh --podman` as a "
+                "normal user.")
+
+
+def cont_images(cs: list[dict], d: dict) -> None:
+    st.subheader("Image signature verification")
+    status = d.get("manifest_status", "")
+    (st.success if status.startswith("valid") else st.error)(
+        f"Signed manifest: {status}" + (f" (signed {d['manifest_signed_at'][:19].replace('T', ' ')} UTC)"
+                                         if d.get("manifest_signed_at") else ""))
+    df = pd.DataFrame(cs)
+    df["size"] = df["image_size_bytes"].apply(human_bytes)
+    df["built"] = df["image_created"].fillna("").str[:10]
+    st.dataframe(df[["service", "image", "image_id", "built", "size", "image_user", "signature"]],
+                 hide_index=True, use_container_width=True,
+                 column_config={"image_id": "image digest", "image_user": "image default user"})
+    st.caption("Every deployment signs the exact image digests with an Ed25519 key (scripts/sign-images.sh). "
+               "The responder checks the signature and compares each running container's image digest: an image "
+               "swapped after deployment shows as DIGEST MISMATCH.")
+    st.subheader("Vulnerability scans (Trivy)")
+    tv = d.get("trivy")
+    if not tv:
+        st.warning("No scan yet. Run `make scan` in the Codespace terminal (Trivy scans every image and fails "
+                   "on CRITICAL findings or leaked secrets), then refresh this page.")
+        return
+    imgs = pd.DataFrame(tv["images"])
+    k = st.columns(4)
+    for i, sev in enumerate(("critical", "high", "medium", "low")):
+        k[i].metric(sev.title(), int(imgs.get(sev, pd.Series([0])).sum()))
+    st.dataframe(imgs, hide_index=True, use_container_width=True)
+    st.caption(f"Scanned {tv.get('scanned_at', '')[:19].replace('T', ' ')} UTC.")
+
+
+def cont_processes(cs: list[dict]) -> None:
+    svc = st.selectbox("Container", [c["service"] for c in cs], key="proc_svc")
+    r = api("GET", f"/api/admin/containers/{svc}/processes")
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    p = r.json()
+    c = next(x for x in cs if x["service"] == svc)
+    k = st.columns(4)
+    k[0].metric("Processes", len(p["processes"]))
+    k[1].metric("Running as root", p["root_processes"])
+    k[2].metric("Networks", len(c["networks"]))
+    k[3].metric("Network I/O", f"{human_bytes(c['net_rx_bytes'])} / {human_bytes(c['net_tx_bytes'])}")
+    if p["processes"]:
+        st.dataframe(pd.DataFrame(p["processes"]), hide_index=True, use_container_width=True)
+    st.caption("Process list from the engine (`top`), which works even though the images contain no shell or ps.")
+    st.markdown("**Networks:** " + (", ".join(c["networks"]) or "none - the container is isolated"))
+
+
+def cont_actions(cs: list[dict]) -> None:
+    services = [c["service"] for c in cs if c["service"] not in ("responder", "falco")]
+    a, b = st.columns(2)
+    with a, st.form("cs_q"):
+        st.markdown("**Quarantine**: cut a container off from every network, keep it running for forensics")
+        svc = st.selectbox("Container", services, key="cs_q_svc")
+        reason = st.text_input("Reason", value="suspicious behaviour reported", key="cs_q_reason")
+        c1, c2 = st.columns(2)
+        if c1.form_submit_button("Quarantine", type="primary", use_container_width=True):
+            ok_or_error(api("POST", "/api/admin/quarantine", json={"service": svc, "reason": reason}),
+                        f"{svc} isolated.")
+        if c2.form_submit_button("Release", use_container_width=True):
+            ok_or_error(api("POST", f"/api/admin/quarantine/{svc}/release"), f"{svc} reconnected to its networks.")
+    with b, st.form("cs_r"):
+        st.markdown("**Restart or recover** (needs your authenticator code)")
+        svc2 = st.selectbox("Container", services, key="cs_r_svc")
+        code = st.text_input("Your authenticator code", max_chars=6, key="cs_r_code")
+        c1, c2 = st.columns(2)
+        if c1.form_submit_button("Restart", type="primary", use_container_width=True):
+            ok_or_error(api("POST", f"/api/admin/containers/{svc2}/restart", json={"totp": code.strip()}),
+                        f"{svc2} restarted.")
+        if c2.form_submit_button("Recover", use_container_width=True,
+                                 help="Release from quarantine if needed, restart from the signed image, "
+                                      "wait until healthy"):
+            res = api("POST", f"/api/admin/containers/{svc2}/recover", json={"totp": code.strip()})
+            if res is not None and res.status_code == 200:
+                (st.success if res.json()["recovered"] else st.warning)(" -> ".join(res.json()["steps"]))
+            else:
+                ok_or_error(res, "")
+    st.subheader("Container security history")
+    pick = st.selectbox("Filter", ["All containers"] + [c["service"] for c in cs], key="cs_hist")
+    h = api("GET", "/api/admin/containers/history",
+            params={} if pick == "All containers" else {"service": pick})
+    rows = h.json() if h is not None and h.status_code == 200 else []
+    if rows:
+        df = pd.DataFrame(rows)
+        df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+        st.dataframe(df[["time", "severity", "service", "actor", "action", "resource", "reason"]], hide_index=True,
+                     use_container_width=True, column_config={"resource": "container", "service": "source"})
+    else:
+        st.caption("No quarantines, restarts, recoveries or runtime alerts yet.")
+
+
 # -------------------------------------------------------------------- main
 ss = S()
 topbar(bool(ss.token))
@@ -1957,5 +2166,6 @@ else:
         "Security settings": security_settings,
         "Session & device policy": session_device_policy,
         "Containers & quarantine": containers_page,
+        "Container security": container_security,
     }[page]()
     footer()

@@ -163,6 +163,12 @@ if [[ $BUILD -eq 1 ]]; then
     c_err "image build failed - see the output above"; exit 1
   fi
 fi
+# admin module 5: sign the exact image digests this deployment runs
+if ./scripts/sign-images.sh "$ENGINE" >/dev/null 2>&1; then
+  c_ok "image digests signed (reports/image-manifest.json)"
+else
+  c_warn "could not sign image digests - the dashboard will show images as unsigned"
+fi
 c_info "starting containers"
 if ! $COMPOSE up -d --force-recreate --no-build; then
   show_failures; exit 1

@@ -59,6 +59,7 @@ permissions := {
 		"admin.search",
 		"admin.user_control",
 		"admin.fraud",
+		"admin.containers",
 		"self.manage",
 	},
 }
@@ -76,6 +77,7 @@ trusted_callers := {
 	"admin.search": {"gateway", "account"},
 	"admin.user_control": {"gateway"},
 	"admin.fraud": {"gateway"},
+	"admin.containers": {"gateway"},
 	"self.manage": {"gateway"},
 	"ops.accounts": {"account"},
 	"ops.transactions": {"account"},

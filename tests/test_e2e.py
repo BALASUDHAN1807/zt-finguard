@@ -737,3 +737,47 @@ def test_analyst_labels_measure_false_positives():
     assert after["false_positive"] == before["false_positive"]
     ev = admin.req("GET", "/api/admin/events", params={"limit": 50}).json()
     assert any(e["action"] == "fraud.label" for e in ev)              # labels are in the audit chain
+
+
+# ------------------------------------------- admin module 5: container security
+def test_container_inventory_hardening_and_signatures():
+    admin = logged_in("admin")
+    r = admin.req("GET", "/api/admin/containers")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    if not d["engine_connected"]:
+        pytest.skip("container engine not reachable (native run)")
+    cs = {c["service"]: c for c in d["containers"]}
+    assert {"gateway", "auth", "account", "transaction", "risk", "audit", "responder", "dashboard",
+            "postgres", "redis", "opa"} <= set(cs)
+    assert d["manifest_status"].startswith("valid")
+    for name in ("gateway", "auth", "account", "transaction", "risk", "audit", "responder", "dashboard"):
+        c = cs[name]
+        assert c["state"] == "running" and c["signature"] == "verified"
+        assert c["user"].startswith("10001") and c["hardening_score"] == "9/9", (name, c["checks"])
+        assert c["memory_limit_bytes"] and c["pids"] is not None
+    p = admin.req("GET", "/api/admin/containers/gateway/processes").json()
+    assert p["processes"] and p["root_processes"] == 0
+    assert logged_in("alice").req("GET", "/api/admin/containers").status_code == 403
+    assert logged_in("ops").req("GET", "/api/admin/containers").status_code == 403
+
+
+def test_container_restart_needs_admin_code_and_is_audited():
+    admin = logged_in("admin")
+    if not admin.req("GET", "/api/admin/containers").json()["engine_connected"]:
+        pytest.skip("container engine not reachable (native run)")
+    assert admin.req("POST", "/api/admin/containers/risk/restart", json={"totp": "000000"}).status_code == 401
+    assert admin.req("POST", "/api/admin/containers/responder/restart",
+                     json={"totp": fresh_code("admin")}).status_code == 400            # never itself
+    ok = admin.req("POST", "/api/admin/containers/risk/restart", json={"totp": fresh_code("admin")})
+    assert ok.status_code == 200, ok.text
+
+    def risk_healthy():
+        cs = admin.req("GET", "/api/admin/containers").json()["containers"]
+        return next(c for c in cs if c["service"] == "risk")["health"] == "healthy"
+    deadline = time.time() + 90
+    while time.time() < deadline and not risk_healthy():
+        time.sleep(3)
+    assert risk_healthy()
+    hist = admin.req("GET", "/api/admin/containers/history", params={"service": "risk"}).json()
+    assert any(h["action"] == "container.restart" and h["actor"] == "admin" for h in hist)

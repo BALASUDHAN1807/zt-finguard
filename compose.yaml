@@ -242,6 +242,7 @@ services:
       <<: *svc-env
       SERVICE_NAME: responder
       COMPOSE_PROJECT: zt-finguard
+      REPORTS_DIR: /reports
       QUARANTINE_MIN_PRIORITY: "${QUARANTINE_MIN_PRIORITY:-Critical}"
       QUARANTINE_PAUSE: "${QUARANTINE_PAUSE:-0}"
       ALERT_WEBHOOK_URL: "${ALERT_WEBHOOK_URL:-}"
@@ -249,9 +250,11 @@ services:
       - {source: ca_crt, target: ca_crt}
       - {source: responder_crt, target: tls_crt}
       - {source: responder_key, target: tls_key}
+      - {source: image_signing_pub, target: image_signing_pub}
     volumes:
       - ${CONTAINER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
       - responder_state:/state
+      - ./reports:/reports:ro
     depends_on:
       audit: {condition: service_healthy}
 
@@ -361,6 +364,7 @@ volumes:
 
 secrets:
   ca_crt: {file: ./certs/ca.crt}
+  image_signing_pub: {file: ./secrets/image_signing.pub}
   gateway_crt: {file: ./certs/gateway.crt}
   gateway_key: {file: ./certs/gateway.key}
   dashboard_crt: {file: ./certs/dashboard.crt}

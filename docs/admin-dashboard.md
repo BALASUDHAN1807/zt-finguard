@@ -10,7 +10,7 @@ belong to a separate **Operations** role (module 3).
 | 2 | Identity & Devices | done |
 | 3 | Banking & Transactions (Operations role) | done |
 | 4 | AI Fraud Intelligence | done |
-| 5 | Container Security | planned |
+| 5 | Container Security | done |
 | 6 | Threat Center | planned |
 | 7 | Network Visualization | planned |
 | 8 | Policy Management (safe editor) | planned |
@@ -146,3 +146,30 @@ never rupee amounts** (separation of duties).
 
 OPA permission `admin.fraud` (admin only). Tests:
 `test_fraud_intelligence_explains_scores_without_amounts`, `test_analyst_labels_measure_false_positives`.
+
+## Module 5 - Container Security
+
+Page **Container security** (admin), tabs **Containers / Isolation & hardening / Images &
+vulnerabilities / Processes & network / Actions & history**. All data comes live from the
+Docker (or Podman) engine API through the **responder**, still the only service with the
+container socket.
+
+| Item | How |
+|---|---|
+| 1-2. Container list, status | every project container: state, health check, restarts, OOM |
+| 3-5. CPU, memory, uptime | engine stats (CPU % between two refreshes, memory without page cache, against the cgroup limit), start time |
+| 6. Rootless / non-root | engine rootless mode, container user (uid 10001 for our services), and the real process users from `top` (root processes counted) |
+| 7. Process monitoring | process list from the engine `top` API - works although the images contain no shell or ps |
+| 8. Network monitoring | attached networks and bytes received / sent |
+| 9. Image details | image, digest, build date, size, default user |
+| 10-11. Vulnerability scan status and counts | Trivy (`make scan`): critical / high / medium / low per image, secrets found, pass / BLOCK |
+| 12. Image signature verification | every deployment signs the exact image digests with an Ed25519 key (`scripts/sign-images.sh`, key in `secrets/`); the responder verifies the signature and compares each running container's digest: **verified**, **not in signed manifest** or **DIGEST MISMATCH** |
+| 13. Isolation status | per container: non-root, read-only filesystem, all capabilities dropped, no-new-privileges, not privileged, memory / process / CPU limits, own network namespace, networks, quarantined |
+| 14. Quarantine | isolate / release (feature 20) |
+| 15. Restart | needs the administrator's authenticator code; never the responder itself |
+| 16. Recovery | release from quarantine if isolated, restart from the signed image, wait until healthy, report each step |
+| 17. Security history | quarantines, releases, restarts, recoveries and Falco alerts per container, from the audit log |
+
+OPA permission `admin.containers`. Tests: `test_container_inventory_hardening_and_signatures`,
+`test_container_restart_needs_admin_code_and_is_audited`, `test_tampered_image_manifest_is_detected`
+(edits the manifest and checks the signature fails).

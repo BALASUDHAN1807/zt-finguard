@@ -15,14 +15,18 @@ Least privilege for a powerful component
   * accepts calls only from the "falco" and "gateway" workload identities (mTLS)
   * acts only on containers labelled com.docker.compose.project=<this project>
   * never quarantines itself or Falco
-  * only network disconnect/connect and pause/unpause are ever called
+  * only network disconnect/connect, pause/unpause and restart are ever called
+    (admin module 5 adds read-only inspect/stats/top/image and restart/recover)
 Works with the Docker Engine API and with Podman's Docker-compatible API.
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -233,6 +237,224 @@ async def manual_quarantine(body: ManualQuarantine, _c: str = Depends(mtls.requi
 @app.post("/quarantine/{service}/release")
 async def manual_release(service: str, body: ReleaseIn, _c: str = Depends(mtls.require_caller("gateway"))):
     return await release(service, body.actor)
+
+
+# -------------------------------------------- admin module 5: container security
+REPORTS_DIR = os.environ.get("REPORTS_DIR", "/reports")
+SIGNING_PUB = os.environ.get("IMAGE_SIGNING_PUB", "/run/secrets/image_signing_pub")
+_cpu_prev: dict[str, tuple[int, int]] = {}
+
+
+def signed_manifest() -> tuple[dict | None, str]:
+    """(images by service, status) - status explains why verification cannot be trusted."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    try:
+        doc = json.load(open(os.path.join(REPORTS_DIR, "image-manifest.json"), encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, "no signed manifest (deploy.sh signs one on every deployment)"
+    try:
+        key = load_pem_public_key(open(SIGNING_PUB, "rb").read())
+        key.verify(base64.b64decode(doc["signature"]), doc["payload"].encode())
+    except InvalidSignature:
+        return None, "manifest signature INVALID - the manifest was modified"
+    except (OSError, KeyError, ValueError) as exc:
+        return None, f"cannot verify manifest ({exc.__class__.__name__})"
+    return json.loads(doc["payload"]), "valid Ed25519 signature"
+
+
+def parse_engine_time(value: str | None) -> float | None:
+    """'2026-11-04T18:00:00.123456789Z' (nanoseconds, Docker/Podman) -> epoch seconds."""
+    import re
+    if not value or value.startswith("0001-"):
+        return None
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:?\d\d)?", value)
+    if not m:
+        return None
+    frac = (m.group(2) or ".0")[:7]
+    tz = m.group(3) or "Z"
+    tz = "+00:00" if tz == "Z" else (tz if ":" in tz else tz[:3] + ":" + tz[3:])
+    try:
+        return datetime.fromisoformat(m.group(1) + frac + tz).timestamp()
+    except ValueError:
+        return None
+
+
+def cpu_percent(service: str, stats: dict) -> float | None:
+    cpu = stats.get("cpu_stats") or {}
+    total = (cpu.get("cpu_usage") or {}).get("total_usage")
+    system = cpu.get("system_cpu_usage")
+    cpus = cpu.get("online_cpus") or len((cpu.get("cpu_usage") or {}).get("percpu_usage") or []) or 1
+    pre = stats.get("precpu_stats") or {}
+    prev = ((pre.get("cpu_usage") or {}).get("total_usage"), pre.get("system_cpu_usage"))
+    if not prev[0] or not prev[1]:
+        prev = _cpu_prev.get(service, (None, None))          # one-shot stats: use our last sample
+    if total is not None and system is not None:
+        _cpu_prev[service] = (total, system)
+    if None in (total, system) or None in prev or system <= prev[1]:
+        return None
+    return round((total - prev[0]) / (system - prev[1]) * cpus * 100, 2)
+
+
+def isolation_checks(insp: dict, quarantined: bool) -> dict:
+    hc, cfg = insp.get("HostConfig") or {}, insp.get("Config") or {}
+    sec = " ".join(hc.get("SecurityOpt") or [])
+    user = (cfg.get("User") or "").split(":")[0]
+    return {
+        "non_root_user": bool(user) and user not in ("0", "root"),
+        "read_only_rootfs": bool(hc.get("ReadonlyRootfs")),
+        "all_caps_dropped": "ALL" in (hc.get("CapDrop") or []) or "all" in (hc.get("CapDrop") or []),
+        "no_new_privileges": "no-new-privileges" in sec,
+        "not_privileged": not hc.get("Privileged"),
+        "memory_limit": bool(hc.get("Memory")),
+        "pids_limit": bool(hc.get("PidsLimit")) and (hc.get("PidsLimit") or 0) > 0,
+        "cpu_limit": bool(hc.get("NanoCpus") or hc.get("CpuQuota")),
+        "no_host_network": hc.get("NetworkMode") not in ("host",),
+        "isolated_now": quarantined,
+    }
+
+
+async def container_detail(c: dict, state: dict, manifest: dict | None) -> dict:
+    labels = c.get("Labels") or {}
+    service = labels.get("com.docker.compose.service", c["Id"][:12])
+    insp = (await engine_call("GET", f"/containers/{c['Id']}/json")).json()
+    st_ = insp.get("State") or {}
+    running = st_.get("Running", False)
+    stats = {}
+    if running:
+        try:
+            stats = (await engine_call("GET", f"/containers/{c['Id']}/stats",
+                                       params={"stream": "false", "one-shot": "true"})).json()
+        except HTTPException:
+            stats = {}
+    try:
+        img = (await engine_call("GET", f"/images/{insp.get('Image')}/json")).json()
+    except HTTPException:
+        img = {}
+    mem = stats.get("memory_stats") or {}
+    cache = (mem.get("stats") or {}).get("inactive_file", (mem.get("stats") or {}).get("cache", 0)) or 0
+    usage = max(0, (mem.get("usage") or 0) - cache)
+    limit = mem.get("limit") or (insp.get("HostConfig") or {}).get("Memory") or 0
+    nets = stats.get("networks") or {}
+    started = st_.get("StartedAt", "")
+    started_ts = parse_engine_time(started)
+    uptime = int(time.time() - started_ts) if running and started_ts else None
+    expected = ((manifest or {}).get("images") or {}).get(service)
+    if manifest is None:
+        signature = "unverified"
+    elif expected is None:
+        signature = "not in signed manifest"
+    elif expected["id"] == insp.get("Image"):
+        signature = "verified"
+    else:
+        signature = "DIGEST MISMATCH"
+    checks = isolation_checks(insp, service in state)
+    hardening = [k for k in checks if k != "isolated_now"]
+    return {
+        "service": service, "container": insp.get("Name", "").lstrip("/"), "id": c["Id"][:12],
+        "state": st_.get("Status"), "health": (st_.get("Health") or {}).get("Status", "no healthcheck"),
+        "started_at": started, "uptime_seconds": uptime, "restart_count": insp.get("RestartCount", 0),
+        "oom_killed": st_.get("OOMKilled", False),
+        "cpu_percent": cpu_percent(service, stats) if running else None,
+        "memory_bytes": usage, "memory_limit_bytes": limit,
+        "memory_percent": round(100 * usage / limit, 2) if limit else None,
+        "pids": (stats.get("pids_stats") or {}).get("current"),
+        "pids_limit": (insp.get("HostConfig") or {}).get("PidsLimit"),
+        "net_rx_bytes": sum(n.get("rx_bytes", 0) for n in nets.values()),
+        "net_tx_bytes": sum(n.get("tx_bytes", 0) for n in nets.values()),
+        "networks": sorted(((insp.get("NetworkSettings") or {}).get("Networks") or {}).keys()),
+        "quarantined": service in state,
+        "user": (insp.get("Config") or {}).get("User") or "(image default)",
+        "image": (insp.get("Config") or {}).get("Image"), "image_id": (insp.get("Image") or "")[:19],
+        "image_created": img.get("Created"), "image_size_bytes": img.get("Size"),
+        "image_tags": img.get("RepoTags") or [], "image_user": (img.get("Config") or {}).get("User") or "",
+        "signature": signature, "checks": checks,
+        "hardening_score": f"{sum(1 for k in hardening if checks[k])}/{len(hardening)}",
+        "seccomp": "default" if not any("seccomp" in o for o in (insp.get("HostConfig") or {}).get("SecurityOpt") or [])
+                   else "custom",
+    }
+
+
+@app.get("/containers")
+async def containers(_c: str = Depends(mtls.require_caller("gateway"))):
+    state = load_state()
+    manifest, manifest_status = signed_manifest()
+    try:
+        info = (await engine_call("GET", "/info")).json()
+        listed = await project_containers()
+    except Exception:  # noqa: BLE001
+        return {"engine_connected": False, "containers": [], "manifest_status": manifest_status}
+    rows = await asyncio.gather(*(container_detail(c, state, manifest) for c in listed), return_exceptions=True)
+    sec = " ".join(info.get("SecurityOptions") or [])
+    return {
+        "engine_connected": True,
+        "engine": {"name": "podman" if "podman" in (info.get("ServerVersion", "") + info.get("Name", "")).lower()
+                   or "podman" in json.dumps(info.get("Plugins") or {}).lower() else "docker",
+                   "version": info.get("ServerVersion"), "os": info.get("OperatingSystem"),
+                   "kernel": info.get("KernelVersion"), "cgroup": info.get("CgroupVersion"),
+                   "rootless": "rootless" in sec, "seccomp": "seccomp" in sec, "apparmor": "apparmor" in sec,
+                   "selinux": "selinux" in sec, "userns": "userns" in sec, "cpus": info.get("NCPU"),
+                   "memory_bytes": info.get("MemTotal")},
+        "manifest_status": manifest_status,
+        "manifest_signed_at": (manifest or {}).get("signed_at"),
+        "containers": sorted([r for r in rows if isinstance(r, dict)], key=lambda r: r["service"]),
+        "errors": [str(r) for r in rows if not isinstance(r, dict)],
+    }
+
+
+@app.get("/containers/{service}/processes")
+async def processes(service: str, _c: str = Depends(mtls.require_caller("gateway"))):
+    """Process list from the engine (works on images without a shell or ps)."""
+    c = await find_container(service=service)
+    top = (await engine_call("GET", f"/containers/{c['Id']}/top")).json()
+    titles = top.get("Titles") or []
+    procs = [dict(zip(titles, p)) for p in top.get("Processes") or []]
+    uid_col = next((t for t in titles if t.upper() in ("UID", "USER")), None)
+    as_root = [p for p in procs if uid_col and str(p.get(uid_col)) in ("0", "root")]
+    return {"service": service, "titles": titles, "processes": procs, "root_processes": len(as_root)}
+
+
+class ActorIn(BaseModel):
+    actor: str = Field(max_length=60)
+    reason: str = Field(default="", max_length=200)
+
+
+@app.post("/containers/{service}/restart")
+async def restart(service: str, body: ActorIn, _c: str = Depends(mtls.require_caller("gateway"))):
+    if service in NEVER_QUARANTINE:
+        raise HTTPException(400, f"{service} cannot be restarted from here")
+    c = await find_container(service=service)
+    await engine_call("POST", f"/containers/{c['Id']}/restart", params={"t": "10"}, timeout=40)
+    clients.audit(actor=body.actor, action="container.restart", resource=service, decision="alert",
+                  reason=body.reason or "restarted_by_administrator")
+    return {"service": service, "restarted": True}
+
+
+@app.post("/containers/{service}/recover")
+async def recover(service: str, body: ActorIn, _c: str = Depends(mtls.require_caller("gateway"))):
+    """Recovery = release from quarantine (if isolated) + restart + wait until healthy."""
+    if service in NEVER_QUARANTINE:
+        raise HTTPException(400, f"{service} cannot be recovered from here")
+    steps = []
+    if service in load_state():
+        await release(service, body.actor)
+        steps.append("released from quarantine (networks restored)")
+    c = await find_container(service=service)
+    await engine_call("POST", f"/containers/{c['Id']}/restart", params={"t": "10"}, timeout=40)
+    steps.append("restarted from its signed image")
+    health = "unknown"
+    for _ in range(30):
+        await asyncio.sleep(2)
+        st_ = (await engine_call("GET", f"/containers/{c['Id']}/json")).json().get("State") or {}
+        health = (st_.get("Health") or {}).get("Status") or ("running" if st_.get("Running") else st_.get("Status"))
+        if health in ("healthy", "running"):
+            break
+    steps.append(f"health: {health}")
+    ok = health in ("healthy", "running")
+    clients.audit(actor=body.actor, action="container.recover", resource=service,
+                  decision="info" if ok else "alert", reason=body.reason or ("recovered" if ok else "recovery_failed"),
+                  details={"steps": steps})
+    return {"service": service, "recovered": ok, "steps": steps}
 
 
 @app.get("/healthz")

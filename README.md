@@ -123,7 +123,7 @@ through the same checks as any API call.
 
 ```bash
 make opa-test     # 27 policy unit tests
-make test         # 41 end-to-end tests through the gateway (stack must be running)
+make test         # 44 end-to-end tests through the gateway (stack must be running)
 make scan         # Trivy; fails on CRITICAL vulnerabilities or leaked secrets
 ```
 

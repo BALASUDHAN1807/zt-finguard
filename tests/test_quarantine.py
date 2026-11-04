@@ -126,3 +126,24 @@ def test_responder_refuses_non_falco_callers_and_low_severity():
     assert run("gateway") == "403"
     assert json.loads(run("falco"))["action"] == "logged"
     assert networks_of("account")                              # untouched
+
+
+def test_tampered_image_manifest_is_detected():
+    """Admin module 5: editing the signed image manifest breaks its Ed25519 signature."""
+    path = os.path.join(ROOT, "reports", "image-manifest.json")
+    original = open(path, encoding="utf-8").read()
+    doc = json.loads(original)
+    payload = json.loads(doc["payload"])
+    first = sorted(payload["images"])[0]
+    payload["images"][first]["id"] = "sha256:" + "0" * 64          # pretend an attacker swapped an image
+    doc["payload"] = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    admin = logged_in("admin")
+    try:
+        open(path, "w", encoding="utf-8").write(json.dumps(doc))
+        d = admin.req("GET", "/api/admin/containers").json()
+        assert "INVALID" in d["manifest_status"]
+        assert all(c["signature"] == "unverified" for c in d["containers"])
+    finally:
+        open(path, "w", encoding="utf-8").write(original)
+    d = admin.req("GET", "/api/admin/containers").json()
+    assert d["manifest_status"].startswith("valid")
