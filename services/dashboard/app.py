@@ -470,7 +470,7 @@ def sidebar() -> str:
             "customer": ["My account", "Send money", "Security settings"],
             "teller": ["Account lookup", "Security settings"],
             "operations": ["Banking & transactions", "Security settings"],
-            "admin": ["Security overview", "Identity & devices", "Access decisions", "Risk model", "Audit integrity",
+            "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Access decisions", "Audit integrity",
                       "Session & device policy", "Containers & quarantine", "Security settings"],
         }[ss.role]
         page = st.radio("Navigate", pages, label_visibility="collapsed")
@@ -1682,6 +1682,259 @@ def ops_pending() -> None:
                             f"#{x['id']} rejected. No money moved.")
 
 
+# ------------------------------------------- admin module 4: fraud intelligence
+PATTERN_LABEL = {"unusual_amount": "Unusual amount for the customer", "drains_balance": "Drains most of the balance",
+                 "unusual_time": "Unusual time of day", "new_payee": "First transfer to a payee",
+                 "velocity": "Many transfers in 10 minutes", "mule_destination": "Empty receiving account (mule)",
+                 "untrusted_device": "From an unverified device"}
+LEVEL_COLORS = alt.Scale(domain=["low", "medium", "high"], range=["#1F7A4D", "#B8892B", "#B42318"])
+
+
+def fraud_intelligence() -> None:
+    st.title("AI fraud intelligence")
+    top = st.columns([3, 1])
+    top[0].caption("Every transfer is scored by the PaySim-trained model plus behavioural rules before money moves. "
+                   "Amounts are shown as ratios (share of balance, times the usual) - administrators never see "
+                   "balances or rupee amounts.")
+    days = top[1].selectbox("Window", [1, 7, 30, 90], index=1, format_func=lambda d: f"Last {d} day{'s' * (d > 1)}")
+    r = api("GET", "/api/admin/fraud", params={"days": days})
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    f = r.json()
+    t = st.tabs(["Live scoring", "Patterns & anomalies", "High-risk accounts", "Model & accuracy"])
+    with t[0]:
+        fraud_live(f)
+    with t[1]:
+        fraud_patterns(f)
+    with t[2]:
+        fraud_accounts(f)
+    with t[3]:
+        fraud_model(f)
+
+
+def tx_frame(rows: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+    df["top factors"] = df["explanation"].apply(
+        lambda ex: ", ".join(str(x.get("factor") or x.get("text") or "?") for x in (ex or [])[:3]) or "-")
+    df["share of balance"] = df["drain_ratio"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "-")
+    df["vs usual"] = df["times_usual"].apply(lambda x: f"{x:.1f}x" if pd.notna(x) else "-")
+    df["ML probability"] = df["ml_probability"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "-")
+    df["level"] = df.apply(lambda x: x["level"] if isinstance(x["level"], str) else
+                           ("-" if pd.isna(x["score"]) else "high" if x["score"] >= 0.75
+                            else "medium" if x["score"] >= 0.4 else "low"), axis=1)
+    df["label"] = df["label"].fillna("")
+    return df
+
+
+def fraud_live(f: dict) -> None:
+    tt = f["totals"]
+    k = st.columns(6)
+    k[0].metric("Transfers scored", tt["transfers"])
+    k[1].metric("Flagged", tt["flagged"])
+    k[2].metric("Blocked", tt["blocked"])
+    k[3].metric("Extra code asked", tt["step_up"])
+    k[4].metric("Average risk", f"{tt['avg_score']:.2f}" if tt["avg_score"] is not None else "-")
+    k[5].metric("Average ML probability", f"{tt['avg_ml_probability']:.0%}" if tt["avg_ml_probability"] else "-")
+    if not f["live"]:
+        st.info("No transfers in this window yet.")
+        return
+    st.subheader("Real-time risk scores")
+    df = tx_frame(f["live"])
+    st.dataframe(df[["time", "customer", "account", "score", "ML probability", "level", "decision",
+                     "share of balance", "vs usual", "top factors", "label"]],
+                 hide_index=True, use_container_width=True, height=360,
+                 column_config={"score": st.column_config.ProgressColumn("risk score", min_value=0, max_value=1,
+                                                                          format="%.2f")})
+    st.subheader("Why was it flagged?")
+    pool = f["suspicious"] or f["live"]
+    opts = {f"#{x['tx_id'] or '-'} {x['customer']} {local_time(pd.Series([x['ts']]), '%d %b %H:%M').iloc[0]} "
+            f"score {x['score'] or 0:.2f} ({x['decision']})": x for x in pool}
+    x = opts[st.selectbox("Flagged transfer", list(opts))]
+    a, b = st.columns([1.4, 1])
+    with a:
+        ex = pd.DataFrame([e | {"factor": e.get("factor") or "rule", "weight": e.get("weight") or 0,
+                                "text": e.get("text") or e.get("factor") or "?"} for e in x["explanation"]]) \
+            if x["explanation"] else pd.DataFrame()
+        if ex.empty:
+            st.caption("No risk factors: the model saw a typical transfer.")
+        else:
+            st.altair_chart(alt.Chart(ex).mark_bar(color="#0B3D4A", cornerRadiusEnd=2).encode(
+                x=alt.X("weight:Q", title="contribution to the score"),
+                y=alt.Y("text:N", sort="-x", title=None, axis=alt.Axis(labelLimit=360)),
+                tooltip=["factor", "weight", "text"]).properties(height=40 * len(ex) + 30), use_container_width=True)
+            st.caption("ML factors come from an occlusion explanation (each feature reset to a typical legitimate "
+                       "value, measuring how much the fraud probability drops); rule factors carry fixed weights.")
+    with b:
+        sig = {"Risk score": f"{x['score'] or 0:.2f} ({x['level'] or '-'})",
+               "ML fraud probability": f"{x['ml_probability']:.0%}" if x["ml_probability"] is not None else "-",
+               "Share of balance": f"{x['drain_ratio']:.0%}" if x["drain_ratio"] is not None else "-",
+               "Versus usual transfer": f"{x['times_usual']:.1f}x" if x["times_usual"] is not None else "-",
+               "New payee": "yes" if x["new_payee"] else "no",
+               "Hour": f"{x['hour']:02d}:00" if x["hour"] is not None else "-",
+               "Transfers in 10 min": x["velocity_10m"] if x["velocity_10m"] is not None else "-",
+               "Device": x["device_trust"] or "-", "Outcome": x["decision"]}
+        st.dataframe(pd.DataFrame(sig.items(), columns=["signal", "value"]), hide_index=True,
+                     use_container_width=True)
+        if x["tx_id"]:
+            with st.form("label"):
+                st.markdown(f"**Analyst review** (now: {x['label'] or 'not reviewed'})")
+                note = st.text_input("Note", placeholder="e.g. customer confirmed by phone")
+                c1, c2 = st.columns(2)
+                fraud = c1.form_submit_button("Confirmed fraud", type="primary", use_container_width=True)
+                legit = c2.form_submit_button("False positive", use_container_width=True)
+                if fraud or legit:
+                    ok_or_error(api("POST", "/api/admin/fraud/label",
+                                    json={"tx_id": x["tx_id"], "label": "fraud" if fraud else "legit", "note": note}),
+                                "Label saved to the audit log. Accuracy figures update on the next refresh.")
+
+
+def fraud_patterns(f: dict) -> None:
+    a, b = st.columns(2)
+    with a:
+        st.subheader("Detected patterns")
+        p = pd.DataFrame([{"pattern": PATTERN_LABEL[k], "transfers": v} for k, v in f["patterns"].items()])
+        st.altair_chart(alt.Chart(p).mark_bar(color="#B8892B", cornerRadiusEnd=2).encode(
+            x=alt.X("transfers:Q", axis=alt.Axis(tickMinStep=1, format="d")),
+            y=alt.Y("pattern:N", sort="-x", title=None, axis=alt.Axis(labelLimit=260)),
+            tooltip=["pattern", "transfers"]).properties(height=250), use_container_width=True)
+    with b:
+        st.subheader("Transfer frequency by hour")
+        h = pd.DataFrame(f["hourly"])
+        h["night"] = h["hour"].apply(lambda x: "00-06 (unusual)" if x < 6 else "day")
+        st.altair_chart(alt.Chart(h).mark_bar(cornerRadiusTopLeft=2, cornerRadiusTopRight=2).encode(
+            x=alt.X("hour:O", title="hour of day (IST)", axis=alt.Axis(labelAngle=0, values=list(range(0, 24, 3)))),
+            y=alt.Y("transfers:Q", axis=alt.Axis(tickMinStep=1, format="d")),
+            color=alt.Color("night:N", title=None, scale=alt.Scale(domain=["day", "00-06 (unusual)"],
+                                                                     range=["#0B3D4A", "#B42318"]),
+                            legend=alt.Legend(orient="top")),
+            tooltip=["hour", "transfers"]).properties(height=250), use_container_width=True)
+    a, b = st.columns(2)
+    with a:
+        st.subheader("Device-based risk")
+        if f["device"]:
+            d = pd.DataFrame(f["device"])
+            d["flagged share"] = (d["flagged"] / d["transfers"]).round(2)
+            st.dataframe(d, hide_index=True, use_container_width=True,
+                         column_config={"flagged share": st.column_config.ProgressColumn(
+                             "flagged share", min_value=0, max_value=1, format="%.2f")})
+        st.caption("Transfers from devices that are not yet trusted are refused by policy (device_not_trusted).")
+    with b:
+        st.subheader("Sign-in and location anomalies")
+        ls = f["login_signals"]
+        k = st.columns(4)
+        k[0].metric("New network", ls["network_changed"])
+        k[1].metric("New device", ls["new_device"])
+        k[2].metric("After failures", ls["failed_attempts"])
+        k[3].metric("Odd hour", ls["odd_hour"])
+        if f["location_anomaly_users"]:
+            st.dataframe(pd.DataFrame(f["location_anomaly_users"]), hide_index=True, use_container_width=True)
+        st.caption("Location is compared as the network a user signs in from (no GeoIP database is bundled).")
+    st.subheader("Abnormal spending patterns")
+    if f["spikes"]:
+        st.dataframe(pd.DataFrame(f["spikes"]), hide_index=True, use_container_width=True,
+                     column_config={"today": "transfers today", "usual_per_day": "usual per day"})
+    else:
+        st.caption("No account sent more than 3x its usual number of transfers today.")
+
+
+def fraud_accounts(f: dict) -> None:
+    st.subheader("High-risk accounts")
+    if f["accounts"]:
+        df = pd.DataFrame(f["accounts"])
+        st.dataframe(df[["account", "customer", "risk_rank", "max_score", "avg_score", "transfers", "blocked",
+                         "step_up", "high", "sessions_revoked", "confirmed_fraud"]], hide_index=True,
+                     use_container_width=True,
+                     column_config={"risk_rank": st.column_config.ProgressColumn("risk rank", min_value=0,
+                                                                                  max_value=1.5, format="%.2f"),
+                                    "max_score": "highest score", "avg_score": "average score",
+                                    "high": "high-risk", "step_up": "extra code"})
+        st.caption("Rank = 0.6 x highest score + 0.4 x average score + 0.1 per blocked transfer "
+                   "+ 0.3 per analyst-confirmed fraud.")
+    else:
+        st.info("No transfers in this window.")
+    st.subheader("Fraud alerts")
+    if f["alerts"]:
+        df = tx_frame(f["alerts"])
+        st.dataframe(df[["time", "customer", "account", "score", "decision", "reason", "share of balance",
+                         "top factors", "session_revoked"]], hide_index=True, use_container_width=True,
+                     column_config={"session_revoked": "sessions ended"})
+    else:
+        st.success("No blocked high-risk or high-value transfers in this window.")
+    st.subheader("Historical fraud analytics")
+    if f["daily"]:
+        d = pd.DataFrame(f["daily"]).melt(id_vars=["day"], value_vars=["low", "medium", "high"],
+                                          var_name="level", value_name="transfers")
+        st.altair_chart(alt.Chart(d).mark_bar().encode(
+            x=alt.X("day:O", title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("transfers:Q", stack=True, axis=alt.Axis(tickMinStep=1, format="d")),
+            color=alt.Color("level:N", scale=LEVEL_COLORS, legend=alt.Legend(orient="top"), title=None),
+            tooltip=["day", "level", "transfers"]).properties(height=240), use_container_width=True)
+        dd = pd.DataFrame(f["daily"])
+        dd["blocked rate"] = (dd["blocked"] / dd["total"]).round(3)
+        st.dataframe(dd, hide_index=True, use_container_width=True)
+
+
+def fraud_model(f: dict) -> None:
+    m, acc = f.get("model"), f["accuracy"]
+    st.subheader("In production: accuracy against analyst reviews")
+    k = st.columns(5)
+    k[0].metric("Reviewed transfers", acc["labelled"])
+    k[1].metric("Precision", f"{acc['precision']:.0%}" if acc["precision"] is not None else "-",
+                help="Of flagged transfers that were reviewed, the share that was real fraud")
+    k[2].metric("Recall", f"{acc['recall']:.0%}" if acc["recall"] is not None else "-",
+                help="Of reviewed real fraud, the share the system flagged")
+    k[3].metric("False-positive rate", f"{acc['false_positive_rate']:.0%}"
+                if acc["false_positive_rate"] is not None else "-")
+    k[4].metric("Cleared by the customer", f"{acc['step_up_cleared_by_customer']} of {acc['step_ups']}",
+                help="Medium-risk transfers the customer confirmed with a fresh authenticator code")
+    cm = pd.DataFrame([["Flagged", acc["true_positive"], acc["false_positive"]],
+                       ["Not flagged", acc["false_negative"], acc["true_negative"]]],
+                      columns=["system", "confirmed fraud", "false positive / legitimate"])
+    a, b = st.columns([1, 1.4])
+    with a:
+        st.markdown("**Confusion matrix (reviewed transfers)**")
+        st.dataframe(cm, hide_index=True, use_container_width=True)
+        if not acc["labelled"]:
+            st.caption("Review flagged transfers on the Live scoring tab to measure real-world precision "
+                       "and false positives.")
+    with b:
+        st.markdown("**Fraud prediction: score distribution**")
+        hdf = pd.DataFrame(f["histogram"]).melt(id_vars=["bin"], var_name="level", value_name="transfers")
+        st.altair_chart(alt.Chart(hdf).mark_bar().encode(
+            x=alt.X("bin:O", title="risk score", axis=alt.Axis(labelAngle=0, values=[0.0, 0.25, 0.4, 0.5, 0.75])),
+            y=alt.Y("transfers:Q", stack=True, axis=alt.Axis(tickMinStep=1, format="d")),
+            color=alt.Color("level:N", scale=LEVEL_COLORS, title=None, legend=alt.Legend(orient="top")),
+            tooltip=["bin", "level", "transfers"]).properties(height=220), use_container_width=True)
+        st.caption("0.40 and above asks for an extra code; 0.75 and above blocks and ends every session.")
+    st.subheader("Model performance (held-out test set)")
+    if not m:
+        st.error("Risk engine unavailable.")
+        return
+    if m.get("synthetic"):
+        st.warning("Trained on the bundled **synthetic PaySim-shaped sample**. Download the real PaySim dataset "
+                   "and run `make train` before reporting results.")
+    t = m["test"]
+    c = st.columns(5)
+    c[0].metric("PR-AUC", f"{t['pr_auc']:.3f}")
+    c[1].metric("ROC-AUC", f"{t['roc_auc']:.3f}")
+    c[2].metric("Recall @ 0.40", f"{t['at_medium']['recall']:.1%}")
+    c[3].metric("Precision @ 0.40", f"{t['at_medium']['precision']:.1%}")
+    c[4].metric("Precision @ 0.75", f"{t['at_high']['precision']:.1%}")
+    leak = m["leaky_baseline_with_post_balances"]["pr_auc"]
+    cmp = pd.DataFrame({"model": ["Leak-free model (deployed)", "Leaky baseline (not usable)"],
+                        "PR-AUC": [t["pr_auc"], leak]})
+    st.altair_chart(alt.Chart(cmp).mark_bar(cornerRadiusEnd=3).encode(
+        x=alt.X("PR-AUC:Q", scale=alt.Scale(domain=[0, 1])),
+        y=alt.Y("model:N", title=None, sort=None, axis=alt.Axis(labelLimit=320)),
+        color=alt.Color("model:N", legend=None, scale=alt.Scale(range=["#0B3D4A", "#A7B4B9"])),
+        tooltip=["model", "PR-AUC"]).properties(height=120), use_container_width=True)
+    st.caption("The leaky baseline uses post-transaction balances, which only exist after the money has moved.")
+    with st.expander("Model card"):
+        st.json({k: m[k] for k in ("dataset", "trained_at", "rows_transfer_cashout", "fraud_rate", "features")})
+
+
 # -------------------------------------------------------------------- main
 ss = S()
 topbar(bool(ss.token))
@@ -1697,6 +1950,7 @@ else:
         "Security overview": security_overview,
         "Identity & devices": identity_devices,
         "Banking & transactions": banking_operations,
+        "AI fraud intelligence": fraud_intelligence,
         "Access decisions": access_decisions,
         "Risk model": risk_model,
         "Audit integrity": audit_integrity,

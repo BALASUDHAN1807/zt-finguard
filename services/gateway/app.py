@@ -615,6 +615,31 @@ async def release(service: str, claims: dict = Depends(session)):
     return await forward("POST", "responder", f"/quarantine/{service}/release", body={"actor": claims["usr"]})
 
 
+# ------------------------------------------- module 4: fraud intelligence
+class FraudLabelBody(BaseModel):
+    tx_id: int = Field(gt=0)
+    label: str = Field(pattern=r"^(fraud|legit)$")
+    note: str = Field(default="", max_length=200)
+
+
+@app.get("/api/admin/fraud")
+async def fraud_intel(days: int = 7, claims: dict = Depends(session)):
+    await require_admin_action("admin.fraud", claims)
+    data = await get_json("audit", "/fraud", params={"days": max(1, min(days, 90))}, timeout=30)
+    if data is None:
+        raise HTTPException(502, "audit service unavailable")
+    return data | {"model": await get_json("risk", "/model")}
+
+
+@app.post("/api/admin/fraud/label")
+async def fraud_label(body: FraudLabelBody, claims: dict = Depends(session)):
+    """Analyst feedback. Stored as an audit event, so labels are tamper-evident too."""
+    await require_admin_action("admin.fraud", claims)
+    clients.audit(actor=claims["usr"], action="fraud.label", resource=f"tx:{body.tx_id}", decision="info",
+                  reason=body.label, details=body.model_dump())
+    return {"tx_id": body.tx_id, "label": body.label}
+
+
 # ------------------------------------------- module 3: banking & transactions
 class BeneficiaryBody(BaseModel):
     account_no: str = Field(pattern=r"^ZT\d{10}$")

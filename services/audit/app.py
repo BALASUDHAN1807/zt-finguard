@@ -315,6 +315,195 @@ async def logins(user: str | None = Query(None, max_length=40), limit: int = Que
     return {"events": rows, "failed_by_user_24h": failed}
 
 
+# ---------------------------------------------- admin module 4: fraud intelligence
+SCORE_BINS = [round(i * 0.05, 2) for i in range(21)]
+AMOUNT_FACTORS = {"unusual_amount", "log_amount"}
+IST = "Asia/Kolkata"
+
+
+def flagged(e: dict) -> bool:
+    lv = (e["details"].get("signals") or {}).get("level")
+    return e["decision"] in ("deny", "step_up") or lv in ("medium", "high") or (e["risk"] or 0) >= 0.40
+
+
+def tx_view(e: dict) -> dict:
+    """A transfer as the security team sees it: scores, reasons and ratios - never the amount."""
+    d, sig = e["details"], e["details"].get("signals") or {}
+    return {"audit_id": e["id"], "ts": e["ts"], "tx_id": d.get("tx_id"), "customer": e["actor"],
+            "account": e["resource"], "payee": d.get("to"), "decision": e["decision"], "reason": e["reason"],
+            "score": e["risk"], "level": sig.get("level"), "ml_probability": sig.get("ml_probability"),
+            "drain_ratio": sig.get("drain_ratio"), "times_usual": sig.get("times_usual"),
+            "new_payee": sig.get("new_payee"), "hour": sig.get("hour"), "velocity_10m": sig.get("velocity_10m"),
+            "device_trust": sig.get("device_trust"), "stepped_up": d.get("stepped_up"),
+            "session_revoked": d.get("session_revoked"),
+            "factors": [r.get("factor") for r in d.get("reasons", []) if isinstance(r, dict) and r.get("factor")],
+            "explanation": [{"factor": r.get("factor"), "weight": r.get("weight"), "text": r.get("text")}
+                            for r in d.get("reasons", []) if isinstance(r, dict)]}
+
+
+@app.get("/fraud")
+async def fraud(days: int = Query(7, ge=1, le=90), _caller: str = Depends(mtls.require_caller("gateway"))):
+    cols = "id, ts, service, actor, action, resource, decision, reason, risk, details"
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            f"SELECT {cols} FROM audit_log WHERE action IN ('transaction.transfer', 'auth.login', 'fraud.label') "
+            "AND ts > now() - make_interval(days => %s) ORDER BY id DESC LIMIT 50000", (days,))
+        rows = await cur.fetchall()
+    for r in rows:
+        r["ts"] = chain.norm_ts(r["ts"])
+        r["risk"] = float(r["risk"]) if r["risk"] is not None else None
+        r["details"] = r["details"] or {}
+    transfers = [tx_view(e) for e in rows if e["action"] == "transaction.transfer"]
+    raw_tx = [e for e in rows if e["action"] == "transaction.transfer"]
+    logins = [e for e in rows if e["action"] == "auth.login"]
+
+    # analyst labels: newest label per transaction wins (labels are themselves audit events)
+    labels: dict[int, dict] = {}
+    for e in rows:
+        if e["action"] == "fraud.label":
+            tx = e["details"].get("tx_id")
+            if tx is not None and tx not in labels:
+                labels[tx] = {"label": e["details"].get("label"), "by": e["actor"], "ts": e["ts"],
+                              "note": e["details"].get("note")}
+    by_id = {e["id"]: e for e in raw_tx}
+    for t in transfers:
+        t["label"] = (labels.get(t["tx_id"]) or {}).get("label")
+        t["flagged"] = flagged(by_id[t["audit_id"]])
+
+    scored = [t for t in transfers if t["score"] is not None]
+    suspicious = [t for t in transfers if t["flagged"]]
+
+    def has(t, *factors):
+        return any(f in factors for f in t["factors"])
+    patterns = {
+        "unusual_amount": sum(1 for t in transfers if has(t, *AMOUNT_FACTORS)),
+        "drains_balance": sum(1 for t in transfers if has(t, "drain_ratio") or (t["drain_ratio"] or 0) >= 0.5),
+        "unusual_time": sum(1 for t in transfers if has(t, "hour") or (t["hour"] is not None and t["hour"] < 6)),
+        "new_payee": sum(1 for t in transfers if t["new_payee"]),
+        "velocity": sum(1 for t in transfers if has(t, "velocity")),
+        "mule_destination": sum(1 for t in transfers if has(t, "dest_balance_zero")),
+        "untrusted_device": sum(1 for e in raw_tx if "device_not_trusted" in (e["reason"] or "")),
+    }
+    # location / device anomalies on sign-in (network changed, new device)
+    login_signals = {"network_changed": 0, "new_device": 0, "failed_attempts": 0, "odd_hour": 0}
+    loc_users: dict[str, int] = {}
+    for e in logins:
+        for r in e["details"].get("reasons", []) or []:
+            f = r.get("factor") if isinstance(r, dict) else None
+            key = {"ip_changed": "network_changed"}.get(f, f)
+            if key in login_signals:
+                login_signals[key] += 1
+            if f == "ip_changed":
+                loc_users[e["actor"]] = loc_users.get(e["actor"], 0) + 1
+    device = {}
+    for t in transfers:
+        k = t["device_trust"] or "unknown"
+        d = device.setdefault(k, {"device_trust": k, "transfers": 0, "flagged": 0, "score_sum": 0.0})
+        d["transfers"] += 1
+        d["flagged"] += int(t["flagged"])
+        d["score_sum"] += t["score"] or 0
+    for d in device.values():
+        d["avg_score"] = round(d.pop("score_sum") / max(d["transfers"], 1), 3)
+
+    # accounts ranked by risk
+    acc: dict[str, dict] = {}
+    for t in transfers:
+        a = acc.setdefault(t["account"], {"account": t["account"], "customer": t["customer"], "transfers": 0,
+                                          "blocked": 0, "step_up": 0, "high": 0, "max_score": 0.0,
+                                          "score_sum": 0.0, "sessions_revoked": 0, "confirmed_fraud": 0})
+        a["transfers"] += 1
+        a["blocked"] += int(t["decision"] == "deny")
+        a["step_up"] += int(t["decision"] == "step_up")
+        a["high"] += int(t["level"] == "high" or (t["score"] or 0) >= 0.75)
+        a["max_score"] = max(a["max_score"], t["score"] or 0)
+        a["score_sum"] += t["score"] or 0
+        a["sessions_revoked"] += int(bool(t["session_revoked"]))
+        a["confirmed_fraud"] += int(t["label"] == "fraud")
+    for a in acc.values():
+        a["avg_score"] = round(a.pop("score_sum") / max(a["transfers"], 1), 3)
+        a["risk_rank"] = round(0.6 * a["max_score"] + 0.4 * a["avg_score"] + 0.1 * a["blocked"]
+                               + 0.3 * a["confirmed_fraud"], 3)
+    accounts = sorted(acc.values(), key=lambda a: -a["risk_rank"])
+
+    # history per day and frequency per hour (Indian time)
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(IST)
+    daily: dict[str, dict] = {}
+    hourly = {h: 0 for h in range(24)}
+    per_acct_day: dict[tuple, int] = {}
+    for t in transfers:
+        local = _dt.fromisoformat(t["ts"]).astimezone(tz)
+        day = local.strftime("%Y-%m-%d")
+        d = daily.setdefault(day, {"day": day, "low": 0, "medium": 0, "high": 0, "blocked": 0, "total": 0})
+        lv = t["level"] or ("high" if (t["score"] or 0) >= 0.75 else "medium" if (t["score"] or 0) >= 0.4 else "low")
+        if lv in d:
+            d[lv] += 1
+        d["blocked"] += int(t["decision"] == "deny")
+        d["total"] += 1
+        hourly[local.hour] += 1
+        per_acct_day[(t["account"], day)] = per_acct_day.get((t["account"], day), 0) + 1
+    today = _dt.now(tz).strftime("%Y-%m-%d")
+    spikes = []
+    for a in {k[0] for k in per_acct_day}:
+        days_seen = [n for (acct, day), n in per_acct_day.items() if acct == a and day != today]
+        base = sum(days_seen) / len(days_seen) if days_seen else 0
+        now_n = per_acct_day.get((a, today), 0)
+        if now_n >= 3 and now_n > 3 * max(base, 1):
+            spikes.append({"account": a, "today": now_n, "usual_per_day": round(base, 1)})
+
+    # score distribution
+    hist = [{"bin": b, "low": 0, "medium": 0, "high": 0} for b in SCORE_BINS[:-1]]
+    for t in scored:
+        i = min(int((t["score"] or 0) / 0.05), 19)
+        lv = "high" if t["score"] >= 0.75 else "medium" if t["score"] >= 0.4 else "low"
+        hist[i][lv] += 1
+
+    # accuracy against analyst labels (+ customers who passed the step-up)
+    lab = [t for t in transfers if t["label"] in ("fraud", "legit")]
+    tp = sum(1 for t in lab if t["flagged"] and t["label"] == "fraud")
+    fp = sum(1 for t in lab if t["flagged"] and t["label"] == "legit")
+    fn = sum(1 for t in lab if not t["flagged"] and t["label"] == "fraud")
+    tn = sum(1 for t in lab if not t["flagged"] and t["label"] == "legit")
+    cleared = sum(1 for t in transfers if t["decision"] == "allow" and t["stepped_up"])
+    accuracy = {"labelled": len(lab), "true_positive": tp, "false_positive": fp, "false_negative": fn,
+                "true_negative": tn,
+                "precision": round(tp / (tp + fp), 3) if tp + fp else None,
+                "recall": round(tp / (tp + fn), 3) if tp + fn else None,
+                "false_positive_rate": round(fp / (fp + tn), 3) if fp + tn else None,
+                "step_up_cleared_by_customer": cleared,
+                "step_ups": sum(1 for t in transfers if t["decision"] == "step_up")}
+
+    alerts = [t for t in transfers if t["decision"] == "deny" and "risk_too_high" in (t["reason"] or "")
+              or t["reason"] == "high_value_pending_approval"][:30]
+    return {
+        "days": days,
+        "totals": {"transfers": len(transfers), "flagged": len(suspicious),
+                   "blocked": sum(1 for t in transfers if t["decision"] == "deny"),
+                   "step_up": sum(1 for t in transfers if t["decision"] == "step_up"),
+                   "avg_score": round(sum(t["score"] for t in scored) / len(scored), 3) if scored else None,
+                   "avg_ml_probability": round(sum(t["ml_probability"] for t in scored if t["ml_probability"]
+                                                   is not None) / max(1, sum(1 for t in scored if t["ml_probability"]
+                                                                              is not None)), 3)},
+        "live": transfers[:40],
+        "suspicious": suspicious[:60],
+        "patterns": patterns,
+        "login_signals": login_signals,
+        "location_anomaly_users": sorted(({"user": u, "network_changes": n} for u, n in loc_users.items()),
+                                         key=lambda x: -x["network_changes"])[:15],
+        "device": sorted(device.values(), key=lambda d: d["device_trust"]),
+        "accounts": accounts[:25],
+        "spikes": spikes,
+        "alerts": alerts,
+        "daily": sorted(daily.values(), key=lambda d: d["day"]),
+        "hourly": [{"hour": h, "transfers": n} for h, n in hourly.items()],
+        "histogram": hist,
+        "accuracy": accuracy,
+        "labels": [{"tx_id": k} | v for k, v in list(labels.items())[:50]],
+    }
+
+
 @app.get("/verify")
 async def verify_chain(_caller: str = Depends(mtls.require_caller("gateway"))):
     p = await db.pool()

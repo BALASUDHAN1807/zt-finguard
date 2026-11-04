@@ -9,7 +9,7 @@ belong to a separate **Operations** role (module 3).
 | 1 | Security Overview | done |
 | 2 | Identity & Devices | done |
 | 3 | Banking & Transactions (Operations role) | done |
-| 4 | AI Fraud Intelligence | planned |
+| 4 | AI Fraud Intelligence | done |
 | 5 | Container Security | planned |
 | 6 | Threat Center | planned |
 | 7 | Network Visualization | planned |
@@ -116,3 +116,33 @@ Schema: `db/migrations/003-banking-operations.sql` (applied by `./deploy.sh` / `
 Tests: `test_high_value_transfer_waits_for_operations_approval`,
 `test_frozen_account_and_daily_limit_are_enforced_by_policy`,
 `test_beneficiaries_need_a_code_and_receipts_stay_private`.
+
+## Module 4 - AI Fraud Intelligence
+
+Page **AI fraud intelligence** (admin), window 1 / 7 / 30 / 90 days, tabs **Live scoring /
+Patterns & anomalies / High-risk accounts / Model & accuracy**. Every transfer's audit entry now
+carries the model's signals (`signals`: ML probability, level, share of balance, times the
+customer's usual amount, new payee, hour, transfers in 10 minutes, device trust, model version);
+the audit service computes the analytics from the hash-chained log. Administrators see **ratios,
+never rupee amounts** (separation of duties).
+
+| Item | How |
+|---|---|
+| 1-2. Real-time risk scores, fraud probability | every transfer: risk score, ML probability, level, decision, top factors |
+| 3. Suspicious transactions | flagged = blocked, extra code asked, or score >= 0.40 |
+| 4. Unusual amount | `unusual_amount` / `log_amount` factors; "x times usual" per transfer |
+| 5. Unusual timing | `hour` factor or 00:00-06:00; frequency-by-hour chart marks those hours |
+| 6. Abnormal spending pattern | accounts sending more than 3x their usual number of transfers today; balance-draining transfers |
+| 7. Device-based risk | flagged share per device trust (trusted / pending); `device_not_trusted` denials |
+| 8. Location anomaly | sign-ins from a new network (`ip_changed`) per user; new device, failures, odd hour |
+| 9. Frequency analysis | transfers per hour of day; velocity factor (3+ in 10 minutes) |
+| 10. High-risk accounts | rank = 0.6 x highest score + 0.4 x average + 0.1 per block + 0.3 per confirmed fraud |
+| 11. Fraud alerts | blocked high-risk transfers (sessions ended) and high-value holds |
+| 12. AI explanation | per transfer: occlusion contributions of the ML features + rule weights, beside its signals |
+| 13. Historical analytics | per day: low / medium / high, blocked, blocked rate |
+| 14. Prediction statistics | score distribution with the 0.40 (step-up) and 0.75 (block) thresholds |
+| 15. Model metrics | PR-AUC, ROC-AUC, precision / recall at both thresholds, leaky-baseline comparison, model card |
+| 16. False-positive analysis | analysts label flagged transfers **confirmed fraud** / **false positive**; labels are audit events (tamper-evident, newest wins) and drive precision, recall, false-positive rate and the confusion matrix; also counts medium-risk transfers the customer cleared with a fresh code |
+
+OPA permission `admin.fraud` (admin only). Tests:
+`test_fraud_intelligence_explains_scores_without_amounts`, `test_analyst_labels_measure_false_positives`.

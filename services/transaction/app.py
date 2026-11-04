@@ -138,16 +138,26 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
     policy_ms = (time.perf_counter() - t_pol) * 1000
     timing = {"risk_ms": round(risk_ms, 1), "policy_ms": round(policy_ms, 1)}
     response.headers["X-ZT-Overhead-ms"] = f"{risk_ms + policy_ms:.1f}"
+    # behavioural signals for fraud analytics (admin module 4 shows ratios, never amounts)
+    bal = float(sender["balance"]) or 1.0
+    signals = {"ml_probability": risk.get("ml_probability"), "level": risk["level"],
+               "model_version": risk.get("model_version"),
+               "drain_ratio": round(min(float(amount) / bal, 9.99), 4),
+               "times_usual": round(float(amount) / float(h["avg_amt"]), 2) if float(h["avg_amt"]) > 0 else None,
+               "new_payee": h["to_payee"] == 0, "hour": datetime.now().hour,
+               "velocity_10m": h["last_10m"], "history_count": h["n_done"],
+               "device_trust": x_zt_device_trust or "unknown"}
     audit_details = {"to": body.to_account, "amount": float(amount), "reasons": risk["reasons"],
-                     "policy": decision["reasons"], "stepped_up": stepped_up, **timing}
+                     "policy": decision["reasons"], "stepped_up": stepped_up, "signals": signals, **timing}
 
     # ---------------------------------------------------------- step-up
     if decision["step_up"]:
         async with p.connection() as conn:
-            await record(conn, sender["account_no"], body.to_account, amount, "step_up_required", risk, user)
+            tx_id = await record(conn, sender["account_no"], body.to_account, amount, "step_up_required", risk, user)
             await conn.commit()
         clients.audit(actor=user, action="transaction.transfer", resource=sender["account_no"],
-                      decision="step_up", reason="step_up_required", risk=risk["score"], details=audit_details)
+                      decision="step_up", reason="step_up_required", risk=risk["score"],
+                      details=audit_details | {"tx_id": tx_id})
         return JSONResponse(status_code=403, headers={"X-ZT-Overhead-ms": f"{risk_ms + policy_ms:.1f}"}, content={
             "decision": "step_up", "reasons": decision["reasons"], "risk": risk,
             "message": "Confirm this transfer with a fresh authenticator code.",
@@ -157,7 +167,7 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
     if not decision["allow"]:
         revoked = False
         async with p.connection() as conn:
-            await record(conn, sender["account_no"], body.to_account, amount, "denied", risk, user)
+            tx_id = await record(conn, sender["account_no"], body.to_account, amount, "denied", risk, user)
             await conn.commit()
         if "risk_too_high" in decision["reasons"]:
             # Continuous evaluation: a high-risk action means this session may be
@@ -170,7 +180,7 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
                 revoked = False
         clients.audit(actor=user, action="transaction.transfer", resource=sender["account_no"],
                       decision="deny", reason=",".join(decision["reasons"]), risk=risk["score"],
-                      details=audit_details | {"session_revoked": revoked})
+                      details=audit_details | {"session_revoked": revoked, "tx_id": tx_id})
         return JSONResponse(status_code=403, headers={"X-ZT-Overhead-ms": f"{risk_ms + policy_ms:.1f}"}, content={
             "decision": "deny", "reasons": decision["reasons"], "risk": risk, "session_revoked": revoked})
 

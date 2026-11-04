@@ -58,6 +58,7 @@ permissions := {
 		"admin.quarantine",
 		"admin.search",
 		"admin.user_control",
+		"admin.fraud",
 		"self.manage",
 	},
 }
@@ -74,6 +75,7 @@ trusted_callers := {
 	"admin.quarantine": {"gateway"},
 	"admin.search": {"gateway", "account"},
 	"admin.user_control": {"gateway"},
+	"admin.fraud": {"gateway"},
 	"self.manage": {"gateway"},
 	"ops.accounts": {"account"},
 	"ops.transactions": {"account"},

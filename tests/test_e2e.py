@@ -682,3 +682,58 @@ def test_beneficiaries_need_a_code_and_receipts_stay_private():
     assert logged_in("admin").req("GET", f"/api/transactions/{tx}/receipt").status_code == 403   # no amounts for admin
     assert logged_in("ops").req("GET", f"/api/transactions/{tx}/receipt").status_code == 200
     assert c.req("POST", f"/api/transactions/{tx}/cancel", json={}).status_code == 409        # completed: no cancel
+
+
+# ------------------------------------------- admin module 4: fraud intelligence
+def _drain_attempt() -> tuple[str, dict]:
+    """A fresh customer tries to move their whole balance to a new payee -> blocked as high risk."""
+    name, _, secret = otp_user()
+    c = Client(device=f"e2e-{name}")
+    r = c.req("POST", "/api/auth/login", json={"username": name, "password": "Long-enough-pw-1",
+                                               "totp": pyotp.TOTP(secret).now()})
+    c.token = r.json()["access_token"]
+    bal = c.req("GET", "/api/accounts/me").json()["balance"]
+    d = c.req("POST", "/api/transfer", json={"to_account": new_payee_account(), "amount": bal})
+    assert d.status_code == 403 and "risk_too_high" in d.json()["reasons"], d.text
+    return name, d.json()
+
+
+def test_fraud_intelligence_explains_scores_without_amounts():
+    name, _ = _drain_attempt()
+    admin = logged_in("admin")
+    r = admin.req("GET", "/api/admin/fraud", params={"days": 1})
+    assert r.status_code == 200, r.text
+    f = r.json()
+    mine = next(t for t in f["live"] if t["customer"] == name)
+    assert mine["tx_id"] and mine["score"] >= 0.75 and mine["decision"] == "deny"
+    assert mine["ml_probability"] is not None and mine["drain_ratio"] >= 0.99
+    assert mine["explanation"] and all(e["text"] for e in mine["explanation"])
+    assert any(a["customer"] == name for a in f["accounts"])
+    assert any(t["customer"] == name for t in f["alerts"])
+    for t in f["live"]:
+        assert "amount" not in t                                  # ratios only, never rupees
+    for key in ("patterns", "device", "daily", "hourly", "histogram", "accuracy", "login_signals"):
+        assert key in f
+    assert f["model"]["test"]["pr_auc"] > 0
+    assert logged_in("ops").req("GET", "/api/admin/fraud").status_code == 403
+    assert logged_in("alice").req("GET", "/api/admin/fraud").status_code == 403
+
+
+def test_analyst_labels_measure_false_positives():
+    name, _ = _drain_attempt()
+    admin = logged_in("admin")
+    tx = next(t for t in admin.req("GET", "/api/admin/fraud", params={"days": 1}).json()["live"]
+              if t["customer"] == name)["tx_id"]
+    before = admin.req("GET", "/api/admin/fraud", params={"days": 1}).json()["accuracy"]
+    assert admin.req("POST", "/api/admin/fraud/label", json={"tx_id": tx, "label": "maybe"}).status_code == 422
+    assert admin.req("POST", "/api/admin/fraud/label", json={"tx_id": tx, "label": "legit"}).status_code == 200
+    time.sleep(1)
+    mid = admin.req("GET", "/api/admin/fraud", params={"days": 1}).json()["accuracy"]
+    assert mid["false_positive"] == before["false_positive"] + 1
+    assert admin.req("POST", "/api/admin/fraud/label", json={"tx_id": tx, "label": "fraud"}).status_code == 200
+    time.sleep(1)
+    after = admin.req("GET", "/api/admin/fraud", params={"days": 1}).json()["accuracy"]
+    assert after["true_positive"] == before["true_positive"] + 1      # newest label wins
+    assert after["false_positive"] == before["false_positive"]
+    ev = admin.req("GET", "/api/admin/events", params={"limit": 50}).json()
+    assert any(e["action"] == "fraud.label" for e in ev)              # labels are in the audit chain
