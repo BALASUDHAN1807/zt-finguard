@@ -112,7 +112,7 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
             "transfers_last_10m": h["last_10m"],
             "history_count": h["n_done"],
             "avg_amount": float(h["avg_amt"]),
-        })
+        }, timeout=2.0)   # normally ~10 ms; a hung risk engine must fail closed well within the gateway's 5 s
         rr.raise_for_status()
         risk = rr.json()
     except Exception:  # noqa: BLE001
