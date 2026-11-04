@@ -113,6 +113,7 @@ through the same checks as any API call.
 
 | | |
 |---|---|
+| ![Sign in](docs/screenshots/21-bank-signin.png) | ![Account](docs/screenshots/22-bank-account.png) |
 | ![Step-up](docs/screenshots/04-step-up.png) | ![Blocked drain](docs/screenshots/06-drain-blocked.png) |
 | ![Admin overview](docs/screenshots/08-admin-overview.png) | ![Decisions](docs/screenshots/09-admin-decisions.png) |
 

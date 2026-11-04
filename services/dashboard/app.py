@@ -133,6 +133,14 @@ def detail(r: httpx.Response):
         return r.text
 
 
+STATUS_LABEL = {"completed": "Completed", "denied": "Blocked", "step_up_required": "Extra code needed"}
+
+
+def daypart() -> str:
+    h = datetime.now().hour
+    return "morning" if h < 12 else "afternoon" if h < 17 else "evening"
+
+
 def money(x: float) -> str:
     return f"{INR}{x:,.2f}"
 
@@ -140,15 +148,117 @@ def money(x: float) -> str:
 # ------------------------------------------------------------------- styles
 st.markdown("""
 <style>
-  .block-container {padding-top: 1.6rem;}
-  .zt-pill {display:inline-block;padding:2px 10px;border-radius:999px;font-size:0.78rem;font-weight:600;}
-  .zt-allow {background:#d1fae5;color:#065f46;}
-  .zt-deny {background:#fee2e2;color:#991b1b;}
-  .zt-step {background:#fef3c7;color:#92400e;}
-  .zt-card {border:1px solid rgba(128,128,128,.25);border-radius:12px;padding:14px 16px;margin-bottom:8px;}
-  .zt-muted {opacity:.7;font-size:.85rem;}
+@import url('https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap');
+:root {
+  --ink:#0B3D4A; --night:#072A33; --brass:#B8892B; --surface:#F3F5F6; --card:#FFFFFF;
+  --line:#D9E0E3; --text:#15262C; --muted:#5A6B71; --credit:#1F7A4D; --debit:#B42318;
+}
+html, body, [class*="css"], .stMarkdown, .stTextInput, .stButton, .stRadio, .stTabs, .stDataFrame {
+  font-family:'Public Sans', system-ui, sans-serif;
+}
+[data-testid="stAppViewContainer"] {background:var(--surface);}
+[data-testid="stHeader"] {background:transparent; height:0;}
+[data-testid="stDecoration"] {display:none;}
+[data-testid="stToolbar"] {display:none;}
+.block-container {padding-top:96px !important; max-width:1180px;}
+h1, h2, h3 {font-family:'Source Serif 4', Georgia, serif !important; color:var(--text); letter-spacing:-0.01em;}
+h1 {font-weight:600 !important; font-size:2.05rem !important; padding-bottom:.2rem !important;}
+h2, h3 {font-weight:600 !important;}
+
+/* top bar */
+.zt-top {position:fixed; top:0; left:0; right:0; z-index:1000200; height:62px; padding:0 max(1rem, calc(50vw - 590px));
+  background:var(--night); color:#fff; display:flex; align-items:center; justify-content:space-between;
+  border-bottom:3px solid var(--brass);}
+.zt-brand {display:flex; align-items:center; gap:10px; font-weight:700; font-size:1.15rem; letter-spacing:.01em;}
+.zt-brand small {font-weight:400; color:#A9C1C7; font-size:.85rem; margin-left:6px;}
+.zt-secure {font-size:.85rem; color:#CFE0E4; display:flex; align-items:center; gap:8px;}
+.zt-dot {width:8px; height:8px; border-radius:50%; background:#3FB57A; display:inline-block;}
+
+/* sign-in hero */
+.zt-hero {background:var(--ink); color:#EAF2F4; border-radius:6px; padding:44px 40px; min-height:480px;
+  position:relative; overflow:hidden;}
+.zt-hero h2 {font-family:'Source Serif 4', Georgia, serif !important; color:#fff !important; font-size:2.3rem !important;
+  line-height:1.15; margin:0 0 16px; max-width:15ch;}
+.zt-hero p {color:#C6D8DC; font-size:1.02rem; line-height:1.6; max-width:42ch;}
+.zt-hero ul {list-style:none; padding:0 !important; margin:28px 0 0 !important;}
+.zt-hero li {margin:0 !important;}
+.zt-hero li {padding:12px 0; border-top:1px solid rgba(255,255,255,.12); color:#E3EEF0; font-size:.95rem;}
+.zt-hero li b {color:#fff; font-weight:600; display:block; margin-bottom:2px;}
+.zt-hero:after {content:""; position:absolute; right:-80px; bottom:-80px; width:260px; height:260px;
+  border:28px solid rgba(184,137,43,.18); border-radius:50%;}
+
+/* panels */
+[data-testid="stForm"] {background:var(--card); border:1px solid var(--line) !important; border-radius:6px; padding:22px 22px 10px;}
+.stTabs [data-baseweb="tab-list"] {gap:28px; border-bottom:1px solid var(--line);}
+.stTabs [data-baseweb="tab"] {font-weight:600; font-size:1rem; padding:10px 0;}
+.stTabs [aria-selected="true"] {color:var(--ink) !important;}
+.stTabs [data-baseweb="tab-highlight"] {background:var(--brass) !important; height:3px;}
+.stButton > button, .stFormSubmitButton > button {border-radius:4px; font-weight:600; padding:.55rem 1rem;}
+.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primaryFormSubmit"] {
+  background:var(--ink); border-color:var(--ink);}
+.stButton > button[kind="primary"]:hover, .stFormSubmitButton > button[kind="primaryFormSubmit"]:hover {
+  background:var(--night); border-color:var(--night);}
+.stTextInput input {border-radius:4px;}
+[data-testid="stExpander"] {background:var(--card); border:1px solid var(--line); border-radius:6px;}
+[data-testid="stMetric"] {background:var(--card); border:1px solid var(--line); border-radius:6px; padding:14px 16px;}
+[data-testid="stMetricValue"] {font-family:'Source Serif 4', Georgia, serif; color:var(--text);}
+[data-testid="stDataFrame"] {border:1px solid var(--line); border-radius:6px; background:var(--card);}
+
+/* sidebar */
+[data-testid="stSidebar"] {background:var(--night);}
+[data-testid="stSidebarContent"] {padding-top:66px;}
+[data-testid="stSidebar"] code {background:rgba(255,255,255,.08); color:#DCE8EB;}
+[data-testid="stSidebar"] * {color:#DCE8EB;}
+[data-testid="stSidebar"] .stRadio label {padding:7px 10px; border-radius:4px; width:100%;}
+[data-testid="stSidebar"] .stRadio label:has(input:checked) {background:rgba(255,255,255,.09); box-shadow:inset 3px 0 0 var(--brass);}
+[data-testid="stSidebar"] [data-baseweb="radio"] > div:first-child {display:none;}
+[data-testid="stSidebar"] .stButton > button {background:transparent; border:1px solid rgba(255,255,255,.3); color:#fff;}
+[data-testid="stSidebar"] hr {border-color:rgba(255,255,255,.12);}
+.zt-who {padding:4px 0 14px;}
+.zt-who b {font-size:1.05rem; color:#fff;}
+.zt-who span {display:block; font-size:.82rem; color:#9FB8BE; margin-top:2px;}
+
+/* passbook */
+.zt-passbook {background:var(--card); border:1px solid var(--line); border-top:4px solid var(--brass);
+  border-radius:6px; padding:26px 30px; display:grid; grid-template-columns:1.4fr 1fr 1fr; gap:24px; margin:6px 0 22px;}
+.zt-passbook .k {color:var(--muted); font-size:.88rem; margin-bottom:6px;}
+.zt-passbook .bal {font-family:'Source Serif 4', Georgia, serif; font-size:2.6rem; font-weight:600; color:var(--ink);
+  font-variant-numeric:tabular-nums; line-height:1.1;}
+.zt-passbook .v {font-size:1.15rem; font-weight:600; color:var(--text); font-variant-numeric:tabular-nums; letter-spacing:.04em;}
+@media (max-width: 760px) {.zt-passbook {grid-template-columns:1fr;} .zt-brand small, .zt-secure, .zt-hero {display:none;}
+  .zt-hero {min-height:auto; padding:30px 24px;}}
+
+/* footer */
+.zt-foot {margin-top:48px; padding:18px 0 8px; border-top:1px solid var(--line); color:var(--muted); font-size:.82rem; line-height:1.6;}
+
+/* existing helpers */
+.zt-pill {display:inline-block;padding:2px 10px;border-radius:4px;font-size:0.78rem;font-weight:600;}
+.zt-allow {background:#E3F2EA;color:var(--credit);}
+.zt-deny {background:#FBE7E5;color:var(--debit);}
+.zt-step {background:#FBF0D9;color:#7A5410;}
+.zt-card {background:var(--card);border:1px solid var(--line);border-radius:6px;padding:14px 16px;margin-bottom:8px;}
+.zt-muted {color:var(--muted);font-size:.85rem;}
+*:focus-visible {outline:2px solid var(--brass) !important; outline-offset:2px;}
 </style>
 """, unsafe_allow_html=True)
+
+SHIELD = ('<svg width="26" height="28" viewBox="0 0 26 28" aria-hidden="true"><path d="M13 1 2 5v8c0 7 4.7 12 11 14 '
+          '6.3-2 11-7 11-14V5L13 1z" fill="#0B3D4A" stroke="#B8892B" stroke-width="1.6"/><path d="M8 14l3.4 3.4L18.5 '
+          '10" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+
+def topbar(signed_in: bool) -> None:
+    right = ('<span class="zt-secure"><span class="zt-dot"></span>Secure session over TLS 1.3</span>' if signed_in
+             else '<span class="zt-secure">Demonstration bank, no real money</span>')
+    st.markdown(f'<div class="zt-top"><div class="zt-brand">{SHIELD}ZT-FinGuard<small>Zero Trust banking</small>'
+                f'</div>{right}</div>', unsafe_allow_html=True)
+
+
+def footer() -> None:
+    st.markdown('<div class="zt-foot">ZT-FinGuard is a demonstration bank built for a Linux &amp; Container '
+                'Technology course project at SRM Institute of Science and Technology. It holds no real money and '
+                'is not connected to any bank or payment network.<br>The bank will never ask for your password, '
+                'SMS code or authenticator code by phone, email or chat.</div>', unsafe_allow_html=True)
 
 
 def pill(decision: str) -> str:
@@ -280,23 +390,23 @@ def sms_messages(mobile: str) -> None:
 # -------------------------------------------------------------------- login
 def login_page() -> None:
     ss = S()
-    left, right = st.columns([1.1, 1])
+    left, right = st.columns([1.15, 1], gap="large")
     with left:
-        st.title("🛡️ ZT-FinGuard")
-        st.markdown("#### Zero Trust banking demo\nEvery request is authenticated, authorised by policy and risk-scored. "
-                    "Nothing is trusted because of where it comes from.")
-        st.markdown("""
-- Sign in with your **mobile number + SMS code**; unusual sign-ins also need the authenticator code
-- 15-minute tokens, locked to this browser session
-- Policy check (OPA) and fraud-risk score on every transfer
-- Service-to-service traffic over mutual TLS
-""")
+        st.markdown("""<div class="zt-hero">
+<h2>Every request checked. Every time.</h2>
+<p>Your money moves only after we confirm it is really you, on a device you trust, asking for something that looks like you.</p>
+<ul>
+<li><b>Sign in with your mobile</b>A one-time SMS code. Unfamiliar devices also need your authenticator app.</li>
+<li><b>Every transfer is risk-checked</b>Unusual payments ask for an extra code; risky ones are stopped before money leaves.</li>
+<li><b>Your session is yours</b>Locked to this browser and closed automatically when you step away.</li>
+</ul></div>""", unsafe_allow_html=True)
     with right:
         if ss.notice:
             st.warning(ss.notice)
         if ss.last_transfer and ss.last_transfer["body"].get("decision") == "deny":
             render_result(ss.last_transfer)
             ss.last_transfer = None
+        st.markdown("## Welcome back")
         tab_in, tab_reg = st.tabs(["Sign in", "Open an account"])
         with tab_in:
             how = st.radio("Sign in with", ["Mobile number + SMS code", "Username + password"],
@@ -330,13 +440,12 @@ def login_page() -> None:
 def sidebar() -> str:
     ss = S()
     with st.sidebar:
-        st.markdown("### 🛡️ ZT-FinGuard")
-        st.markdown(f"**{ss.user}** · `{ss.role}`")
         me = api("GET", "/api/me", background=True)
         info = me.json() if me is not None and me.status_code == 200 else {}
         trust = info.get("device_trust", "pending")
-        icon = {"trusted": "🟢 trusted device", "pending": "🟡 device pending approval"}.get(trust, trust)
-        st.caption(f"MFA verified · {icon}")
+        icon = {"trusted": "Trusted device", "pending": "Device waiting for approval"}.get(trust, trust)
+        st.markdown(f'<div class="zt-who"><b>{ss.user}</b><span>{ss.role.title()} account</span>'
+                    f'<span>Verified sign-in, {icon.lower()}</span></div>', unsafe_allow_html=True)
         if ss.role == "customer" and trust != "trusted":
             st.info("New device: you can view your account, but transfers stay blocked until you approve "
                     "this device from a trusted one (Security settings).")
@@ -363,11 +472,15 @@ def my_account() -> None:
         st.error(detail(r) if r is not None else "unavailable")
         return
     a = r.json()
-    st.title("My account")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Balance", money(a["balance"]))
-    c2.metric("Account number", a["account_no"])
-    c3.metric("Opened", a["opened"][:10])
+    st.title(f"Good {daypart()}, {S().user}")
+    acct = a["account_no"]
+    grouped = " ".join(acct[i:i + 4] for i in range(0, len(acct), 4))
+    opened = datetime.fromisoformat(a["opened"][:10]).strftime("%d %b %Y")
+    st.markdown(f"""<div class="zt-passbook">
+<div><div class="k">Available balance</div><div class="bal">{money(a["balance"])}</div></div>
+<div><div class="k">Savings account</div><div class="v">{grouped}</div></div>
+<div><div class="k">Customer since</div><div class="v">{opened}</div></div>
+</div>""", unsafe_allow_html=True)
     st.subheader("Recent activity")
     t = api("GET", "/api/accounts/me/transactions")
     rows = t.json() if t is not None and t.status_code == 200 else []
@@ -378,12 +491,16 @@ def my_account() -> None:
     df["when"] = pd.to_datetime(df["created_at"]).dt.strftime("%d %b %H:%M")
     df["counterparty"] = df.apply(lambda x: x["to_account"] if x["direction"] == "out" else x["from_account"], axis=1)
     df["amount"] = df.apply(lambda x: (-1 if x["direction"] == "out" else 1) * x["amount"], axis=1)
+    df["status"] = df["status"].map(STATUS_LABEL).fillna(df["status"])
     st.dataframe(
         df[["when", "counterparty", "amount", "status", "risk_score"]],
         hide_index=True, use_container_width=True,
         column_config={
-            "amount": st.column_config.NumberColumn("Amount (₹)", format="%.2f"),
-            "risk_score": st.column_config.ProgressColumn("Risk", min_value=0, max_value=1, format="%.2f"),
+            "when": st.column_config.TextColumn("Date"),
+            "counterparty": st.column_config.TextColumn("To / from account"),
+            "amount": st.column_config.NumberColumn("Amount (₹)", format="%+.2f"),
+            "status": st.column_config.TextColumn("Status"),
+            "risk_score": st.column_config.ProgressColumn("Risk score", min_value=0, max_value=1, format="%.2f"),
         })
 
 
@@ -520,7 +637,7 @@ def security_overview() -> None:
         if s["deny_reasons"]:
             df = pd.DataFrame(s["deny_reasons"]).rename(columns={"n": "count"})
             df["reason"] = df["reason"].replace("", "(none)")
-            st.altair_chart(alt.Chart(df).mark_bar(color="#b91c1c", cornerRadiusEnd=3).encode(
+            st.altair_chart(alt.Chart(df).mark_bar(color="#9B3B2F", cornerRadiusEnd=2).encode(
                 x=alt.X("count:Q", title="denials", axis=alt.Axis(tickMinStep=1, format="d")),
                 y=alt.Y("reason:N", sort="-x", title=None),
                 tooltip=["reason", "count"]).properties(height=260), use_container_width=True)
@@ -536,7 +653,7 @@ def security_overview() -> None:
                 x=alt.X("level:N", sort=["low", "medium", "high"], title=None, axis=alt.Axis(labelAngle=0)),
                 y=alt.Y("count:Q", title="scores", axis=alt.Axis(tickMinStep=1, format="d")),
                 color=alt.Color("level:N", legend=None, scale=alt.Scale(
-                    domain=["low", "medium", "high"], range=["#15803d", "#d97706", "#b91c1c"])),
+                    domain=["low", "medium", "high"], range=["#1F7A4D", "#B8892B", "#B42318"])),
                 tooltip=["level", "count"]).properties(height=260), use_container_width=True)
         else:
             st.info("No risk scores yet.")
@@ -617,7 +734,7 @@ def risk_model() -> None:
     st.altair_chart(alt.Chart(cmp).mark_bar(cornerRadiusEnd=3).encode(
         x=alt.X("PR-AUC:Q", scale=alt.Scale(domain=[0, 1])),
         y=alt.Y("model:N", title=None, sort=None, axis=alt.Axis(labelLimit=320)),
-        color=alt.Color("model:N", legend=None, scale=alt.Scale(range=["#0f766e", "#94a3b8"])),
+        color=alt.Color("model:N", legend=None, scale=alt.Scale(range=["#0B3D4A", "#A7B4B9"])),
         tooltip=["model", "PR-AUC"]).properties(height=140), use_container_width=True)
     st.caption("The leaky baseline uses `newbalanceOrig` / `newbalanceDest`, which only exist *after* the money "
                "has moved. It looks better on paper but cannot be used to stop a transfer.")
@@ -834,8 +951,10 @@ def containers_page() -> None:
 
 # -------------------------------------------------------------------- main
 ss = S()
+topbar(bool(ss.token))
 if not ss.token:
     login_page()
+    footer()
 else:
     page = sidebar()
     {
@@ -850,3 +969,4 @@ else:
         "Session & device policy": session_device_policy,
         "Containers & quarantine": containers_page,
     }[page]()
+    footer()
