@@ -39,6 +39,8 @@ permissions := {
 		"admin.session_policy",
 		"admin.devices",
 		"admin.quarantine",
+		"admin.search",
+		"admin.user_control",
 		"self.manage",
 	},
 }
@@ -53,6 +55,8 @@ trusted_callers := {
 	"admin.session_policy": {"gateway"},
 	"admin.devices": {"gateway"},
 	"admin.quarantine": {"gateway"},
+	"admin.search": {"gateway", "account"},
+	"admin.user_control": {"gateway"},
 	"self.manage": {"gateway"},
 }
 

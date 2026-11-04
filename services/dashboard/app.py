@@ -136,6 +136,14 @@ def detail(r: httpx.Response):
 STATUS_LABEL = {"completed": "Completed", "denied": "Blocked", "step_up_required": "Extra code needed"}
 
 
+def compact_money(x: float) -> str:
+    """Indian short form for tiles: 50110 -> 50.1K, 2500000 -> 25.0L, 30000000 -> 3.0Cr."""
+    for size, unit in ((1e7, "Cr"), (1e5, "L"), (1e3, "K")):
+        if x >= size:
+            return f"{INR}{x / size:.1f}{unit}"
+    return f"{INR}{x:,.0f}"
+
+
 def daypart() -> str:
     h = datetime.now().hour
     return "morning" if h < 12 else "afternoon" if h < 17 else "evening"
@@ -238,6 +246,11 @@ h2, h3 {font-weight:600 !important;}
 .zt-step {background:#FBF0D9;color:#7A5410;}
 .zt-card {background:var(--card);border:1px solid var(--line);border-radius:6px;padding:14px 16px;margin-bottom:8px;}
 .zt-muted {color:var(--muted);font-size:.85rem;}
+.zt-posture {display:flex; gap:18px; align-items:center; background:var(--card); border:1px solid var(--line);
+  border-top:4px solid var(--brass); border-radius:6px; padding:18px 20px;}
+.zt-posture-level {font-family:'Source Serif 4', Georgia, serif; font-size:1.6rem; font-weight:600;}
+.zt-critical {background:#F6DCD8;color:#8E1B12;} .zt-high {background:#FBE7E5;color:#B42318;}
+.zt-medium {background:#FBF0D9;color:#7A5410;} .zt-low {background:#E4EEF1;color:#2F5D6B;} .zt-info {background:#EEF1F2;color:#5A6B71;}
 *:focus-visible {outline:2px solid var(--brass) !important; outline-offset:2px;}
 </style>
 """, unsafe_allow_html=True)
@@ -262,7 +275,9 @@ def footer() -> None:
 
 
 def pill(decision: str) -> str:
-    cls = {"allow": "zt-allow", "deny": "zt-deny", "step_up": "zt-step", "alert": "zt-deny"}.get(decision, "")
+    cls = {"allow": "zt-allow", "deny": "zt-deny", "step_up": "zt-step", "alert": "zt-deny",
+           "critical": "zt-critical", "high": "zt-high", "medium": "zt-medium", "low": "zt-low",
+           "info": "zt-info"}.get(decision, "")
     return f'<span class="zt-pill {cls}">{decision.upper()}</span>'
 
 
@@ -611,77 +626,276 @@ def account_lookup() -> None:
 
 
 # ------------------------------------------------------------------- admin
-@st.fragment(run_every=5)
+SEV_ORDER = ["critical", "high", "medium", "low", "info"]
+SEV_COLORS = ["#8E1B12", "#B42318", "#B8892B", "#5A8A9A", "#A7B4B9"]
+DECISION_COLORS = {"allow": "#1F7A4D", "deny": "#B42318", "step_up": "#B8892B", "alert": "#8E1B12", "info": "#A7B4B9"}
+
+
+def local_time(series: pd.Series, fmt: str = "%H:%M:%S") -> pd.Series:
+    return pd.to_datetime(series, utc=True).dt.tz_convert("Asia/Kolkata").dt.strftime(fmt)
+
+
+def posture_ring(score: int, level: str) -> str:
+    color = "#1F7A4D" if score >= 85 else "#B8892B" if score >= 65 else "#B42318"
+    c = 2 * 3.14159 * 52
+    return f"""<div class="zt-posture">
+<svg width="132" height="132" viewBox="0 0 132 132" style="flex:none;width:132px;height:132px" role="img" aria-label="Security posture {score} of 100">
+<circle cx="66" cy="66" r="52" fill="none" stroke="#E3E9EB" stroke-width="12"/>
+<circle cx="66" cy="66" r="52" fill="none" stroke="{color}" stroke-width="12" stroke-linecap="round"
+ stroke-dasharray="{c * score / 100:.1f} {c:.1f}" transform="rotate(-90 66 66)"/>
+<text x="66" y="72" text-anchor="middle" font-size="34" font-weight="600" fill="#15262C"
+ font-family="Source Serif 4, Georgia, serif">{score}</text></svg>
+<div><div class="zt-posture-level" style="color:{color}">{level}</div>
+<div class="zt-muted">Security posture, out of 100. Computed live from the controls listed alongside.</div></div></div>"""
+
+
+def notifications(alerts: list[dict]) -> None:
+    label = f"🔔 Alerts ({len(alerts)})" if alerts else "🔔 No alerts"
+    with st.popover(label, use_container_width=True):
+        if not alerts:
+            st.write("Nothing critical or high in the last 24 hours.")
+        for a in alerts[:12]:
+            st.markdown(f"{pill(a['severity'])} **{a['action']}** by {a['actor']}  \n"
+                        f"<span class='zt-muted'>{a['reason'] or '-'} · {local_time(pd.Series([a['ts']])).iloc[0]}</span>",
+                        unsafe_allow_html=True)
+
+
+def global_search() -> None:
+    q = st.text_input("Search", placeholder="Search users, transactions, containers and incidents",
+                      label_visibility="collapsed", key="global_q")
+    if len(q.strip()) < 2:
+        return
+    r = api("GET", "/api/admin/search", params={"q": q.strip()})
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "search unavailable")
+        return
+    d = r.json()
+    t = st.tabs([f"Users ({len(d['users'])})", f"Transactions ({len(d['transactions'])})",
+                 f"Containers ({len(d['containers'])})", f"Incidents and events ({len(d['events'])})"])
+    with t[0]:
+        if d["users"]:
+            st.dataframe(pd.DataFrame(d["users"]), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No matching users.")
+    with t[1]:
+        if d["transactions"]:
+            df = pd.DataFrame(d["transactions"])
+            df["created_at"] = local_time(df["created_at"], "%d %b %H:%M")
+            st.dataframe(df, hide_index=True, use_container_width=True)
+            st.caption("Amounts and balances are hidden from administrators (separation of duties).")
+        else:
+            st.caption("No matching transactions.")
+    with t[2]:
+        if d["containers"]:
+            st.dataframe(pd.DataFrame(d["containers"])[["service", "state", "health", "status"]],
+                         hide_index=True, use_container_width=True)
+        else:
+            st.caption("No matching containers.")
+    with t[3]:
+        if d["events"]:
+            df = pd.DataFrame(d["events"])
+            df["ts"] = local_time(df["ts"], "%d %b %H:%M:%S")
+            st.dataframe(df[["ts", "severity", "actor", "action", "decision", "reason"]],
+                         hide_index=True, use_container_width=True)
+        else:
+            st.caption("No matching events.")
+
+
 def security_overview() -> None:
+    st.title("Security overview")
+    global_search()
+    overview_live()
+    quick_actions()
+
+
+@st.fragment(run_every=10)
+def overview_live() -> None:
     r = api("GET", "/api/admin/overview", background=True)
     if r is None or r.status_code != 200:
         st.error(detail(r) if r is not None else "unavailable")
         return
     o = r.json()
-    s, lat = o["stats"], o["latency"]
+    s = o["summary"] or {"total": 0, "by_decision": {}, "series": [], "severity": {}, "fraud": {}, "incidents": [],
+                         "alerts": [], "feed": [], "logins": []}
     bd = s["by_decision"]
-    healthy = sum(1 for h in o["health"] if h["healthy"])
+    cont = o["containers"]
+    running = sum(1 for c in cont if c["state"] == "running")
+    healthy_c = sum(1 for c in cont if c["health"] == "healthy")
+    h = st.columns([3, 1])
+    h[0].caption(f"Last 24 hours, refreshed {datetime.now().strftime('%H:%M:%S')} (every 10 s)")
+    with h[1]:
+        notifications(s["alerts"])
 
-    st.title("Zero Trust security overview")
-    st.caption(f"Last 24 h · refreshed {datetime.now().strftime('%H:%M:%S')} · every 5 s")
-    k = st.columns(5)
-    k[0].metric("Decisions logged", f"{s['total']:,}")
-    k[1].metric("Denied", f"{bd.get('deny', 0):,}")
-    k[2].metric("Step-up MFA", f"{bd.get('step_up', 0):,}")
-    k[3].metric("Runtime alerts (Falco)", f"{s['falco_alerts']:,}")
-    k[4].metric("Services healthy", f"{healthy} / {len(o['health'])}")
-
-    left, right = st.columns([1.2, 1])
+    # ---- posture + headline numbers
+    left, right = st.columns([1.05, 2])
     with left:
-        st.subheader("Why requests were denied")
-        if s["deny_reasons"]:
-            df = pd.DataFrame(s["deny_reasons"]).rename(columns={"n": "count"})
-            df["reason"] = df["reason"].replace("", "(none)")
-            st.altair_chart(alt.Chart(df).mark_bar(color="#9B3B2F", cornerRadiusEnd=2).encode(
-                x=alt.X("count:Q", title="denials", axis=alt.Axis(tickMinStep=1, format="d")),
-                y=alt.Y("reason:N", sort="-x", title=None),
-                tooltip=["reason", "count"]).properties(height=260), use_container_width=True)
-        else:
-            st.info("No denials yet.")
+        p = o["posture"]
+        st.markdown(posture_ring(p["score"], p["level"]), unsafe_allow_html=True)
+        with st.expander("How the score is calculated"):
+            st.dataframe(pd.DataFrame(p["parts"]), hide_index=True, use_container_width=True,
+                         column_config={"points": st.column_config.ProgressColumn(
+                             "points", min_value=0, max_value=25, format="%.1f")})
     with right:
-        st.subheader("Risk levels scored")
-        rl = s["risk_levels"]
-        if rl:
-            df = pd.DataFrame({"level": ["low", "medium", "high"],
-                               "count": [rl.get(lv, 0) for lv in ("low", "medium", "high")]})
-            st.altair_chart(alt.Chart(df).mark_bar(cornerRadiusEnd=3).encode(
-                x=alt.X("level:N", sort=["low", "medium", "high"], title=None, axis=alt.Axis(labelAngle=0)),
-                y=alt.Y("count:Q", title="scores", axis=alt.Axis(tickMinStep=1, format="d")),
-                color=alt.Color("level:N", legend=None, scale=alt.Scale(
-                    domain=["low", "medium", "high"], range=["#1F7A4D", "#B8892B", "#B42318"])),
-                tooltip=["level", "count"]).properties(height=260), use_container_width=True)
-        else:
-            st.info("No risk scores yet.")
+        k = st.columns(4)
+        k[0].metric("Requests verified", f"{s['total']:,}")
+        k[1].metric("Allowed", f"{bd.get('allow', 0):,}")
+        k[2].metric("Denied", f"{bd.get('deny', 0):,}")
+        k[3].metric("Step-up MFA", f"{bd.get('step_up', 0):,}")
+        k = st.columns(3)
+        k[0].metric("Active incidents", len(s["incidents"]))
+        k[1].metric("Running containers", f"{running} / {len(cont)}" if cont else "-")
+        k[2].metric("Container health", f"{round(100 * healthy_c / len(cont))}%" if cont else "-")
 
-    a, b = st.columns(2)
+    # ---- events graph + severity
+    a, b = st.columns([1.6, 1])
     with a:
-        st.subheader("Zero Trust overhead")
-        budget = 100.0
-        p95 = lat["transfer_decision_p95_ms"]
-        st.metric("Transfer decision p95 (risk + policy)", f"{p95} ms" if p95 is not None else "-")
-        if p95 is not None:
-            (st.success if p95 <= budget else st.warning)(
-                f"{'Within' if p95 <= budget else 'Over'} the {budget:.0f} ms budget from the requirements")
-        st.metric("Gateway token checks p95", f"{lat['gateway_check_p95_ms']} ms"
-                  if lat["gateway_check_p95_ms"] is not None else "-")
-        st.caption(f"{lat['samples']} transfer samples since gateway start")
+        st.subheader("Security events")
+        if s["series"]:
+            df = pd.DataFrame(s["series"])
+            df["hour"] = pd.to_datetime(df["hour"], utc=True).dt.tz_convert("Asia/Kolkata")
+            end = pd.Timestamp.now(tz="Asia/Kolkata").floor("h")
+            hours = pd.date_range(end - pd.Timedelta(hours=23), end, freq="h")
+            order = [h.strftime("%H:00") for h in hours]
+            df = df[df["hour"] >= hours[0]]
+            df["hour"] = df["hour"].dt.strftime("%H:00")
+            st.altair_chart(alt.Chart(df).mark_bar(cornerRadiusTopLeft=2, cornerRadiusTopRight=2).encode(
+                x=alt.X("hour:O", title=None, sort=order, scale=alt.Scale(domain=order),
+                        axis=alt.Axis(labelAngle=0, values=order[::3])),
+                y=alt.Y("n:Q", title="events per hour", stack=True),
+                color=alt.Color("decision:N", title=None, scale=alt.Scale(
+                    domain=list(DECISION_COLORS), range=list(DECISION_COLORS.values())),
+                    legend=alt.Legend(orient="top")),
+                tooltip=["hour", "decision", "n"]).properties(height=250), use_container_width=True)
+        else:
+            st.info("No events yet.")
     with b:
-        st.subheader("Service health (via mTLS)")
-        st.dataframe(pd.DataFrame(o["health"]), hide_index=True, use_container_width=True,
-                     column_config={"healthy": st.column_config.CheckboxColumn("healthy"),
-                                    "ms": st.column_config.NumberColumn("probe ms", format="%.1f")})
+        st.subheader("Threat severity")
+        sev = s["severity"]
+        df = pd.DataFrame({"severity": SEV_ORDER, "events": [sev.get(x, 0) for x in SEV_ORDER]})
+        st.altair_chart(alt.Chart(df).mark_bar(cornerRadiusEnd=2).encode(
+            y=alt.Y("severity:N", sort=SEV_ORDER, title=None),
+            x=alt.X("events:Q", title="events (24 h)", axis=alt.Axis(tickMinStep=1, format="d")),
+            color=alt.Color("severity:N", legend=None, scale=alt.Scale(domain=SEV_ORDER, range=SEV_COLORS)),
+            tooltip=["severity", "events"]).properties(height=250), use_container_width=True)
 
-    st.subheader("Container image scans (Trivy)")
+    # ---- fraud
+    st.subheader("Fraud detection")
+    f = s["fraud"]
+    k = st.columns(6)
+    k[0].metric("Transfers checked", f.get("transfers_checked", 0))
+    k[1].metric("Blocked", f.get("blocked", 0))
+    k[2].metric("Extra code asked", f.get("step_up", 0))
+    k[3].metric("Amount stopped", compact_money(f.get("blocked_amount", 0)))
+    k[4].metric("High-risk accounts", f.get("high_risk_accounts", 0))
+    k[5].metric("Average risk", f"{f['avg_transfer_risk']:.2f}" if f.get("avg_transfer_risk") is not None else "-")
+
+    # ---- incidents + live feed
+    a, b = st.columns([1, 1.5])
+    with a:
+        st.subheader("Active incidents")
+        if s["incidents"]:
+            df = pd.DataFrame(s["incidents"])
+            df["last"] = local_time(df["last"])
+            st.dataframe(df[["severity", "actor", "action", "reason", "count", "last"]], hide_index=True,
+                         use_container_width=True, height=320)
+        else:
+            st.success("No critical or high-severity activity in the last 24 hours.")
+    with b:
+        st.subheader("Live security feed")
+        if s["feed"]:
+            df = pd.DataFrame(s["feed"])
+            df["ts"] = local_time(df["ts"])
+            st.dataframe(df[["ts", "severity", "service", "actor", "action", "decision", "reason"]],
+                         hide_index=True, use_container_width=True, height=320,
+                         column_config={"ts": "time"})
+
+    # ---- logins + health
+    a, b = st.columns([1.3, 1])
+    with a:
+        st.subheader("Recent sign-in activity")
+        if s["logins"]:
+            df = pd.DataFrame(s["logins"])
+            df["ts"] = local_time(df["ts"])
+            df["ip"] = df["details"].apply(lambda d: (d or {}).get("ip", "-"))
+            df["method"] = df.apply(lambda x: "SMS code requested" if x["action"] == "auth.otp_request"
+                                    else (x["reason"] or "-"), axis=1)
+            st.dataframe(df[["ts", "actor", "decision", "method", "ip"]], hide_index=True,
+                         use_container_width=True, height=300,
+                         column_config={"ts": "time", "actor": "user", "decision": "result"})
+        else:
+            st.info("No sign-ins yet.")
+    with b:
+        st.subheader("Microservice health")
+        hc = {c["service"]: c for c in cont}
+        rows = [{"service": h["name"], "mTLS probe": "ok" if h["healthy"] else "failing",
+                 "ms": h["ms"], "container": hc.get(h["name"], {}).get("health", "-")} for h in o["health"]]
+        for c in cont:
+            if c["service"] not in {r["service"] for r in rows}:
+                rows.append({"service": c["service"], "mTLS probe": "-", "ms": None, "container": c["health"]})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=300,
+                     column_config={"ms": st.column_config.NumberColumn("probe ms", format="%.1f")})
+
+    with st.expander("Denial reasons, Zero Trust overhead and image scans"):
+        stats_details(o, s)
+
+
+def stats_details(o: dict, s: dict) -> None:
+    lat = o["latency"]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Transfer decision p95", f"{lat['transfer_decision_p95_ms']} ms"
+              if lat["transfer_decision_p95_ms"] is not None else "-")
+    c2.metric("Gateway token check p95", f"{lat['gateway_check_p95_ms']} ms"
+              if lat["gateway_check_p95_ms"] is not None else "-")
+    c3.metric("Audit chain", "intact" if (o.get("chain") or {}).get("ok") else "check needed")
+    deny = [e for e in s["feed"] if e["decision"] == "deny"]
+    if deny:
+        df = pd.DataFrame(deny)["reason"].value_counts().rename_axis("reason").reset_index(name="count")
+        st.altair_chart(alt.Chart(df).mark_bar(color="#9B3B2F", cornerRadiusEnd=2).encode(
+            x=alt.X("count:Q", axis=alt.Axis(tickMinStep=1, format="d")), y=alt.Y("reason:N", sort="-x", title=None)
+        ).properties(height=180), use_container_width=True)
     if o.get("trivy"):
         st.dataframe(pd.DataFrame(o["trivy"]["images"]), hide_index=True, use_container_width=True)
-        st.caption(f"Scanned {o['trivy'].get('scanned_at', '')}")
     else:
-        st.info("No scan report yet. Run `make scan` to scan every image with Trivy.")
+        st.caption("No image scan yet. Run `make scan` (Trivy).")
+
+
+def quick_actions() -> None:
+    st.subheader("Quick security actions")
+    c = st.columns(4)
+    with c[0], st.form("qa_logout"):
+        st.markdown("**Force sign-out**")
+        u = st.text_input("Username", key="qa_u1")
+        if st.form_submit_button("Sign out everywhere", type="primary", use_container_width=True) and u:
+            res = api("POST", f"/api/admin/users/{u.strip()}/force-logout")
+            st.success(f"All sessions of {u} ended.") if res is not None and res.status_code == 200 \
+                else st.error(detail(res) if res is not None else "failed")
+    with c[1], st.form("qa_lock"):
+        st.markdown("**Lock or unlock account**")
+        u = st.text_input("Username", key="qa_u2")
+        lock = st.radio("Action", ["Lock", "Unlock"], horizontal=True, label_visibility="collapsed")
+        if st.form_submit_button("Apply", type="primary", use_container_width=True) and u:
+            res = api("POST", f"/api/admin/users/{u.strip()}/lock",
+                      json={"locked": lock == "Lock", "reason": "quick action from security overview"})
+            st.success(f"{u} {'locked and signed out' if lock == 'Lock' else 'unlocked'}.") \
+                if res is not None and res.status_code == 200 else st.error(detail(res) if res is not None else "failed")
+    with c[2], st.form("qa_quarantine"):
+        st.markdown("**Isolate a container**")
+        qr = api("GET", "/api/admin/quarantine", background=True)
+        q = qr.json() if qr is not None and qr.status_code == 200 else {"containers": []}
+        svcs = [x["service"] for x in q["containers"] if x["service"] not in ("responder", "falco")]
+        svc = st.selectbox("Container", svcs or ["-"])
+        if st.form_submit_button("Quarantine", type="primary", use_container_width=True) and svcs:
+            res = api("POST", "/api/admin/quarantine", json={"service": svc, "reason": "quick action"})
+            st.success(f"{svc} cut off from its networks. Release it under Containers & quarantine.") \
+                if res is not None and res.status_code == 200 else st.error(detail(res) if res is not None else "failed")
+    with c[3], st.form("qa_audit"):
+        st.markdown("**Verify the audit log**")
+        st.caption("Recomputes every hash in the chain to prove nothing was edited or deleted.")
+        if st.form_submit_button("Verify now", type="primary", use_container_width=True):
+            res = api("GET", "/api/admin/audit/verify")
+            v = res.json() if res is not None and res.status_code == 200 else {}
+            st.success(f"Chain intact ({v.get('checked', '?')} entries).") if v.get("ok") \
+                else st.error(f"Chain broken: {v.get('problem', 'unavailable')}")
 
 
 @st.fragment(run_every=5)

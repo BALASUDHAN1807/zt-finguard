@@ -145,6 +145,117 @@ async def stats(_caller: str = Depends(mtls.require_caller("gateway"))):
     }
 
 
+# ------------------------------------------------ admin module 1: overview
+CRITICAL_REASONS = ("risk_too_high", "refresh_token_reuse", "chain_broken", "login_risk_high")
+HIGH_REASONS = ("account_locked", "device_revoked", "token_used_from_other_device", "new_device_needs_verification",
+                "untrusted_workload", "risk_engine_unavailable", "forced_by_admin", "locked_by_admin")
+FALCO_LEVELS = {"emergency": "critical", "alert": "critical", "critical": "critical",
+                "error": "high", "warning": "medium", "notice": "low", "low": "low",
+                "informational": "info", "debug": "info"}
+
+
+def severity(ev: dict) -> str:
+    """One severity scale for every event source (Falco, policy, risk, auth)."""
+    reason = ev.get("reason") or ""
+    if ev.get("service") == "falco":
+        prio = str((ev.get("details") or {}).get("priority", "")).lower()
+        return FALCO_LEVELS.get(prio, "medium")
+    if ev.get("action", "").startswith("container.quarantine") or any(r in reason for r in CRITICAL_REASONS):
+        return "critical"
+    if any(r in reason for r in HIGH_REASONS) or ev.get("decision") == "alert":
+        return "high"
+    if ev.get("decision") == "deny":
+        return "medium"
+    if ev.get("decision") == "step_up":
+        return "low"
+    return "info"
+
+
+def row_out(r: dict) -> dict:
+    r = dict(r)
+    r["ts"] = chain.norm_ts(r["ts"])
+    r["risk"] = float(r["risk"]) if r["risk"] is not None else None
+    r["severity"] = severity(r)
+    return r
+
+
+@app.get("/overview")
+async def overview(_caller: str = Depends(mtls.require_caller("gateway"))):
+    """Everything the Security Overview needs, computed from the hash-chained log."""
+    cols = "id, ts, service, actor, action, resource, decision, reason, risk, details"
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(f"SELECT {cols} FROM audit_log WHERE ts > now() - interval '24 hours' "
+                                 "ORDER BY id DESC LIMIT 20000")
+        day = [row_out(r) for r in await cur.fetchall()]
+        cur = await conn.execute(
+            "SELECT date_trunc('hour', ts) AS hour, decision, count(*) AS n FROM audit_log "
+            "WHERE ts > now() - interval '24 hours' GROUP BY 1, 2 ORDER BY 1")
+        series = [{"hour": chain.norm_ts(r["hour"]), "decision": r["decision"], "n": r["n"]}
+                  for r in await cur.fetchall()]
+        cur = await conn.execute(
+            "SELECT kind, level, count(*) AS n, avg(score) AS avg FROM risk_scores "
+            "WHERE created_at > now() - interval '24 hours' GROUP BY kind, level")
+        risk = [{"kind": r["kind"], "level": r["level"], "n": r["n"], "avg": float(r["avg"] or 0)}
+                for r in await cur.fetchall()]
+
+    by_decision: dict[str, int] = {}
+    sev = {k: 0 for k in ("critical", "high", "medium", "low", "info")}
+    for e in day:
+        by_decision[e["decision"]] = by_decision.get(e["decision"], 0) + 1
+        sev[e["severity"]] += 1
+
+    transfers = [e for e in day if e["action"] == "transaction.transfer"]
+    blocked = [e for e in transfers if e["decision"] == "deny"]
+    fraud = {
+        "transfers_checked": len(transfers),
+        "allowed": sum(1 for e in transfers if e["decision"] == "allow"),
+        "step_up": sum(1 for e in transfers if e["decision"] == "step_up"),
+        "blocked": len(blocked),
+        "blocked_amount": round(sum(float((e["details"] or {}).get("amount", 0)) for e in blocked), 2),
+        "high_risk_accounts": len({e["actor"] for e in blocked if "risk_too_high" in (e["reason"] or "")}),
+        "sessions_revoked": sum(1 for e in blocked if (e["details"] or {}).get("session_revoked")),
+        "avg_transfer_risk": round(sum(e["risk"] or 0 for e in transfers) / len(transfers), 3) if transfers else None,
+        "risk_by_kind": risk,
+    }
+    alerts = [e for e in day if e["severity"] in ("critical", "high")]
+    # an incident = one kind of critical/high signal for one actor (repeats fold into it)
+    groups: dict[tuple, dict] = {}
+    for e in alerts:
+        key = (e["actor"], e["action"], (e["reason"] or "")[:60])
+        g = groups.setdefault(key, {"actor": e["actor"], "action": e["action"], "reason": e["reason"],
+                                    "severity": e["severity"], "count": 0, "last": e["ts"]})
+        g["count"] += 1
+    logins = [e for e in day if e["action"] in ("auth.login", "auth.otp_request")][:15]
+    return {
+        "window": "24h",
+        "total": len(day),
+        "by_decision": by_decision,
+        "series": series,
+        "severity": sev,
+        "fraud": fraud,
+        "incidents": sorted(sorted(groups.values(), key=lambda g: g["last"], reverse=True),
+                            key=lambda g: g["severity"] != "critical"),
+        "alerts": alerts[:20],
+        "feed": day[:25],
+        "logins": logins,
+        "falco_alerts": sum(1 for e in day if e["service"] == "falco"),
+    }
+
+
+@app.get("/search")
+async def search(q: str = Query(min_length=2, max_length=60),
+                 _caller: str = Depends(mtls.require_caller("gateway"))):
+    like = f"%{q}%"
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            "SELECT id, ts, service, actor, action, resource, decision, reason, risk, details FROM audit_log "
+            "WHERE actor ILIKE %s OR action ILIKE %s OR reason ILIKE %s OR resource ILIKE %s "
+            "ORDER BY id DESC LIMIT 25", (like, like, like, like))
+        return [row_out(r) for r in await cur.fetchall()]
+
+
 @app.get("/verify")
 async def verify_chain(_caller: str = Depends(mtls.require_caller("gateway"))):
     p = await db.pool()

@@ -20,7 +20,7 @@ from collections import deque
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -361,20 +361,95 @@ def read_report(name: str):
         return None
 
 
+async def get_json(service: str, path: str, claims: dict | None = None, **kw):
+    """GET from an internal service; None if it is down (the overview degrades, never fails)."""
+    headers = {"Authorization": f"Bearer {claims['_raw']}"} if claims else {}
+    try:
+        r = await mtls.client().get(mtls.url(service, path), headers=headers, **kw)
+        return r.json() if r.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+_CHAIN = {"at": 0.0, "result": None}
+
+
+async def chain_status() -> dict | None:
+    """Full hash-chain verification is O(n), so the overview reuses a result for 60 s."""
+    if time.time() - _CHAIN["at"] > 60:
+        _CHAIN["result"] = await get_json("audit", "/verify", timeout=30)
+        _CHAIN["at"] = time.time()
+    return _CHAIN["result"]
+
+
+def container_health(c: dict) -> str:
+    status = (c.get("status") or "").lower()
+    if c.get("state") != "running":
+        return "down"
+    if "unhealthy" in status:
+        return "unhealthy"
+    if "starting" in status:
+        return "starting"
+    return "healthy"
+
+
+def posture(health, containers, chain, summary, quarantined, trivy, identity) -> dict:
+    """0-100 score from measurable controls; every point is explained on the dashboard."""
+    parts = []
+
+    def add(control: str, got: float, out_of: int, evidence: str) -> None:
+        parts.append({"control": control, "points": round(max(0.0, min(got, out_of)), 1),
+                      "out_of": out_of, "evidence": evidence})
+
+    ok = sum(1 for h in health if h["healthy"])
+    add("Microservices answering over mTLS", 25 * ok / max(len(health), 1), 25, f"{ok} of {len(health)} healthy")
+    if containers:
+        good = sum(1 for c in containers if c["health"] == "healthy")
+        add("Containers running and healthy", 15 * good / len(containers), 15, f"{good} of {len(containers)}")
+    else:
+        add("Containers running and healthy", 7.5, 15, "container engine not reachable from the responder")
+    if chain is None:
+        add("Audit log hash chain intact", 0, 15, "audit service unavailable")
+    else:
+        add("Audit log hash chain intact", 15 if chain.get("ok") else 0, 15,
+            f"{chain.get('checked', chain.get('count', '?'))} entries verified" if chain.get("ok") else "chain broken")
+    crit = (summary or {}).get("severity", {}).get("critical", 0)
+    add("No critical security events (24 h)", 15 - 5 * crit, 15, f"{crit} critical")
+    add("No quarantined containers", 10 - 5 * len(quarantined), 10, f"{len(quarantined)} quarantined")
+    if trivy:
+        crit_v = sum(i.get("critical", 0) for i in trivy.get("images", []))
+        add("No critical image vulnerabilities", 10 if crit_v == 0 else 0, 10, f"{crit_v} critical CVEs")
+    else:
+        add("No critical image vulnerabilities", 5, 10, "no scan yet (make scan)")
+    dev = (identity or {}).get("devices", {})
+    trusted, pending = dev.get("trusted", 0), dev.get("pending", 0)
+    add("Devices verified", 10 * trusted / max(trusted + pending, 1), 10, f"{trusted} trusted, {pending} pending")
+    score = round(sum(p["points"] for p in parts))
+    level = "Strong" if score >= 85 else "Fair" if score >= 65 else "At risk"
+    return {"score": score, "level": level, "parts": parts}
+
+
 @app.get("/api/admin/overview")
 async def overview(claims: dict = Depends(session)):
     await require_admin_action("admin.dashboard", claims)
-    stats = (await mtls.client().get(mtls.url("audit", "/stats"))).json()
+    summary = await get_json("audit", "/overview")
     health = [await health_of(s) for s in SERVICES + ["opa"]]
-    try:
-        model = (await mtls.client().get(mtls.url("risk", "/model"))).json()
-    except httpx.HTTPError:
-        model = None
+    q = await get_json("responder", "/quarantine") or {"containers": [], "quarantined": {}, "engine_connected": False}
+    containers = [c | {"health": container_health(c)} for c in q["containers"]]
+    identity = await get_json("auth", "/admin/identity-stats", claims)
+    trivy = read_report("trivy-summary.json")
+    chain = await chain_status()
     return {
-        "stats": stats,
+        "summary": summary,
         "health": health,
-        "model": model,
-        "trivy": read_report("trivy-summary.json"),
+        "containers": containers,
+        "engine_connected": q.get("engine_connected", False),
+        "quarantined": q.get("quarantined", {}),
+        "identity": identity,
+        "chain": chain,
+        "posture": posture(health, containers, chain, summary, q.get("quarantined", {}), trivy, identity),
+        "model": await get_json("risk", "/model"),
+        "trivy": trivy,
         "latency": {
             "gateway_check_p50_ms": pct(GATEWAY_CHECK_MS, 0.50),
             "gateway_check_p95_ms": pct(GATEWAY_CHECK_MS, 0.95),
@@ -383,6 +458,43 @@ async def overview(claims: dict = Depends(session)):
             "samples": len(TRANSFER_DECISION_MS),
         },
     }
+
+
+@app.get("/api/admin/search")
+async def global_search(q: str, claims: dict = Depends(session)):
+    """One search box over users, transactions, containers and security events."""
+    await require_admin_action("admin.search", claims)
+    q = q.strip()[:40]
+    if len(q) < 2:
+        raise HTTPException(400, "type at least 2 characters")
+    users = await get_json("auth", "/admin/users/search", claims, params={"q": q}) or []
+    txs = await get_json("account", "/admin/transactions/search", claims, params={"q": q}) or []
+    events = await get_json("audit", "/search", params={"q": q}) or []
+    qs = await get_json("responder", "/quarantine") or {"containers": []}
+    containers = [c | {"health": container_health(c)} for c in qs["containers"]
+                  if q.lower() in (c.get("service") or "").lower()]
+    clients.audit(actor=claims["usr"], action="admin.search", resource="global", decision="info", reason=q)
+    return {"users": users, "transactions": txs, "containers": containers, "events": events}
+
+
+class LockBody(BaseModel):
+    locked: bool
+    reason: str = Field(default="", max_length=200)
+
+
+USERNAME = Path(pattern=r"^[a-z0-9_]{3,20}$")
+
+
+@app.post("/api/admin/users/{username}/force-logout")
+async def force_logout(username: str = USERNAME, claims: dict = Depends(session)):
+    await require_admin_action("admin.user_control", claims)
+    return await forward("POST", "auth", f"/admin/users/{username}/force-logout", claims)
+
+
+@app.post("/api/admin/users/{username}/lock")
+async def lock_user(body: LockBody, username: str = USERNAME, claims: dict = Depends(session)):
+    await require_admin_action("admin.user_control", claims)
+    return await forward("POST", "auth", f"/admin/users/{username}/lock", claims, body.model_dump())
 
 
 @app.get("/api/admin/events")

@@ -467,3 +467,53 @@ def test_three_wrong_sms_codes_destroy_the_code():
         assert c.req("POST", "/api/auth/login/otp", json={"mobile": mobile, "otp": wrong}).status_code == 401
     r = c.req("POST", "/api/auth/login/otp", json={"mobile": mobile, "otp": code})
     assert r.status_code == 401 and "step_up" not in r.text      # gone, not "needs authenticator"
+
+
+# ------------------------------------------- admin module 1: security overview
+def test_security_overview_is_admin_only_and_complete():
+    assert logged_in("alice").req("GET", "/api/admin/overview").status_code == 403
+    o = logged_in("admin").req("GET", "/api/admin/overview")
+    assert o.status_code == 200, o.text
+    o = o.json()
+    assert 0 <= o["posture"]["score"] <= 100 and o["posture"]["parts"]
+    assert sum(p["out_of"] for p in o["posture"]["parts"]) == 100
+    s = o["summary"]
+    for key in ("total", "by_decision", "series", "severity", "fraud", "incidents", "alerts", "feed", "logins"):
+        assert key in s
+    assert {h["name"] for h in o["health"]} >= {"auth", "account", "transaction", "risk", "audit", "opa"}
+
+
+def test_global_search_hides_amounts_from_admin():
+    admin = logged_in("admin")
+    assert admin.req("GET", "/api/admin/search", params={"q": "a"}).status_code == 400
+    r = admin.req("GET", "/api/admin/search", params={"q": "alice"})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert any(u["username"] == "alice" for u in d["users"])
+    assert all("amount" not in t and "balance" not in t for t in d["transactions"])
+    assert all("password_hash" not in u and "totp_secret" not in u for u in d["users"])
+    assert logged_in("teller").req("GET", "/api/admin/search", params={"q": "alice"}).status_code == 403
+
+
+def test_admin_lock_force_logout_and_unlock():
+    name, mobile, secret = otp_user()
+    victim = Client(device=f"e2e-lock-{name}")
+    r = victim.req("POST", "/api/auth/login", json={"username": name, "password": "Long-enough-pw-1",
+                                                    "totp": pyotp.TOTP(secret).now()})
+    assert r.status_code == 200, r.text
+    victim.token = r.json()["access_token"]
+    admin = logged_in("admin")
+    assert admin.req("POST", f"/api/admin/users/{name}/force-logout").status_code == 200
+    assert victim.req("GET", "/api/accounts/me").status_code == 401          # session ended at once
+    assert admin.req("POST", f"/api/admin/users/{name}/lock", json={"locked": True}).status_code == 200
+    time.sleep(31)
+    locked = victim.req("POST", "/api/auth/login", json={"username": name, "password": "Long-enough-pw-1",
+                                                         "totp": pyotp.TOTP(secret).now()})
+    assert locked.status_code == 401                                          # locked: right password refused
+    assert admin.req("POST", f"/api/admin/users/{name}/lock", json={"locked": False}).status_code == 200
+    time.sleep(31)
+    ok = victim.req("POST", "/api/auth/login", json={"username": name, "password": "Long-enough-pw-1",
+                                                     "totp": pyotp.TOTP(secret).now()})
+    assert ok.status_code == 200, ok.text
+    assert admin.req("POST", "/api/admin/users/admin/force-logout").status_code == 400   # not on yourself
+    assert logged_in("alice").req("POST", "/api/admin/users/bob/force-logout").status_code == 403

@@ -109,7 +109,7 @@ through the same checks as any API call.
 | customer | **My account** (balance, history with risk scores) · **Send money** (live risk score, reasons, step-up MFA, decision time) |
 | teller | **Account lookup** (read any account, cannot transfer) |
 | every role | **Security settings** (inactivity timeout, my devices: approve / revoke) |
-| admin | **Session & device policy** (maximum timeout, device inventory) · **Containers & quarantine** (live status, isolate / release) · **Security overview** (decisions, denials by reason, risk mix, ZT overhead vs 100 ms budget, service health, Trivy results; auto-refresh 5 s) · **Access decisions** (filterable audit stream) · **Risk model** (metrics, leaky vs leak-free, model card) · **Audit integrity** (verify hash chain) |
+| admin | **Security overview** (posture score, incidents, fraud statistics, live feed, global search, quick actions - see [docs/admin-dashboard.md](docs/admin-dashboard.md)) · **Session & device policy** (maximum timeout, device inventory) · **Containers & quarantine** (live status, isolate / release) · **Security overview** (decisions, denials by reason, risk mix, ZT overhead vs 100 ms budget, service health, Trivy results; auto-refresh 5 s) · **Access decisions** (filterable audit stream) · **Risk model** (metrics, leaky vs leak-free, model card) · **Audit integrity** (verify hash chain) |
 
 | | |
 |---|---|
@@ -120,8 +120,8 @@ through the same checks as any API call.
 ## Tests
 
 ```bash
-make opa-test     # 19 policy unit tests
-make test         # 30 end-to-end tests through the gateway (stack must be running)
+make opa-test     # 21 policy unit tests
+make test         # 33 end-to-end tests through the gateway (stack must be running)
 make scan         # Trivy; fails on CRITICAL vulnerabilities or leaked secrets
 ```
 

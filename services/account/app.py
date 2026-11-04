@@ -110,6 +110,28 @@ async def any_account(acct_no: str, authorization: str | None = Header(None)):
     return public(acct) | {"transactions": await history(acct_no, 10)}
 
 
+@app.get("/admin/transactions/search", dependencies=[from_gateway])
+async def admin_transaction_search(q: str, authorization: str | None = Header(None)):
+    """Security view of transactions for the global search. Separation of duties: no amounts
+    or balances, only who/when/status/risk - enough to investigate an incident."""
+    claims = user_from(authorization)
+    await decide(claims, "admin.search", None, "transactions")
+    like = f"%{q[:40]}%"
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """WITH owned AS (SELECT account_no FROM accounts WHERE owner ILIKE %s)
+               SELECT id, from_account, to_account, status, risk_score, created_at FROM transactions
+               WHERE from_account ILIKE %s OR to_account ILIKE %s OR status ILIKE %s OR id::text = %s
+                  OR from_account IN (SELECT account_no FROM owned) OR to_account IN (SELECT account_no FROM owned)
+               ORDER BY id DESC LIMIT 20""", (like, like, like, like, q.strip()))
+        rows = await cur.fetchall()
+    for r in rows:
+        r["risk_score"] = float(r["risk_score"]) if r["risk_score"] is not None else None
+        r["created_at"] = r["created_at"].isoformat()
+    return rows
+
+
 class OpenIn(BaseModel):
     user_id: int
     username: str

@@ -143,3 +143,26 @@ test_only_admin_sets_session_policy_or_quarantines if {
 		ad.allow
 	}
 }
+
+test_only_admin_searches_and_controls_users if {
+	every a in ["admin.search", "admin.user_control"] {
+		authz.decision.allow with input as {
+			"subject": {"user": "admin", "role": "admin", "mfa": true},
+			"action": a, "resource": {}, "context": {"caller": "gateway"},
+		}
+		every r in ["customer", "teller"] {
+			not authz.decision.allow with input as {
+				"subject": {"user": "x", "role": r, "mfa": true},
+				"action": a, "resource": {}, "context": {"caller": "gateway"},
+			}
+		}
+	}
+}
+
+test_admin_search_from_unknown_workload_denied if {
+	d := authz.decision with input as {
+		"subject": {"user": "admin", "role": "admin", "mfa": true},
+		"action": "admin.search", "resource": {}, "context": {"caller": "transaction"},
+	}
+	"untrusted_workload" in d.reasons
+}

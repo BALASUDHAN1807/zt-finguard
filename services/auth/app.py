@@ -720,6 +720,89 @@ def require_admin(claims: dict) -> None:
         raise HTTPException(403, "administrators only")
 
 
+# ------------------------------------- admin module 1: users + quick actions
+@app.get("/admin/users/search", dependencies=[gateway_only])
+async def admin_user_search(q: str, authorization: str | None = Header(None)):
+    require_admin(caller_claims(authorization))
+    like = f"%{q[:40]}%"
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            "SELECT username, role, mobile, failed_attempts, locked_until, last_login_ip, created_at FROM users "
+            "WHERE username ILIKE %s OR mobile LIKE %s ORDER BY username LIMIT 20", (like, like))
+        rows = await cur.fetchall()
+    now = datetime.now(timezone.utc)
+    return [{"username": r["username"], "role": r["role"],
+             "mobile": mask_mobile(r["mobile"]) if r["mobile"] else None,
+             "locked": bool(r["locked_until"] and r["locked_until"] > now),
+             "failed_attempts": r["failed_attempts"], "last_login_ip": r["last_login_ip"],
+             "created_at": r["created_at"].isoformat()} for r in rows]
+
+
+@app.get("/admin/identity-stats", dependencies=[gateway_only])
+async def admin_identity_stats(authorization: str | None = Header(None)):
+    require_admin(caller_claims(authorization))
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute("SELECT role, count(*) AS n FROM users GROUP BY role")
+        roles = {r["role"]: r["n"] for r in await cur.fetchall()}
+        cur = await conn.execute("SELECT count(*) AS n FROM users WHERE locked_until > now()")
+        locked = (await cur.fetchone())["n"]
+        cur = await conn.execute("SELECT status, count(*) AS n FROM known_devices GROUP BY status")
+        devices = {r["status"]: r["n"] for r in await cur.fetchall()}
+    active = 0
+    async for _ in clients.redis().scan_iter(match="sess:*", count=500):
+        active += 1
+    return {"users_by_role": roles, "locked_accounts": locked, "devices": devices, "active_sessions": active}
+
+
+async def admin_target(username: str, claims: dict) -> dict:
+    require_admin(claims)
+    user = await get_user(username)
+    if user is None:
+        raise HTTPException(404, "no such user")
+    if user["username"] == claims["usr"]:
+        raise HTTPException(400, "you cannot do this to your own account")
+    return user
+
+
+@app.post("/admin/users/{username}/force-logout", dependencies=[gateway_only])
+async def admin_force_logout(username: str, authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    user = await admin_target(username, claims)
+    await revoke_user_sessions(str(user["id"]), "forced_by_admin")
+    clients.audit(actor=claims["usr"], action="admin.force_logout", resource=username,
+                  decision="alert", reason="forced_by_admin")
+    return {"username": username, "sessions_revoked": True}
+
+
+class LockIn(BaseModel):
+    locked: bool
+    reason: str = Field(default="", max_length=200)
+
+
+@app.post("/admin/users/{username}/lock", dependencies=[gateway_only])
+async def admin_lock(username: str, body: LockIn, authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    user = await admin_target(username, claims)
+    p = await db.pool()
+    async with p.connection() as conn:
+        if body.locked:
+            await conn.execute("UPDATE users SET locked_until = now() + interval '100 years' WHERE id = %s",
+                               (user["id"],))
+        else:
+            await conn.execute("UPDATE users SET locked_until = NULL, failed_attempts = 0 WHERE id = %s",
+                               (user["id"],))
+        await conn.commit()
+    if body.locked:
+        await revoke_user_sessions(str(user["id"]), "locked_by_admin")
+    clients.audit(actor=claims["usr"], action="admin.lock" if body.locked else "admin.unlock", resource=username,
+                  decision="alert" if body.locked else "info",
+                  reason=("locked_by_admin" if body.locked else "unlocked_by_admin")
+                  + (f": {body.reason}" if body.reason else ""))
+    return {"username": username, "locked": body.locked}
+
+
 @app.get("/admin/session-policy", dependencies=[gateway_only])
 async def get_session_policy(authorization: str | None = Header(None)):
     require_admin(caller_claims(authorization))
