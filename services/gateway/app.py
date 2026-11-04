@@ -615,6 +615,96 @@ async def release(service: str, claims: dict = Depends(session)):
     return await forward("POST", "responder", f"/quarantine/{service}/release", body={"actor": claims["usr"]})
 
 
+# ------------------------------------------- module 3: banking & transactions
+class BeneficiaryBody(BaseModel):
+    account_no: str = Field(pattern=r"^ZT\d{10}$")
+    nickname: str = Field(min_length=1, max_length=40)
+    totp: str = Field(max_length=10)
+
+
+class NoteBody(BaseModel):
+    note: str = Field(default="", max_length=200)
+
+
+class FreezeBody(BaseModel):
+    frozen: bool
+    reason: str = Field(default="", max_length=200)
+
+
+class LimitBody(BaseModel):
+    daily_limit: float = Field(gt=0, le=10_000_000)
+
+
+ACCOUNT_NO = Path(pattern=r"^ZT\d{10}$")
+
+
+@app.get("/api/beneficiaries")
+async def beneficiaries(claims: dict = Depends(session)):
+    return await forward("GET", "account", "/beneficiaries", claims)
+
+
+@app.post("/api/beneficiaries")
+async def add_beneficiary(body: BeneficiaryBody, claims: dict = Depends(session)):
+    v = await forward("POST", "auth", "/me/verify-totp", claims, {"totp": body.totp, "purpose": "add_beneficiary"})
+    if v.status_code != 200:
+        return v
+    return await forward("POST", "account", "/beneficiaries", claims,
+                         {"account_no": body.account_no, "nickname": body.nickname})
+
+
+@app.delete("/api/beneficiaries/{bid}")
+async def delete_beneficiary(bid: int, claims: dict = Depends(session)):
+    return await forward("DELETE", "account", f"/beneficiaries/{bid}", claims)
+
+
+@app.get("/api/transactions/{tx_id}/receipt")
+async def tx_receipt(tx_id: int, claims: dict = Depends(session)):
+    return await forward("GET", "account", f"/transactions/{tx_id}/receipt", claims)
+
+
+@app.post("/api/transactions/{tx_id}/cancel")
+async def tx_cancel(tx_id: int, body: NoteBody, claims: dict = Depends(session)):
+    return await forward("POST", "transaction", f"/transactions/{tx_id}/cancel", claims, body.model_dump())
+
+
+@app.get("/api/ops/summary")
+async def ops_summary(claims: dict = Depends(session)):
+    return await forward("GET", "account", "/ops/summary", claims)
+
+
+@app.get("/api/ops/accounts")
+async def ops_accounts(claims: dict = Depends(session)):
+    return await forward("GET", "account", "/ops/accounts", claims)
+
+
+@app.get("/api/ops/transactions")
+async def ops_transactions(request: Request, claims: dict = Depends(session)):
+    allowed = {"status", "account", "q", "date_from", "date_to", "min_amount", "max_amount", "limit"}
+    params = {k: v[:40] for k, v in request.query_params.items() if k in allowed and v}
+    headers = {"Authorization": f"Bearer {claims['_raw']}"}
+    try:
+        r = await mtls.client().get(mtls.url("account", "/ops/transactions"), params=params, headers=headers)
+    except httpx.HTTPError:
+        raise HTTPException(502, "account unavailable")
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@app.post("/api/ops/accounts/{acct_no}/freeze")
+async def ops_freeze(body: FreezeBody, acct_no: str = ACCOUNT_NO, claims: dict = Depends(session)):
+    return await forward("POST", "account", f"/ops/accounts/{acct_no}/freeze", claims, body.model_dump())
+
+
+@app.put("/api/ops/accounts/{acct_no}/limit")
+async def ops_limit(body: LimitBody, acct_no: str = ACCOUNT_NO, claims: dict = Depends(session)):
+    return await forward("PUT", "account", f"/ops/accounts/{acct_no}/limit", claims, body.model_dump())
+
+
+@app.post("/api/ops/pending/{tx_id}/{op}")
+async def ops_decide(body: NoteBody, tx_id: int, op: str = Path(pattern=r"^(approve|reject)$"),
+                     claims: dict = Depends(session)):
+    return await forward("POST", "transaction", f"/pending/{tx_id}/{op}", claims, body.model_dump())
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}

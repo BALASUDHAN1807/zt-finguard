@@ -9,10 +9,12 @@
 #   "resource": {"owner": "alice", "account": "ZT1000000002"},
 #   "context":  {"caller": "transaction", "amount": 2500,
 #                "risk_level": "low|medium|high", "step_up": false,
-#                "device_trust": "trusted|pending"}
+#                "device_trust": "trusted|pending",
+#                "sender_status": "active|frozen", "receiver_status": "active|frozen",
+#                "daily_used": 12000, "daily_limit": 100000}
 # }
 #
-# result = {"allow": bool, "step_up": bool, "reasons": [..]}
+# result = {"allow": bool, "step_up": bool, "needs_approval": bool, "reasons": [..]}
 package finguard.authz
 
 # ---------------------------------------------------------------- role model
@@ -24,6 +26,21 @@ permissions := {
 		"account.read:own",
 		"transaction.transfer:own",
 		"transaction.history:own",
+		"transaction.cancel:own",
+		"beneficiary.manage:own",
+		"self.manage",
+	},
+	# Banking operations (maker-checker). Cannot move its own money (has no account),
+	# cannot touch security tooling, and the customer still initiates every transfer.
+	"operations": {
+		"ops.accounts",
+		"ops.transactions",
+		"ops.freeze",
+		"ops.limits",
+		"ops.approve",
+		"account.read:any",
+		"transaction.history:any",
+		"transaction.cancel:any",
 		"self.manage",
 	},
 	"teller": {
@@ -58,10 +75,20 @@ trusted_callers := {
 	"admin.search": {"gateway", "account"},
 	"admin.user_control": {"gateway"},
 	"self.manage": {"gateway"},
+	"ops.accounts": {"account"},
+	"ops.transactions": {"account"},
+	"ops.freeze": {"account"},
+	"ops.limits": {"account"},
+	"ops.approve": {"transaction"},
+	"transaction.cancel": {"transaction"},
+	"beneficiary.manage": {"account"},
 }
 
 # Per-transfer ceiling by role (INR).
 transfer_limit := {"customer": 200000}
+
+# Transfers at or above this amount wait for an operations officer (maker-checker).
+high_value_threshold := 50000
 
 # ------------------------------------------------------------------- helpers
 role := input.subject.role
@@ -112,6 +139,30 @@ deny contains "amount_over_limit" if {
 	input.context.amount > transfer_limit[role]
 }
 
+# Frozen accounts can neither send nor receive (a missing status must deny).
+deny contains "account_frozen" if {
+	is_transfer
+	not input.context.sender_status == "active"
+}
+
+deny contains "payee_account_frozen" if {
+	is_transfer
+	not input.context.receiver_status == "active"
+}
+
+within_daily_limit if input.context.daily_used + input.context.amount <= input.context.daily_limit
+
+deny contains "daily_limit_exceeded" if {
+	is_transfer
+	not within_daily_limit
+}
+
+# ---------------------------------------------------------- maker-checker
+needs_approval if {
+	is_transfer
+	input.context.amount >= high_value_threshold
+}
+
 # ------------------------------------------------------------------ step-up
 needs_step_up if {
 	is_transfer
@@ -137,9 +188,12 @@ else := deny
 decision := {
 	"allow": allow,
 	"step_up": step_up,
+	"needs_approval": needs_approval,
 	"reasons": reasons,
 }
 
 default allow := false
+
+default needs_approval := false
 
 default step_up := false

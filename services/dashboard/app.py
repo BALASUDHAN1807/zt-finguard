@@ -133,7 +133,8 @@ def detail(r: httpx.Response):
         return r.text
 
 
-STATUS_LABEL = {"completed": "Completed", "denied": "Blocked", "step_up_required": "Extra code needed"}
+STATUS_LABEL = {"completed": "Completed", "denied": "Blocked", "step_up_required": "Extra code needed",
+                "pending_approval": "Waiting for approval", "cancelled": "Cancelled", "rejected": "Rejected"}
 
 
 def compact_money(x: float) -> str:
@@ -276,6 +277,7 @@ def footer() -> None:
 
 def pill(decision: str) -> str:
     cls = {"allow": "zt-allow", "deny": "zt-deny", "step_up": "zt-step", "alert": "zt-deny",
+           "pending_approval": "zt-step",
            "critical": "zt-critical", "high": "zt-high", "medium": "zt-medium", "low": "zt-low",
            "info": "zt-info"}.get(decision, "")
     return f'<span class="zt-pill {cls}">{decision.upper()}</span>'
@@ -467,6 +469,7 @@ def sidebar() -> str:
         pages = {
             "customer": ["My account", "Send money", "Security settings"],
             "teller": ["Account lookup", "Security settings"],
+            "operations": ["Banking & transactions", "Security settings"],
             "admin": ["Security overview", "Identity & devices", "Access decisions", "Risk model", "Audit integrity",
                       "Session & device policy", "Containers & quarantine", "Security settings"],
         }[ss.role]
@@ -496,6 +499,14 @@ def my_account() -> None:
 <div><div class="k">Savings account</div><div class="v">{grouped}</div></div>
 <div><div class="k">Customer since</div><div class="v">{opened}</div></div>
 </div>""", unsafe_allow_html=True)
+    if a.get("status") == "frozen":
+        st.error("This account is **frozen** by the bank's operations team"
+                 + (f" ({a['frozen_reason']})" if a.get("frozen_reason") else "")
+                 + ". You can view it, but no money can be sent or received until it is unfrozen.")
+    if a.get("daily_limit"):
+        used = a.get("used_today", 0)
+        st.progress(min(1.0, used / a["daily_limit"]),
+                    text=f"Sent today {money(used)} of your {money(a['daily_limit'])} daily limit")
     st.subheader("Recent activity")
     t = api("GET", "/api/accounts/me/transactions")
     rows = t.json() if t is not None and t.status_code == 200 else []
@@ -503,9 +514,10 @@ def my_account() -> None:
         st.info("No transactions yet.")
         return
     df = pd.DataFrame(rows)
-    df["when"] = pd.to_datetime(df["created_at"]).dt.strftime("%d %b %H:%M")
+    df["when"] = local_time(df["created_at"], "%d %b %H:%M")
     df["counterparty"] = df.apply(lambda x: x["to_account"] if x["direction"] == "out" else x["from_account"], axis=1)
     df["amount"] = df.apply(lambda x: (-1 if x["direction"] == "out" else 1) * x["amount"], axis=1)
+    raw_rows = rows
     df["status"] = df["status"].map(STATUS_LABEL).fillna(df["status"])
     st.dataframe(
         df[["when", "counterparty", "amount", "status", "risk_score"]],
@@ -517,6 +529,7 @@ def my_account() -> None:
             "status": st.column_config.TextColumn("Status"),
             "risk_score": st.column_config.ProgressColumn("Risk score", min_value=0, max_value=1, format="%.2f"),
         })
+    customer_tx_tools(raw_rows)
 
 
 def send_money() -> None:
@@ -527,8 +540,12 @@ def send_money() -> None:
     if me is not None and me.status_code == 200 and me.json().get("device_trust") != "trusted":
         st.warning("This device is **not trusted yet**, so transfers from it will be refused. "
                    "Approve it from a trusted device under *Security settings*.")
+    bens = beneficiaries_panel()
     with st.form("transfer"):
-        to = st.text_input("To account", placeholder="ZT10000000xx")
+        choices = ["Enter an account number"] + [f"{b['nickname']} ({b['account_no']})" for b in bens]
+        payee = st.selectbox("Pay to", choices)
+        to = st.text_input("To account", placeholder="ZT10000000xx") if payee == choices[0] else \
+            payee.rsplit("(", 1)[1].rstrip(")")
         amt = st.number_input("Amount (₹)", min_value=1.0, step=100.0, value=1000.0)
         go = st.form_submit_button("Send", type="primary")
     if go:
@@ -583,6 +600,11 @@ def render_result(lt: dict) -> None:
     st.markdown(f"#### Result {pill(decision)}", unsafe_allow_html=True)
     if decision == "allow":
         st.success(f"Sent {money(lt['amount'])} to {lt['to']}. New balance {money(d['new_balance'])}.")
+        receipt_button(d["transaction_id"], "last_receipt")
+    elif decision == "pending_approval":
+        st.info(f"{money(lt['amount'])} to {lt['to']} is **waiting for approval** (transaction "
+                f"#{d['transaction_id']}). High-value transfers are checked by an operations officer before the "
+                "money moves. You can cancel it from My account until then.")
     elif decision == "deny":
         st.error("Transfer blocked: " + ", ".join(d.get("reasons", [])))
     else:
@@ -1224,9 +1246,8 @@ def identity_users() -> None:
     c = st.columns(3)
     with c[0], st.form("role_form"):
         st.markdown(f"**Role** (now: {cur['role']})")
-        role = st.selectbox("New role", ["customer", "teller", "admin"],
-                            index=["customer", "teller", "admin"].index(cur["role"])
-                            if cur["role"] in ("customer", "teller", "admin") else 0)
+        roles = ["customer", "teller", "operations", "admin"]
+        role = st.selectbox("New role", roles, index=roles.index(cur["role"]) if cur["role"] in roles else 0)
         code = st.text_input("Your authenticator code", max_chars=6, key="role_code")
         if st.form_submit_button("Change role", type="primary", use_container_width=True):
             ok_or_error(api("PUT", f"/api/admin/users/{who}/role", json={"role": role, "totp": code.strip()}),
@@ -1360,6 +1381,307 @@ def identity_logins() -> None:
             tooltip=["user", "failed"]).properties(height=max(120, 26 * len(fd))), use_container_width=True)
 
 
+# ------------------------------------------------ module 3: banking helpers
+TX_STATUS = {"completed": "Completed", "denied": "Blocked", "step_up_required": "Extra code needed",
+             "pending_approval": "Waiting for approval", "cancelled": "Cancelled", "rejected": "Rejected"}
+
+
+def pdf_escape(t: str) -> str:
+    return t.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)").encode("latin-1", "replace").decode("latin-1")
+
+
+def simple_pdf(title: str, rows: list[tuple[str, str]], footer: str) -> bytes:
+    """One-page A4 PDF built by hand (Helvetica, no extra libraries in the image)."""
+    ops = ["BT /F2 18 Tf 56 770 Td (" + pdf_escape(title) + ") Tj ET",
+           "0.72 0.54 0.17 RG 2 w 56 756 m 539 756 l S"]
+    y = 726
+    for k, v in rows:
+        ops.append(f"BT /F1 10 Tf 0.35 0.42 0.44 rg 56 {y} Td ({pdf_escape(k)}) Tj ET")
+        ops.append(f"BT /F2 11 Tf 0.08 0.15 0.17 rg 220 {y} Td ({pdf_escape(v)}) Tj ET")
+        y -= 24
+    ops.append(f"0.85 0.88 0.89 RG 1 w 56 {y + 8} m 539 {y + 8} l S")
+    for i, line in enumerate(footer.split("\n")):
+        ops.append(f"BT /F1 8 Tf 0.35 0.42 0.44 rg 56 {y - 12 - 12 * i} Td ({pdf_escape(line)}) Tj ET")
+    content = "\n".join(ops).encode("latin-1")
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R "
+            b"/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> >>",
+            b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for i, o in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + o + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    out += b"".join(f"{o:010d} 00000 n \n".encode() for o in offsets)
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+def receipt_pdf(r: dict) -> bytes:
+    when = pd.to_datetime(r["created_at"], utc=True).tz_convert("Asia/Kolkata").strftime("%d %b %Y, %H:%M:%S IST")
+    rows = [("Transaction ID", str(r["transaction_id"])), ("Reference", r["reference"]), ("Date and time", when),
+            ("From", f"{r['from_name']}  ({r['from_account']})"), ("To", f"{r['to_name']}  ({r['to_account']})"),
+            ("Amount", f"INR {r['amount']:,.2f}"), ("Status", TX_STATUS.get(r["status"], r["status"])),
+            ("Fraud risk score", f"{r['risk_score']:.2f}" if r["risk_score"] is not None else "-")]
+    if r.get("decided_by"):
+        rows.append(("Decided by", f"{r['decided_by']} ({r.get('note') or ''})"))
+    return simple_pdf("ZT-FinGuard transaction receipt", rows,
+                      "Generated by ZT-FinGuard, a demonstration bank for a Linux & Container Technology course "
+                      "project.\nIt holds no real money. The reference is a SHA-256 fingerprint of this transaction.")
+
+
+def receipt_button(tx_id: int, key: str) -> None:
+    r = api("GET", f"/api/transactions/{tx_id}/receipt")
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "receipt unavailable")
+        return
+    st.download_button("Download receipt (PDF)", receipt_pdf(r.json()), file_name=f"zt-finguard-receipt-{tx_id}.pdf",
+                       mime="application/pdf", key=key, use_container_width=True)
+
+
+def customer_tx_tools(rows: list[dict]) -> None:
+    pending = [x for x in rows if x["status"] == "pending_approval" and x["direction"] == "out"]
+    a, b = st.columns(2)
+    with a:
+        st.markdown("**Receipt**")
+        opts = {f"#{x['id']} {local_time(pd.Series([x['created_at']]), '%d %b %H:%M').iloc[0]} "
+                f"{money(x['amount'])} {TX_STATUS.get(x['status'], x['status'])}": x["id"] for x in rows}
+        pick = st.selectbox("Transaction", list(opts), label_visibility="collapsed")
+        receipt_button(opts[pick], "cust_receipt")
+    with b:
+        st.markdown("**Waiting for approval**")
+        if not pending:
+            st.caption("Nothing waiting. Transfers of ₹50,000 or more are checked by an operations officer "
+                       "before the money moves; until then you can cancel them.")
+        for x in pending:
+            if st.button(f"Cancel #{x['id']} ({money(x['amount'])} to {x['to_account']})", key=f"cx{x['id']}",
+                         use_container_width=True):
+                ok_or_error(api("POST", f"/api/transactions/{x['id']}/cancel", json={"note": "cancelled by customer"}),
+                            "Transfer cancelled. No money moved.")
+
+
+def beneficiaries_panel() -> list[dict]:
+    r = api("GET", "/api/beneficiaries")
+    bens = r.json() if r is not None and r.status_code == 200 else []
+    with st.expander(f"Saved payees ({len(bens)})"):
+        for bn in bens:
+            c1, c2 = st.columns([4, 1])
+            c1.markdown(f"**{bn['nickname']}**  \n<span class='zt-muted'>{bn['account_no']}</span>",
+                        unsafe_allow_html=True)
+            if c2.button("Remove", key=f"rmb{bn['id']}"):
+                api("DELETE", f"/api/beneficiaries/{bn['id']}")
+                st.rerun()
+        with st.form("add_ben"):
+            st.markdown("**Add a payee**")
+            c = st.columns(3)
+            acct = c[0].text_input("Account number", placeholder="ZT10000000xx")
+            nick = c[1].text_input("Nickname", placeholder="e.g. Amma")
+            code = c[2].text_input("Authenticator code", max_chars=6,
+                                   help="Saving a payee is a sensitive change, so it needs a fresh code")
+            if st.form_submit_button("Save payee", type="primary"):
+                res = api("POST", "/api/beneficiaries", json={"account_no": acct.strip().upper(),
+                                                              "nickname": nick.strip(), "totp": code.strip()})
+                if res is not None and res.status_code == 200:
+                    st.rerun()
+                ok_or_error(res, "Saved.")
+    return bens
+
+
+# ---------------------------------------------- module 3: operations pages
+def banking_operations() -> None:
+    st.title("Banking & transactions")
+    st.caption("Operations desk: accounts, transfers, approvals and limits. Security administration is a "
+               "separate role (separation of duties).")
+    t = st.tabs(["Overview", "Accounts", "Transactions", "Pending approvals"])
+    with t[0]:
+        ops_overview()
+    with t[1]:
+        ops_accounts()
+    with t[2]:
+        ops_transactions()
+    with t[3]:
+        ops_pending()
+
+
+def ops_overview() -> None:
+    r = api("GET", "/api/ops/summary")
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    s = r.json()
+    k = st.columns(4)
+    k[0].metric("Customer deposits", compact_money(s["deposits"]))
+    k[1].metric("Accounts", s["accounts"])
+    k[2].metric("Frozen accounts", s["frozen"])
+    k[3].metric("Low balance (< ₹1,000)", s["low_balance"])
+    k = st.columns(3)
+    k[0].metric("Transfers today", f"{s['today_count']} ({compact_money(s['today_amount'])})")
+    k[1].metric("Waiting for approval", f"{s['pending_count']} ({compact_money(s['pending_amount'])})")
+    k[2].metric("High-value transfers (24 h)", s["high_value_24h"])
+    a, b = st.columns([1, 1.4])
+    with a:
+        st.subheader("Transfer status (24 h)")
+        if s["by_status_24h"]:
+            df = pd.DataFrame(s["by_status_24h"])
+            df["status"] = df["status"].map(TX_STATUS).fillna(df["status"])
+            st.altair_chart(alt.Chart(df).mark_bar(color="#0B3D4A", cornerRadiusEnd=2).encode(
+                x=alt.X("n:Q", title="transfers", axis=alt.Axis(tickMinStep=1, format="d")),
+                y=alt.Y("status:N", sort="-x", title=None), tooltip=["status", "n", "amount"]
+            ).properties(height=220), use_container_width=True)
+        else:
+            st.info("No transfers in the last 24 hours.")
+    with b:
+        st.subheader("Money moved per hour")
+        if s["volume_24h"]:
+            df = pd.DataFrame(s["volume_24h"])
+            df["hour"] = local_time(df["hour"], "%H:00")
+            st.altair_chart(alt.Chart(df).mark_bar(color="#B8892B", cornerRadiusTopLeft=2,
+                                                   cornerRadiusTopRight=2).encode(
+                x=alt.X("hour:O", title=None, sort=None, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("amount:Q", title="₹ completed"), tooltip=["hour", "amount", "n"]
+            ).properties(height=220), use_container_width=True)
+        else:
+            st.info("No completed transfers in the last 24 hours.")
+    st.subheader("High-value transfer alerts")
+    hv = api("GET", "/api/ops/transactions", params={"min_amount": 50000, "limit": 15})
+    rows = hv.json() if hv is not None and hv.status_code == 200 else []
+    if rows:
+        df = pd.DataFrame(rows)
+        df["created_at"] = local_time(df["created_at"], "%d %b %H:%M")
+        df["status"] = df["status"].map(TX_STATUS).fillna(df["status"])
+        st.dataframe(df[["id", "created_at", "from_name", "to_name", "amount", "status", "risk_score", "decided_by"]],
+                     hide_index=True, use_container_width=True,
+                     column_config={"amount": st.column_config.NumberColumn("amount (₹)", format="%.2f"),
+                                    "created_at": "time", "from_name": "from", "to_name": "to"})
+    else:
+        st.caption("No transfers of ₹50,000 or more.")
+
+
+def ops_accounts() -> None:
+    r = api("GET", "/api/ops/accounts")
+    rows = r.json() if r is not None and r.status_code == 200 else []
+    if not rows:
+        st.info("No accounts.")
+        return
+    df = pd.DataFrame(rows)
+    q = st.text_input("Find account", placeholder="Name or account number", key="acct_q")
+    view = df[df["owner"].str.contains(q, case=False) | df["account_no"].str.contains(q, case=False)] if q else df
+    view = view.assign(used=(100 * view["used_today"] / view["daily_limit"]).round(0),
+                       status=view["status"].map({"active": "Active", "frozen": "Frozen"}),
+                       last_tx=local_time(view["last_tx"], "%d %b %H:%M").fillna("-"))
+    st.dataframe(view[["account_no", "owner", "balance", "status", "daily_limit", "used_today", "used", "tx_24h",
+                       "last_tx", "frozen_reason"]], hide_index=True, use_container_width=True,
+                 column_config={"balance": st.column_config.NumberColumn("balance (₹)", format="%.2f"),
+                                "daily_limit": st.column_config.NumberColumn("daily limit (₹)", format="%.0f"),
+                                "used_today": st.column_config.NumberColumn("sent today (₹)", format="%.0f"),
+                                "used": st.column_config.ProgressColumn("limit used", min_value=0, max_value=100,
+                                                                        format="%d%%"),
+                                "tx_24h": "transfers (24 h)", "last_tx": "last activity",
+                                "frozen_reason": "freeze reason"})
+    opts = {f"{x['account_no']} - {x['owner']} ({x['status']})": x for x in rows}
+    pick = opts[st.selectbox("Account", list(opts))]
+    a, b = st.columns(2)
+    with a, st.form("freeze"):
+        frozen = pick["status"] == "frozen"
+        st.markdown(f"**{'Unfreeze' if frozen else 'Freeze'} account**")
+        st.caption("A frozen account can be viewed but cannot send or receive money.")
+        reason = st.text_input("Reason", value="" if not frozen else pick.get("frozen_reason") or "",
+                               placeholder="e.g. suspected account takeover")
+        if st.form_submit_button("Unfreeze" if frozen else "Freeze", type="primary", use_container_width=True):
+            ok_or_error(api("POST", f"/api/ops/accounts/{pick['account_no']}/freeze",
+                            json={"frozen": not frozen, "reason": reason}),
+                        f"{pick['account_no']} {'unfrozen' if frozen else 'frozen'}.")
+    with b, st.form("limit"):
+        st.markdown("**Daily transfer limit**")
+        st.caption(f"Now {money(pick['daily_limit'])}; sent today {money(pick['used_today'])}.")
+        lim = st.number_input("New limit (₹)", min_value=1000.0, max_value=10_000_000.0, step=5000.0,
+                              value=float(pick["daily_limit"]))
+        if st.form_submit_button("Set limit", type="primary", use_container_width=True):
+            ok_or_error(api("PUT", f"/api/ops/accounts/{pick['account_no']}/limit", json={"daily_limit": lim}),
+                        f"Daily limit of {pick['account_no']} set to {money(lim)}.")
+
+
+def ops_transactions() -> None:
+    with st.form("tx_filters"):
+        c = st.columns(4)
+        status = c[0].selectbox("Status", ["Any"] + list(TX_STATUS), format_func=lambda x: TX_STATUS.get(x, x))
+        q = c[1].text_input("Customer name or transaction id")
+        account = c[2].text_input("Account number")
+        dates = c[3].date_input("Dates", value=[], format="DD/MM/YYYY")
+        c = st.columns(4)
+        mn = c[0].number_input("Minimum amount (₹)", min_value=0.0, value=0.0, step=1000.0)
+        mx = c[1].number_input("Maximum amount (₹, 0 = any)", min_value=0.0, value=0.0, step=1000.0)
+        c[3].markdown("&nbsp;")
+        c[3].form_submit_button("Search", type="primary", use_container_width=True)
+    params = {"limit": 300}
+    if status != "Any":
+        params["status"] = status
+    if q.strip():
+        params["q"] = q.strip()
+    if account.strip():
+        params["account"] = account.strip().upper()
+    if len(dates) >= 1:
+        params["date_from"] = dates[0].isoformat()
+        params["date_to"] = (dates[1] if len(dates) > 1 else dates[0]).isoformat()
+    if mn:
+        params["min_amount"] = mn
+    if mx:
+        params["max_amount"] = mx
+    r = api("GET", "/api/ops/transactions", params=params)
+    rows = r.json() if r is not None and r.status_code == 200 else []
+    st.caption(f"{len(rows)} transactions")
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    df["created_at"] = local_time(df["created_at"], "%d %b %H:%M")
+    df["status"] = df["status"].map(TX_STATUS).fillna(df["status"])
+    st.dataframe(df[["id", "created_at", "from_name", "from_account", "to_name", "to_account", "amount", "status",
+                     "risk_score", "decided_by", "decision_note"]], hide_index=True, use_container_width=True,
+                 height=420, column_config={"amount": st.column_config.NumberColumn("amount (₹)", format="%.2f"),
+                                            "created_at": "time", "from_name": "from", "to_name": "to",
+                                            "decision_note": "note"})
+    a, b = st.columns(2)
+    with a:
+        pick = st.selectbox("Receipt for transaction", [x["id"] for x in rows])
+        receipt_button(pick, "ops_receipt")
+    with b:
+        pend = [x for x in rows if x["status"] == "pending_approval"]
+        if pend:
+            pid = st.selectbox("Cancel a transfer waiting for approval", [x["id"] for x in pend])
+            if st.button("Cancel transfer", use_container_width=True):
+                ok_or_error(api("POST", f"/api/transactions/{pid}/cancel", json={"note": "cancelled by operations"}),
+                            f"Transfer #{pid} cancelled.")
+
+
+def ops_pending() -> None:
+    r = api("GET", "/api/ops/transactions", params={"status": "pending_approval", "limit": 100})
+    rows = r.json() if r is not None and r.status_code == 200 else []
+    st.caption("Transfers of ₹50,000 or more stop here (maker-checker): the customer made the request, an "
+               "operations officer checks it. Approving moves the money; rejecting returns nothing to do.")
+    if not rows:
+        st.success("No transfers waiting for approval.")
+        return
+    for x in rows:
+        with st.container(border=True):
+            c = st.columns([3, 2])
+            c[0].markdown(f"**#{x['id']} {money(x['amount'])}** from **{x['from_name']}** ({x['from_account']}) "
+                          f"to **{x['to_name']}** ({x['to_account']})  \n"
+                          f"<span class='zt-muted'>requested {local_time(pd.Series([x['created_at']]), '%d %b %H:%M').iloc[0]}"
+                          f", fraud risk {x['risk_score'] or 0:.2f}</span>", unsafe_allow_html=True)
+            note = c[1].text_input("Note", key=f"note{x['id']}", placeholder="e.g. called customer, confirmed")
+            b1, b2 = c[1].columns(2)
+            if b1.button("Approve", key=f"ap{x['id']}", type="primary", use_container_width=True):
+                ok_or_error(api("POST", f"/api/ops/pending/{x['id']}/approve", json={"note": note}),
+                            f"#{x['id']} approved and completed.")
+            if b2.button("Reject", key=f"rj{x['id']}", use_container_width=True):
+                ok_or_error(api("POST", f"/api/ops/pending/{x['id']}/reject", json={"note": note}),
+                            f"#{x['id']} rejected. No money moved.")
+
+
 # -------------------------------------------------------------------- main
 ss = S()
 topbar(bool(ss.token))
@@ -1374,6 +1696,7 @@ else:
         "Account lookup": account_lookup,
         "Security overview": security_overview,
         "Identity & devices": identity_devices,
+        "Banking & transactions": banking_operations,
         "Access decisions": access_decisions,
         "Risk model": risk_model,
         "Audit integrity": audit_integrity,

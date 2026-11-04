@@ -31,6 +31,8 @@ users = [
     {"username": "alice",       "role": "customer", "mobile": "9876500001"},
     {"username": "bob",         "role": "customer", "mobile": "9876500002"},
     {"username": "victim_demo", "role": "customer", "mobile": "9876500003"},
+    {"username": "meera",       "role": "customer", "mobile": "9876500004", "opening_balance": 500000},
+    {"username": "ops",         "role": "operations", "mobile": "9000000003"},
 ]
 for u in users:
     u["password"] = pw()
@@ -38,6 +40,25 @@ for u in users:
 json.dump({"users": users}, open(sys.argv[1], "w"), indent=2)
 PY
 fi
+
+# Users added in later versions (e.g. the operations officer) are appended to an existing file
+python3 - "$OUT/seed_users.json" <<'PY'
+import base64, json, secrets, sys
+path = sys.argv[1]
+data = json.load(open(path))
+have = {u["username"] for u in data["users"]}
+added = []
+for u in [{"username": "ops", "role": "operations", "mobile": "9000000003"},
+          {"username": "meera", "role": "customer", "mobile": "9876500004", "opening_balance": 500000}]:
+    if u["username"] not in have:
+        u["password"] = "Zt-" + secrets.token_urlsafe(9)
+        u["totp_secret"] = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+        data["users"].append(u)
+        added.append(u["username"])
+if added:
+    json.dump(data, open(path, "w"), indent=2)
+    print("[secrets] added demo users:", ", ".join(added))
+PY
 
 # same reasoning as certs/: dir is 0700, files readable by non-root container UIDs
 chmod 644 "$OUT"/*

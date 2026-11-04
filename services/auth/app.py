@@ -48,8 +48,8 @@ LOCK_MINUTES = 15
 USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
 MOBILE_RE = re.compile(r"^[6-9][0-9]{9}$")          # Indian mobile numbers
 # Demo mobile numbers when seed_users.json predates F22 (same as scripts/gen-secrets.sh)
-DEMO_MOBILES = {"admin": "9000000001", "teller": "9000000002", "alice": "9876500001",
-                "bob": "9876500002", "victim_demo": "9876500003"}
+DEMO_MOBILES = {"admin": "9000000001", "teller": "9000000002", "ops": "9000000003", "alice": "9876500001",
+                "bob": "9876500002", "victim_demo": "9876500003", "meera": "9876500004"}
 
 
 def seed_mobile(u: dict) -> str | None:
@@ -71,28 +71,36 @@ def mask_mobile(m: str) -> str:
 
 
 # ------------------------------------------------------------------ startup
-async def seed_users() -> None:
+async def seed_users() -> bool:
+    """Create any demo user that does not exist yet and backfill demo mobile numbers.
+    Returns False while the schema is not ready (db/migrations still to be applied)."""
+    users = json.load(open(SEED_FILE))["users"]
     p = await db.pool()
+    done = True
     async with p.connection() as conn:
-        users = json.load(open(SEED_FILE))["users"]
-        cur = await conn.execute("SELECT count(*) AS n FROM users")
-        if (await cur.fetchone())["n"] > 0:
-            # F22 on an existing database: give the demo users their mobile numbers
-            try:
-                for u in users:
-                    await conn.execute("UPDATE users SET mobile = %s WHERE username = %s AND mobile IS NULL",
-                                       (seed_mobile(u), u["username"]))
-                await conn.commit()
-            except Exception as exc:  # noqa: BLE001 - column added by db/migrations (deploy.sh)
-                await conn.rollback()
-                log.warning("mobile numbers not seeded yet (%r)", exc)
-            return
         for u in users:
-            await conn.execute(
-                "INSERT INTO users (username, password_hash, totp_secret, role, mobile) VALUES (%s,%s,%s,%s,%s)",
-                (u["username"], hash_password(u["password"]), u["totp_secret"], u["role"], seed_mobile(u)))
-        await conn.commit()
-        log.info("seeded %d demo users", len(users))
+            try:
+                cur = await conn.execute(
+                    """INSERT INTO users (username, password_hash, totp_secret, role, mobile)
+                       VALUES (%s,%s,%s,%s,%s) ON CONFLICT (username) DO NOTHING RETURNING id""",
+                    (u["username"], hash_password(u["password"]), u["totp_secret"], u["role"], seed_mobile(u)))
+                if await cur.fetchone():
+                    log.info("seeded demo user %s", u["username"])
+                await conn.execute("UPDATE users SET mobile = %s WHERE username = %s AND mobile IS NULL",
+                                   (seed_mobile(u), u["username"]))
+                await conn.commit()
+            except Exception as exc:  # noqa: BLE001 - e.g. role 'operations' before migration 003
+                await conn.rollback()
+                log.warning("demo user %s not seeded yet (%r)", u["username"], exc)
+                done = False
+    return done
+
+
+async def seed_until_ready() -> None:
+    for _ in range(120):
+        if await seed_users():
+            return
+        await asyncio.sleep(5)
 
 
 async def open_missing_accounts() -> None:
@@ -103,9 +111,12 @@ async def open_missing_accounts() -> None:
             async with p.connection() as conn:
                 cur = await conn.execute("SELECT id, username FROM users WHERE role = 'customer'")
                 customers = await cur.fetchall()
+            opening = {u["username"]: u["opening_balance"] for u in json.load(open(SEED_FILE))["users"]
+                       if u.get("opening_balance")}
             for c in customers:
                 r = await mtls.client().post(mtls.url("account", "/internal/open"),
-                                             json={"user_id": c["id"], "username": c["username"]})
+                                             json={"user_id": c["id"], "username": c["username"],
+                                                   "opening_balance": opening.get(c["username"])})
                 r.raise_for_status()
             log.info("accounts ensured for %d customers", len(customers))
             return
@@ -126,11 +137,14 @@ async def load_security_settings() -> None:
 @asynccontextmanager
 async def lifespan(_app):
     await db.pool()
-    await seed_users()
+    seeded = await seed_users()
     await load_security_settings()
     task = asyncio.create_task(open_missing_accounts())
+    seeder = None if seeded else asyncio.create_task(seed_until_ready())
     yield
     task.cancel()
+    if seeder:
+        seeder.cancel()
     await db.close()
 
 
@@ -690,6 +704,25 @@ class SessionPrefIn(BaseModel):
     idle_timeout_minutes: int = Field(ge=1, le=1440)
 
 
+class VerifyTotpIn(BaseModel):
+    totp: str = Field(max_length=10)
+    purpose: str = Field(default="sensitive_action", max_length=60)
+
+
+@app.post("/me/verify-totp", dependencies=[gateway_only])
+async def verify_my_totp(body: VerifyTotpIn, authorization: str | None = Header(None)):
+    """Step-up for sensitive customer actions (e.g. saving a new beneficiary)."""
+    claims = caller_claims(authorization)
+    user = await get_user_by_id(claims["sub"])
+    if not await totp_ok(user, body.totp):
+        clients.audit(actor=claims["usr"], action="auth.step_up", resource=body.purpose, decision="deny",
+                      reason="bad_or_replayed_totp")
+        raise HTTPException(401, "authenticator code invalid or already used")
+    clients.audit(actor=claims["usr"], action="auth.step_up", resource=body.purpose, decision="allow",
+                  reason="totp_reverified")
+    return {"verified": True}
+
+
 @app.get("/me/session", dependencies=[gateway_only])
 async def my_session(authorization: str | None = Header(None)):
     claims = caller_claims(authorization)
@@ -963,7 +996,7 @@ async def verify_current(body: DeviceActionIn, authorization: str | None = Heade
 
 
 # --------------------------------------- admin module 2: identity & devices
-ROLES = ("customer", "teller", "admin")
+ROLES = ("customer", "teller", "admin", "operations")
 
 
 async def admin_totp(claims: dict, code: str | None) -> None:

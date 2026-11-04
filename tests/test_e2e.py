@@ -590,3 +590,95 @@ def test_role_change_needs_admin_code_and_ends_sessions():
     assert r.json()["role"] == "teller"
     assert admin.req("PUT", "/api/admin/users/admin/role",
                      json={"role": "customer", "totp": "000000"}).status_code == 400
+
+
+# ------------------------------------------- admin module 3: banking & operations
+def _send(c: Client, user: str, to: str, amount: float):
+    """Transfer; completes the step-up with a fresh authenticator code if the risk engine asks."""
+    r = c.req("POST", "/api/transfer", json={"to_account": to, "amount": amount})
+    if r.status_code == 403 and r.json().get("decision") == "step_up":
+        su = c.req("POST", "/api/auth/step-up", json={"totp": fresh_code(user), "to_account": to, "amount": amount})
+        assert su.status_code == 200, su.text
+        r = c.req("POST", "/api/transfer", json={"to_account": to, "amount": amount,
+                                                 "step_up_token": su.json()["step_up_token"]})
+    return r
+
+
+def test_high_value_transfer_waits_for_operations_approval():
+    ops, meera = logged_in("ops"), logged_in("meera")
+    me = meera.req("GET", "/api/accounts/me").json()
+    assert ops.req("PUT", f"/api/ops/accounts/{me['account_no']}/limit",
+                   json={"daily_limit": 1_000_000}).status_code == 200
+    alice = account_of("alice")
+    r = _send(meera, "meera", alice, 55000)
+    assert r.status_code == 202 and r.json()["decision"] == "pending_approval", r.text
+    tx = r.json()["transaction_id"]
+    assert meera.req("GET", "/api/accounts/me").json()["balance"] == me["balance"]       # nothing moved yet
+    assert meera.req("POST", f"/api/ops/pending/{tx}/approve", json={}).status_code == 403   # maker != checker
+    assert logged_in("admin").req("POST", f"/api/ops/pending/{tx}/approve", json={}).status_code == 403
+    ok = ops.req("POST", f"/api/ops/pending/{tx}/approve", json={"note": "confirmed by phone"})
+    assert ok.status_code == 200 and ok.json()["status"] == "completed", ok.text
+    assert meera.req("GET", "/api/accounts/me").json()["balance"] == me["balance"] - 55000
+    assert ops.req("POST", f"/api/ops/pending/{tx}/approve", json={}).status_code == 409     # only once
+    rc = meera.req("GET", f"/api/transactions/{tx}/receipt").json()
+    assert rc["status"] == "completed" and rc["decided_by"] == "ops" and len(rc["reference"]) == 20
+
+    r2 = _send(meera, "meera", alice, 51000)
+    tx2 = r2.json()["transaction_id"]
+    assert meera.req("POST", f"/api/transactions/{tx2}/cancel", json={}).status_code == 200
+    assert ops.req("POST", f"/api/ops/pending/{tx2}/approve", json={}).status_code == 409    # cancelled
+    r3 = _send(meera, "meera", alice, 52000)
+    tx3 = r3.json()["transaction_id"]
+    assert ops.req("POST", f"/api/ops/pending/{tx3}/reject", json={"note": "not confirmed"}).status_code == 200
+    assert meera.req("POST", f"/api/transactions/{tx3}/cancel", json={}).status_code == 409   # already rejected
+
+
+def test_frozen_account_and_daily_limit_are_enforced_by_policy():
+    name, _, secret = otp_user()
+    c = Client(device=f"e2e-{name}")
+    r = c.req("POST", "/api/auth/login", json={"username": name, "password": "Long-enough-pw-1",
+                                               "totp": pyotp.TOTP(secret).now()})
+    c.token = r.json()["access_token"]
+    mine = c.req("GET", "/api/accounts/me").json()["account_no"]
+    ops = logged_in("ops")
+    assert ops.req("POST", f"/api/ops/accounts/{mine}/freeze", json={"frozen": True}).status_code == 400  # reason
+    assert ops.req("POST", f"/api/ops/accounts/{mine}/freeze",
+                   json={"frozen": True, "reason": "suspected takeover"}).status_code == 200
+    assert c.req("GET", "/api/accounts/me").json()["status"] == "frozen"
+    blocked = c.req("POST", "/api/transfer", json={"to_account": account_of("alice"), "amount": 100})
+    assert blocked.status_code == 403 and "account_frozen" in blocked.json()["reasons"]
+    assert ops.req("POST", f"/api/ops/accounts/{mine}/freeze", json={"frozen": False}).status_code == 200
+    assert ops.req("PUT", f"/api/ops/accounts/{mine}/limit", json={"daily_limit": 500}).status_code == 200
+    over = c.req("POST", "/api/transfer", json={"to_account": account_of("alice"), "amount": 1000})
+    assert over.status_code == 403 and "daily_limit_exceeded" in over.json()["reasons"]
+    assert c.req("GET", "/api/ops/accounts").status_code == 403                  # customers are not operations
+
+
+def test_beneficiaries_need_a_code_and_receipts_stay_private():
+    name, _, secret = otp_user()
+    c = Client(device=f"e2e-{name}")
+    r = c.req("POST", "/api/auth/login", json={"username": name, "password": "Long-enough-pw-1",
+                                               "totp": pyotp.TOTP(secret).now()})
+    c.token = r.json()["access_token"]
+    bob = account_of("bob")
+    assert c.req("POST", "/api/beneficiaries", json={"account_no": bob, "nickname": "Bob",
+                                                     "totp": "000000"}).status_code == 401
+    time.sleep(31)
+    ok = c.req("POST", "/api/beneficiaries", json={"account_no": bob, "nickname": "Bob",
+                                                   "totp": pyotp.TOTP(secret).now()})
+    assert ok.status_code == 200, ok.text
+    assert [b["account_no"] for b in c.req("GET", "/api/beneficiaries").json()] == [bob]
+    sent = c.req("POST", "/api/transfer", json={"to_account": bob, "amount": 200})
+    if sent.status_code == 403 and sent.json().get("decision") == "step_up":    # risk engine's call
+        time.sleep(31)
+        su = c.req("POST", "/api/auth/step-up", json={"totp": pyotp.TOTP(secret).now(), "to_account": bob,
+                                                       "amount": 200})
+        sent = c.req("POST", "/api/transfer", json={"to_account": bob, "amount": 200,
+                                                    "step_up_token": su.json()["step_up_token"]})
+    assert sent.status_code == 200, sent.text
+    tx = sent.json()["transaction_id"]
+    assert c.req("GET", f"/api/transactions/{tx}/receipt").status_code == 200
+    assert logged_in("alice").req("GET", f"/api/transactions/{tx}/receipt").status_code == 403
+    assert logged_in("admin").req("GET", f"/api/transactions/{tx}/receipt").status_code == 403   # no amounts for admin
+    assert logged_in("ops").req("GET", f"/api/transactions/{tx}/receipt").status_code == 200
+    assert c.req("POST", f"/api/transactions/{tx}/cancel", json={}).status_code == 409        # completed: no cancel

@@ -9,7 +9,8 @@ transfer(subject, ctx) := {
 	"subject": subject,
 	"action": "transaction.transfer",
 	"resource": {"owner": "alice", "account": "ZT1"},
-	"context": object.union({"caller": "transaction", "amount": 1000, "risk_level": "low", "device_trust": "trusted"}, ctx),
+	"context": object.union({"caller": "transaction", "amount": 1000, "risk_level": "low", "device_trust": "trusted",
+		"sender_status": "active", "receiver_status": "active", "daily_used": 0, "daily_limit": 100000}, ctx),
 }
 
 test_low_risk_own_transfer_allowed if {
@@ -165,4 +166,46 @@ test_admin_search_from_unknown_workload_denied if {
 		"action": "admin.search", "resource": {}, "context": {"caller": "transaction"},
 	}
 	"untrusted_workload" in d.reasons
+}
+
+# ------------------------------------------------- module 3: banking rules
+test_frozen_accounts_cannot_send_or_receive if {
+	"account_frozen" in authz.decision.reasons with input as transfer(customer, {"sender_status": "frozen"})
+	"payee_account_frozen" in authz.decision.reasons with input as transfer(customer, {"receiver_status": "frozen"})
+}
+
+test_missing_account_status_denies if {
+	inp := transfer(customer, {})
+	no_status := object.union(object.remove(inp, ["context"]), {"context": object.remove(inp.context, ["sender_status"])})
+	"account_frozen" in authz.decision.reasons with input as no_status
+}
+
+test_daily_limit_enforced_and_fails_closed if {
+	"daily_limit_exceeded" in authz.decision.reasons with input as transfer(customer, {"daily_used": 99500, "amount": 1000})
+	inp := transfer(customer, {})
+	no_limit := object.union(object.remove(inp, ["context"]), {"context": object.remove(inp.context, ["daily_limit"])})
+	"daily_limit_exceeded" in authz.decision.reasons with input as no_limit
+}
+
+test_high_value_needs_approval_but_is_allowed if {
+	d := authz.decision with input as transfer(customer, {"amount": 60000})
+	d.allow
+	d.needs_approval
+	not authz.decision.needs_approval with input as transfer(customer, {"amount": 49999})
+}
+
+test_operations_cannot_transfer_or_use_admin_tools if {
+	ops := {"user": "ops", "role": "operations", "mfa": true}
+	not authz.decision.allow with input as transfer(ops, {})
+	not authz.decision.allow with input as {"subject": ops, "action": "admin.dashboard", "resource": {}, "context": {"caller": "gateway"}}
+	authz.decision.allow with input as {"subject": ops, "action": "ops.approve", "resource": {}, "context": {"caller": "transaction"}}
+	not authz.decision.allow with input as {"subject": customer, "action": "ops.approve", "resource": {}, "context": {"caller": "transaction"}}
+	not authz.decision.allow with input as {"subject": {"user": "admin", "role": "admin", "mfa": true}, "action": "ops.accounts", "resource": {}, "context": {"caller": "account"}}
+}
+
+test_customer_cancels_only_own if {
+	authz.decision.allow with input as {"subject": customer, "action": "transaction.cancel",
+		"resource": {"owner": "alice"}, "context": {"caller": "transaction"}}
+	not authz.decision.allow with input as {"subject": customer, "action": "transaction.cancel",
+		"resource": {"owner": "bob"}, "context": {"caller": "transaction"}}
 }

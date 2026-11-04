@@ -8,7 +8,7 @@ belong to a separate **Operations** role (module 3).
 |---|---|---|
 | 1 | Security Overview | done |
 | 2 | Identity & Devices | done |
-| 3 | Banking & Transactions (Operations role) | planned |
+| 3 | Banking & Transactions (Operations role) | done |
 | 4 | AI Fraud Intelligence | planned |
 | 5 | Container Security | planned |
 | 6 | Threat Center | planned |
@@ -83,3 +83,36 @@ One page, four tabs: **Users**, **Devices**, **Active sessions**, **Sign-in hist
 Tests: `test_user_directory_and_single_session_revocation`,
 `test_admin_device_approval_needs_code_and_revoke_ends_device_sessions`,
 `test_role_change_needs_admin_code_and_ends_sessions`.
+
+## Module 3 - Banking & Transactions (Operations role)
+
+A new **operations** role (`ops`, mobile 9000000003) runs the banking desk. Separation of
+duties in OPA: operations cannot move its own money (no account) or use security tooling;
+admins cannot see balances, amounts or receipts; customers always initiate transfers.
+
+Page **Banking & transactions** (operations), tabs **Overview / Accounts / Transactions / Pending approvals**.
+
+| Item | How |
+|---|---|
+| 1-2. Account overview, balance monitoring | every account: balance, status, daily limit, sent today, transfers (24 h), last activity; total deposits, frozen and low-balance counts |
+| 3, 6, 7. History, search and filters, status tracking | filter by status, customer name / id, account, date range, amount range; statuses completed, blocked, extra code needed, waiting for approval, cancelled, rejected |
+| 4. Fund transfer management | customers send money (risk + policy as before); operations sees and acts on every transfer |
+| 5. Beneficiaries | customers save payees (nickname + account); saving needs a **fresh authenticator code**; pick a saved payee when sending |
+| 8, 13. Approval status, pending management | transfers of **₹50,000 or more** wait (`pending_approval`, no money moves) until an operations officer approves (money moves) or rejects - maker-checker |
+| 9. Daily limits | per account (default ₹1,00,000, counts completed + pending, Indian day); operations can change it |
+| 10. Receipts | PDF receipt (reference = SHA-256 fingerprint of the transaction); customers for their own transfers, operations and tellers for any, admins never |
+| 11. Cancellation | only while a transfer is waiting for approval; customer (own) or operations |
+| 12. High-value alerts | every ₹50,000+ transfer is an `alert` in the audit log and listed on the overview |
+| 14. Freeze / unfreeze | a frozen account can be viewed but cannot send or receive; a reason is required |
+
+**Policy-as-code.** Frozen accounts, the daily limit and the approval threshold are OPA rules
+(`account_frozen`, `payee_account_frozen`, `daily_limit_exceeded`, `needs_approval`), fed by
+the transaction service, and they **fail closed**: a missing status or limit denies. Policy tests: 27.
+
+**Demo:** sign in as `meera` (business account, ₹5,00,000) and send ₹55,000 to alice
+(`ZT1000000003`), then sign in as `ops` and approve it under *Pending approvals*.
+
+Schema: `db/migrations/003-banking-operations.sql` (applied by `./deploy.sh` / `make up`).
+Tests: `test_high_value_transfer_waits_for_operations_approval`,
+`test_frozen_account_and_daily_limit_are_enforced_by_policy`,
+`test_beneficiaries_need_a_code_and_receipts_stay_private`.

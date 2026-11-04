@@ -66,6 +66,8 @@ Open **https://localhost:8501** (import `certs/ca.crt` into your browser to remo
 | `alice` | customer | send ₹20,000 to a new payee → **step-up** code required |
 | `bob` | customer | send his whole balance → **blocked + all sessions ended** |
 | `teller` | teller | look up any account; cannot transfer |
+| `ops` | operations | banking desk: approve high-value transfers, freeze accounts, set daily limits, receipts |
+| `meera` | customer | business account (₹5,00,000): send ₹55,000 → waits for operations approval |
 | `admin` | admin | security dashboard, decisions, model card, audit-chain verification |
 
 Each code works once. Add the TOTP secret from `make users` to Google Authenticator to sign in from your phone.
@@ -120,8 +122,8 @@ through the same checks as any API call.
 ## Tests
 
 ```bash
-make opa-test     # 21 policy unit tests
-make test         # 36 end-to-end tests through the gateway (stack must be running)
+make opa-test     # 27 policy unit tests
+make test         # 39 end-to-end tests through the gateway (stack must be running)
 make scan         # Trivy; fails on CRITICAL vulnerabilities or leaked secrets
 ```
 

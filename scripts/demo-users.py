@@ -24,17 +24,18 @@ def totp(secret: str, t: float | None = None) -> str:
 
 
 # F22 demo mobile numbers (same defaults as services/auth/app.py for older seed files)
-MOBILES = {"admin": "9000000001", "teller": "9000000002", "alice": "9876500001",
-           "bob": "9876500002", "victim_demo": "9876500003"}
+MOBILES = {"admin": "9000000001", "teller": "9000000002", "ops": "9000000003", "alice": "9876500001",
+           "bob": "9876500002", "victim_demo": "9876500003", "meera": "9876500004"}
 
 users = json.load(open(os.path.join(ROOT, "secrets", "seed_users.json")))["users"]
 left = 30 - int(time.time()) % 30
-print(f"{'user':12} {'role':9} {'mobile':11} {'password':18} {'code now':9} (valid ~{left}s)  TOTP secret")
+print(f"{'user':12} {'role':10} {'mobile':11} {'password':18} {'code now':9} (valid ~{left}s)  TOTP secret")
 for u in users:
     mobile = u.get("mobile") or MOBILES.get(u["username"], "-")
-    print(f"{u['username']:12} {u['role']:9} {mobile:11} {u['password']:18} {totp(u['totp_secret']):9}"
+    print(f"{u['username']:12} {u['role']:10} {mobile:11} {u['password']:18} {totp(u['totp_secret']):9}"
           f"                {u['totp_secret']}")
 print("\nSign in with a mobile number + SMS code (simulated SMS inbox on the sign-in page),\n"
       "or with username + password + authenticator code.")
 print("Codes can be used once each. Account numbers: alice ZT1000000003, bob ZT1000000004, "
-      "victim_demo ZT1000000005")
+      "victim_demo ZT1000000005;\n"
+      "meera has a business account (opening balance 5,00,000) for high-value transfers that need approval")

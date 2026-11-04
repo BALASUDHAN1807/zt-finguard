@@ -60,6 +60,7 @@ build:
 
 up:
 	$(COMPOSE) up -d --build
+	@$(MAKE) --no-print-directory migrate
 	@echo "Dashboard: https://localhost:8501   API: https://localhost:8443"
 	@echo "Browser will warn about the private CA - import certs/ca.crt to trust it."
 
@@ -81,6 +82,10 @@ test:
 	LOGIN_RATE_LIMIT_PER_MIN=1000 $(COMPOSE) up -d --no-deps gateway
 	@until python3 -c "import ssl,urllib.request as u; u.urlopen('https://localhost:8443/healthz', context=ssl.create_default_context(cafile='certs/ca.crt'), timeout=2)" 2>/dev/null; do sleep 2; done
 	ZT_DOCKER=1 IMAGE_PREFIX=$(IMAGE_PREFIX) .venv/bin/pytest -v tests/; rc=$$?; $(COMPOSE) up -d --no-deps gateway; exit $$rc
+
+migrate:
+	@until $(COMPOSE) exec -T -u postgres postgres pg_isready -q 2>/dev/null; do sleep 2; done
+	@for f in db/migrations/*.sql; do $(COMPOSE) exec -T -u postgres postgres psql -q -v ON_ERROR_STOP=1 -d finguard < $$f && echo "migration $$f applied"; done
 
 opa-test:
 	$(ENGINE) run --rm -v $(PWD)/policies:/policies:ro docker.io/openpolicyagent/opa:1.4.2-static test /policies -v

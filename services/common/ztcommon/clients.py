@@ -27,11 +27,13 @@ async def authorize(input_doc: dict) -> dict:
         return {
             "allow": bool(result.get("allow")),
             "step_up": bool(result.get("step_up")),
+            "needs_approval": bool(result.get("needs_approval")),
             "reasons": sorted(result.get("reasons", [])),
         }
     except Exception as exc:  # noqa: BLE001 - any failure must deny
         log.error("policy engine unavailable: %s", exc)
-        return {"allow": False, "step_up": False, "reasons": ["policy engine unavailable (fail closed)"]}
+        return {"allow": False, "step_up": False, "needs_approval": False,
+                "reasons": ["policy engine unavailable (fail closed)"]}
 
 
 # ------------------------------------------------------------------- audit log

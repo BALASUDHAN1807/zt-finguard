@@ -8,6 +8,10 @@ Flow for POST /transfer
   5. medium risk  -> 403 step_up_required (client re-verifies TOTP)
      high risk    -> deny AND revoke all the user's sessions (continuous evaluation)
      allowed      -> atomic debit/credit with row locks
+     high value   -> held as pending_approval until an operations officer approves (maker-checker)
+
+Banking rules (frozen accounts, daily limit, high-value threshold) are decided by OPA from
+the context built here, so they are policy-as-code like every other rule.
 """
 from __future__ import annotations
 
@@ -70,10 +74,11 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
 
     p = await db.pool()
     async with p.connection() as conn:
-        cur = await conn.execute("SELECT account_no, owner, balance FROM accounts WHERE owner = %s", (user,))
+        cur = await conn.execute(
+            "SELECT account_no, owner, balance, status, daily_limit FROM accounts WHERE owner = %s", (user,))
         sender = await cur.fetchone()
-        cur = await conn.execute("SELECT account_no, owner, balance FROM accounts WHERE account_no = %s",
-                                 (body.to_account,))
+        cur = await conn.execute(
+            "SELECT account_no, owner, balance, status FROM accounts WHERE account_no = %s", (body.to_account,))
         receiver = await cur.fetchone()
         if sender is None:
             raise HTTPException(404, "you have no account")
@@ -92,6 +97,7 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
                      ORDER BY id DESC LIMIT 50) recent""",
             {"to": body.to_account, "frm": sender["account_no"]})
         h = await cur.fetchone()
+        daily_used = await used_today(conn, sender["account_no"])
         await conn.rollback()
 
     # ---------------------------------------------------------------- risk
@@ -125,7 +131,9 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
         "context": {"caller": "transaction", "amount": float(amount),
                     "risk_level": risk["level"], "step_up": stepped_up,
                     # set by the gateway (only caller allowed on this endpoint); absent -> denied
-                    "device_trust": x_zt_device_trust or "unknown"},
+                    "device_trust": x_zt_device_trust or "unknown",
+                    "sender_status": sender["status"], "receiver_status": receiver["status"],
+                    "daily_used": float(daily_used), "daily_limit": float(sender["daily_limit"])},
     })
     policy_ms = (time.perf_counter() - t_pol) * 1000
     timing = {"risk_ms": round(risk_ms, 1), "policy_ms": round(policy_ms, 1)}
@@ -166,28 +174,147 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
         return JSONResponse(status_code=403, headers={"X-ZT-Overhead-ms": f"{risk_ms + policy_ms:.1f}"}, content={
             "decision": "deny", "reasons": decision["reasons"], "risk": risk, "session_revoked": revoked})
 
+    # ------------------------------------------- high value: maker-checker
+    if decision.get("needs_approval"):
+        async with p.connection() as conn:
+            tx_id = await record(conn, sender["account_no"], body.to_account, amount, "pending_approval", risk, user)
+            await conn.commit()
+        clients.audit(actor=user, action="transaction.transfer", resource=sender["account_no"],
+                      decision="alert", reason="high_value_pending_approval", risk=risk["score"],
+                      details=audit_details | {"tx_id": tx_id})
+        return JSONResponse(status_code=202, headers={"X-ZT-Overhead-ms": f"{risk_ms + policy_ms:.1f}"}, content={
+            "decision": "pending_approval", "transaction_id": tx_id, "risk": risk,
+            "message": "High-value transfer: it will be completed after an operations officer approves it."})
+
     # ------------------------------------------------------------ allow
     async with p.connection() as conn:
         async with conn.transaction():
-            # lock both rows in a fixed order to avoid deadlocks
-            first, second = sorted([sender["account_no"], body.to_account])
-            await conn.execute("SELECT 1 FROM accounts WHERE account_no IN (%s,%s) ORDER BY account_no FOR UPDATE",
-                               (first, second))
-            cur = await conn.execute(
-                "UPDATE accounts SET balance = balance - %s WHERE account_no = %s AND balance >= %s RETURNING balance",
-                (amount, sender["account_no"], amount))
-            debited = await cur.fetchone()
-            if debited is None:
-                raise HTTPException(400, "insufficient funds")
-            await conn.execute("UPDATE accounts SET balance = balance + %s WHERE account_no = %s",
-                               (amount, body.to_account))
+            new_balance = await move_money(conn, sender["account_no"], body.to_account, amount)
             tx_id = await record(conn, sender["account_no"], body.to_account, amount, "completed", risk, user)
     clients.audit(actor=user, action="transaction.transfer", resource=sender["account_no"],
                   decision="allow", reason="step_up_verified" if stepped_up else "low_risk",
                   risk=risk["score"], details=audit_details | {"tx_id": tx_id})
-    return {"decision": "allow", "transaction_id": tx_id, "new_balance": float(debited["balance"]),
+    return {"decision": "allow", "transaction_id": tx_id, "new_balance": float(new_balance),
             "risk": risk, "stepped_up": stepped_up,
             "zt_overhead_ms": round((time.perf_counter() - started) * 1000, 1)}
+
+
+async def used_today(conn, account_no: str) -> Decimal:
+    """Money sent today (Indian time), including transfers still waiting for approval."""
+    cur = await conn.execute(
+        """SELECT coalesce(sum(amount), 0) AS used FROM transactions
+           WHERE from_account = %s AND status IN ('completed', 'pending_approval')
+             AND created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'""",
+        (account_no,))
+    return (await cur.fetchone())["used"]
+
+
+async def move_money(conn, sender: str, receiver: str, amount: Decimal) -> Decimal:
+    """Atomic debit/credit inside the caller's transaction (rows locked in a fixed order)."""
+    first, second = sorted([sender, receiver])
+    await conn.execute("SELECT 1 FROM accounts WHERE account_no IN (%s,%s) ORDER BY account_no FOR UPDATE",
+                       (first, second))
+    cur = await conn.execute(
+        "UPDATE accounts SET balance = balance - %s WHERE account_no = %s AND balance >= %s RETURNING balance",
+        (amount, sender, amount))
+    debited = await cur.fetchone()
+    if debited is None:
+        raise HTTPException(409, "insufficient funds")
+    await conn.execute("UPDATE accounts SET balance = balance + %s WHERE account_no = %s", (amount, receiver))
+    return debited["balance"]
+
+
+async def authorize_or_403(claims: dict, action: str, owner: str | None, resource: str) -> None:
+    d = await clients.authorize({
+        "subject": {"user": claims["usr"], "role": claims["role"], "mfa": claims.get("mfa", False)},
+        "action": action, "resource": {"owner": owner, "account": resource},
+        "context": {"caller": "transaction"},
+    })
+    if not d["allow"]:
+        clients.audit(actor=claims["usr"], action=action, resource=resource, decision="deny",
+                      reason=",".join(d["reasons"]))
+        raise HTTPException(403, {"error": "denied by policy", "reasons": d["reasons"]})
+
+
+class DecisionIn(BaseModel):
+    note: str = Field(default="", max_length=200)
+
+
+async def pending_tx(conn, tx_id: int) -> dict:
+    cur = await conn.execute(
+        """SELECT t.id, t.from_account, t.to_account, t.amount, t.status, a.owner
+           FROM transactions t JOIN accounts a ON a.account_no = t.from_account WHERE t.id = %s FOR UPDATE OF t""",
+        (tx_id,))
+    tx = await cur.fetchone()
+    if tx is None:
+        raise HTTPException(404, "transaction not found")
+    if tx["status"] != "pending_approval":
+        raise HTTPException(409, f"transaction is {tx['status']}, not waiting for approval")
+    return tx
+
+
+@app.post("/pending/{tx_id}/approve", dependencies=[Depends(mtls.require_caller("gateway"))])
+async def approve_pending(tx_id: int, body: DecisionIn, authorization: str | None = Header(None)):
+    """Checker step: an operations officer releases a held high-value transfer."""
+    claims = tokens.verify_access(tokens.bearer(authorization))
+    await authorize_or_403(claims, "ops.approve", None, str(tx_id))
+    p = await db.pool()
+    async with p.connection() as conn:
+        async with conn.transaction():
+            tx = await pending_tx(conn, tx_id)
+            cur = await conn.execute("SELECT account_no, status FROM accounts WHERE account_no IN (%s,%s)",
+                                     (tx["from_account"], tx["to_account"]))
+            if any(a["status"] != "active" for a in await cur.fetchall()):
+                raise HTTPException(409, "an account in this transfer is frozen - reject it or unfreeze first")
+            await move_money(conn, tx["from_account"], tx["to_account"], tx["amount"])
+            await conn.execute(
+                "UPDATE transactions SET status = 'completed', decided_by = %s, decided_at = now(), decision_note = %s "
+                "WHERE id = %s", (claims["usr"], body.note or "approved", tx_id))
+    clients.audit(actor=claims["usr"], action="transaction.approve", resource=tx["from_account"], decision="allow",
+                  reason="high_value_approved", details={"tx_id": tx_id, "amount": float(tx["amount"]),
+                                                         "customer": tx["owner"], "note": body.note})
+    return {"transaction_id": tx_id, "status": "completed"}
+
+
+@app.post("/pending/{tx_id}/reject", dependencies=[Depends(mtls.require_caller("gateway"))])
+async def reject_pending(tx_id: int, body: DecisionIn, authorization: str | None = Header(None)):
+    claims = tokens.verify_access(tokens.bearer(authorization))
+    await authorize_or_403(claims, "ops.approve", None, str(tx_id))
+    p = await db.pool()
+    async with p.connection() as conn:
+        async with conn.transaction():
+            tx = await pending_tx(conn, tx_id)
+            await conn.execute(
+                "UPDATE transactions SET status = 'rejected', decided_by = %s, decided_at = now(), decision_note = %s "
+                "WHERE id = %s", (claims["usr"], body.note or "rejected", tx_id))
+    clients.audit(actor=claims["usr"], action="transaction.reject", resource=tx["from_account"], decision="deny",
+                  reason="high_value_rejected", details={"tx_id": tx_id, "customer": tx["owner"], "note": body.note})
+    return {"transaction_id": tx_id, "status": "rejected"}
+
+
+@app.post("/transactions/{tx_id}/cancel", dependencies=[Depends(mtls.require_caller("gateway"))])
+async def cancel(tx_id: int, body: DecisionIn, authorization: str | None = Header(None)):
+    """Only transfers that have not moved money yet (waiting for approval) can be cancelled."""
+    claims = tokens.verify_access(tokens.bearer(authorization))
+    p = await db.pool()
+    async with p.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute(
+                """SELECT t.id, t.status, t.from_account, a.owner FROM transactions t
+                   JOIN accounts a ON a.account_no = t.from_account WHERE t.id = %s FOR UPDATE OF t""", (tx_id,))
+            tx = await cur.fetchone()
+            # policy first, so a customer cannot learn whether someone else's transaction exists
+            await authorize_or_403(claims, "transaction.cancel", tx["owner"] if tx else "__nobody__", str(tx_id))
+            if tx is None:
+                raise HTTPException(404, "transaction not found")
+            if tx["status"] != "pending_approval":
+                raise HTTPException(409, f"a {tx['status']} transfer cannot be cancelled")
+            await conn.execute(
+                "UPDATE transactions SET status = 'cancelled', decided_by = %s, decided_at = now(), decision_note = %s "
+                "WHERE id = %s", (claims["usr"], body.note or "cancelled", tx_id))
+    clients.audit(actor=claims["usr"], action="transaction.cancel", resource=tx["from_account"], decision="info",
+                  reason="cancelled", details={"tx_id": tx_id})
+    return {"transaction_id": tx_id, "status": "cancelled"}
 
 
 @app.get("/healthz")
