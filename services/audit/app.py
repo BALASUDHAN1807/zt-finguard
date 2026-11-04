@@ -147,7 +147,7 @@ async def stats(_caller: str = Depends(mtls.require_caller("gateway"))):
 
 # ------------------------------------------------ admin module 1: overview
 CRITICAL_REASONS = ("risk_too_high", "refresh_token_reuse", "chain_broken", "login_risk_high")
-HIGH_REASONS = ("account_locked", "device_revoked", "token_used_from_other_device", "new_device_needs_verification",
+HIGH_REASONS = ("revoked_by_admin", "session_revoked_by_admin", "account_locked", "device_revoked", "token_used_from_other_device", "new_device_needs_verification",
                 "untrusted_workload", "risk_engine_unavailable", "forced_by_admin", "locked_by_admin")
 FALCO_LEVELS = {"emergency": "critical", "alert": "critical", "critical": "critical",
                 "error": "high", "warning": "medium", "notice": "low", "low": "low",
@@ -254,6 +254,65 @@ async def search(q: str = Query(min_length=2, max_length=60),
             "WHERE actor ILIKE %s OR action ILIKE %s OR reason ILIKE %s OR resource ILIKE %s "
             "ORDER BY id DESC LIMIT 25", (like, like, like, like))
         return [row_out(r) for r in await cur.fetchall()]
+
+
+# ---------------------------------------------- admin module 2: sign-ins
+LOGIN_ACTIONS = ("auth.login", "auth.otp_request", "auth.refresh", "session.concurrent")
+
+
+def ip_location(ip: str | None) -> str:
+    """Where an address belongs. A GeoIP database (city/country) needs a licensed download,
+    so this classifies the network instead - which is what matters inside a container network."""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        return "unknown"
+    if a.is_loopback:
+        return "this host"
+    if a.is_private:
+        return "private / container network"
+    return "public internet"
+
+
+def suspicious(e: dict) -> list[str]:
+    d = e.get("details") or {}
+    why = []
+    if e["decision"] == "deny":
+        why.append(e.get("reason") or "denied")
+    if e["decision"] == "step_up":
+        why.append("needed extra verification")
+    why += [r.get("factor", "") for r in d.get("reasons", []) if isinstance(r, dict)]
+    if e["action"] == "session.concurrent":
+        why.append("signed in on another device at the same time")
+    if (e.get("risk") or 0) >= 0.4:
+        why.append("risk score " + f"{e['risk']:.2f}")
+    return sorted(set(w for w in why if w))
+
+
+@app.get("/logins")
+async def logins(user: str | None = Query(None, max_length=40), limit: int = Query(200, ge=1, le=1000),
+                 _caller: str = Depends(mtls.require_caller("gateway"))):
+    p = await db.pool()
+    async with p.connection() as conn:
+        sql = ("SELECT id, ts, service, actor, action, resource, decision, reason, risk, details FROM audit_log "
+               "WHERE action = ANY(%s)")
+        args: list = [list(LOGIN_ACTIONS)]
+        if user:
+            sql += " AND actor = %s"
+            args.append(user)
+        cur = await conn.execute(sql + " ORDER BY id DESC LIMIT %s", (*args, limit))
+        rows = [row_out(r) for r in await cur.fetchall()]
+        cur = await conn.execute(
+            "SELECT actor, count(*) AS n FROM audit_log WHERE action IN ('auth.login','auth.refresh') "
+            "AND decision = 'deny' AND ts > now() - interval '24 hours' GROUP BY actor ORDER BY n DESC LIMIT 20")
+        failed = await cur.fetchall()
+    for r in rows:
+        ip = (r["details"] or {}).get("ip")
+        r["ip"] = ip
+        r["location"] = ip_location(ip)
+        r["suspicious"] = suspicious(r)
+    return {"events": rows, "failed_by_user_24h": failed}
 
 
 @app.get("/verify")

@@ -316,9 +316,17 @@ async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known
     sid = uuid.uuid4().hex
     await publish_device(user["id"], dfp, device["status"])
     await r.set(f"idle:{user['id']}", user["idle_timeout_minutes"], ex=sessions.SESSION_TTL)
-    await sessions.start(r, sid)
-    _, cap, effective = await sessions.limits(r, str(user["id"]))
     access, claims = issue_access(user, dfp, sid, amr)
+    others = [x for x in await sessions.active(r, str(user["id"])) if x.get("dfp") != dfp]
+    await sessions.start(r, sid, {"sub": user["id"], "user": user["username"], "role": user["role"],
+                                  "dfp": dfp, "device": device["label"], "device_status": device["status"],
+                                  "ip": ctx.ip, "method": method, "jti": claims["jti"]})
+    if others:
+        clients.audit(actor=actor, action="session.concurrent", resource="session", decision="info",
+                      reason="concurrent_sessions",
+                      details={"other_sessions": len(others), "other_ips": sorted({o["ip"] for o in others}),
+                               "ip": ctx.ip})
+    _, cap, effective = await sessions.limits(r, str(user["id"]))
     refresh = await issue_refresh(user, dfp, family=sid)
     clients.audit(actor=actor, action="auth.login", resource="session", decision="allow",
                   reason=method, risk=risk["score"],
@@ -954,6 +962,85 @@ async def verify_current(body: DeviceActionIn, authorization: str | None = Heade
     return await my_devices(authorization)
 
 
+# --------------------------------------- admin module 2: identity & devices
+ROLES = ("customer", "teller", "admin")
+
+
+async def admin_totp(claims: dict, code: str | None) -> None:
+    """Sensitive admin actions need the administrator's own authenticator code (step-up)."""
+    me = await get_user_by_id(claims["sub"])
+    if not code or not await totp_ok(me, code):
+        raise HTTPException(401, "your authenticator code is required for this action (invalid or already used)")
+
+
+@app.get("/admin/users", dependencies=[gateway_only])
+async def admin_users(authorization: str | None = Header(None)):
+    require_admin(caller_claims(authorization))
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """SELECT u.id, u.username, u.role, u.mobile, u.failed_attempts, u.locked_until, u.last_login_ip,
+                      u.idle_timeout_minutes, u.created_at,
+                      count(d.id) FILTER (WHERE d.status = 'trusted') AS trusted,
+                      count(d.id) FILTER (WHERE d.status = 'pending') AS pending,
+                      count(d.id) FILTER (WHERE d.status = 'revoked') AS revoked,
+                      max(d.last_seen) AS last_seen
+               FROM users u LEFT JOIN known_devices d ON d.user_id = u.id
+               GROUP BY u.id ORDER BY u.role, u.username LIMIT 500""")
+        rows = await cur.fetchall()
+    live = await sessions.active(clients.redis())
+    per_user: dict[str, int] = {}
+    for x in live:
+        per_user[x["sub"]] = per_user.get(x["sub"], 0) + 1
+    now = datetime.now(timezone.utc)
+    return [{
+        "username": r["username"], "role": r["role"],
+        "mobile": mask_mobile(r["mobile"]) if r["mobile"] else None,
+        "mfa_authenticator": True,                       # every account is created with a TOTP secret
+        "mfa_sms": bool(r["mobile"]),
+        "locked": bool(r["locked_until"] and r["locked_until"] > now),
+        "failed_attempts": r["failed_attempts"], "last_login_ip": r["last_login_ip"],
+        "devices_trusted": r["trusted"], "devices_pending": r["pending"], "devices_revoked": r["revoked"],
+        "active_sessions": per_user.get(str(r["id"]), 0),
+        "idle_timeout_minutes": r["idle_timeout_minutes"],
+        "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
+        "created_at": r["created_at"].isoformat(),
+    } for r in rows]
+
+
+class RoleIn(BaseModel):
+    role: str
+    totp: str = Field(max_length=10)
+
+
+@app.put("/admin/users/{username}/role", dependencies=[gateway_only])
+async def admin_set_role(username: str, body: RoleIn, authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    user = await admin_target(username, claims)
+    if body.role not in ROLES:
+        raise HTTPException(400, f"role must be one of {', '.join(ROLES)}")
+    await admin_totp(claims, body.totp)
+    if user["role"] == body.role:
+        return {"username": username, "role": body.role, "changed": False}
+    p = await db.pool()
+    async with p.connection() as conn:
+        if user["role"] == "admin":
+            cur = await conn.execute("SELECT count(*) AS n FROM users WHERE role = 'admin'")
+            if (await cur.fetchone())["n"] <= 1:
+                raise HTTPException(400, "cannot remove the last administrator")
+        await conn.execute("UPDATE users SET role = %s WHERE id = %s", (body.role, user["id"]))
+        await conn.commit()
+    if body.role == "customer":
+        r = await mtls.client().post(mtls.url("account", "/internal/open"),
+                                     json={"user_id": user["id"], "username": user["username"]})
+        r.raise_for_status()
+    # tokens carry the role: end every session so the new role applies at the next sign-in
+    await revoke_user_sessions(str(user["id"]), "role_changed")
+    clients.audit(actor=claims["usr"], action="admin.role_change", resource=username, decision="alert",
+                  reason=f"{user['role']}->{body.role}", details={"from": user["role"], "to": body.role})
+    return {"username": username, "role": body.role, "changed": True}
+
+
 @app.get("/admin/devices", dependencies=[gateway_only])
 async def admin_devices(authorization: str | None = Header(None)):
     require_admin(caller_claims(authorization))
@@ -962,14 +1049,96 @@ async def admin_devices(authorization: str | None = Header(None)):
         cur = await conn.execute("SELECT status, count(*) AS n FROM known_devices GROUP BY status")
         counts = {r["status"]: r["n"] for r in await cur.fetchall()}
         cur = await conn.execute(
-            """SELECT u.username, d.label, d.status, d.last_ip, d.first_seen, d.last_seen
+            """SELECT d.id, u.username, d.fingerprint, d.label, d.status, d.first_ip, d.last_ip, d.first_seen,
+                      d.last_seen, d.verified_at, d.verified_by
                FROM known_devices d JOIN users u ON u.id = d.user_id
-               ORDER BY d.last_seen DESC LIMIT 50""")
+               ORDER BY d.last_seen DESC LIMIT 300""")
         rows = await cur.fetchall()
     for r in rows:
-        r["first_seen"] = r["first_seen"].isoformat()
-        r["last_seen"] = r["last_seen"].isoformat()
+        r["fingerprint"] = r["fingerprint"][:16]          # enough to tell devices apart, not the full value
+        for k in ("first_seen", "last_seen", "verified_at"):
+            r[k] = r[k].isoformat() if r[k] else None
     return {"counts": counts, "devices": rows}
+
+
+class AdminDeviceIn(BaseModel):
+    totp: str | None = Field(default=None, max_length=10)
+    reason: str = Field(default="", max_length=200)
+
+
+async def kill_session(r, sid: str) -> None:
+    await r.set(f"rtfam_revoked:{sid}", 1, ex=REFRESH_TTL)
+    await sessions.end(r, sid)
+
+
+@app.post("/admin/devices/{device_id}/{op}", dependencies=[gateway_only])
+async def admin_device_action(device_id: int, op: str, body: AdminDeviceIn, authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    require_admin(claims)
+    if op not in ("approve", "revoke"):
+        raise HTTPException(404, "unknown action")
+    if op == "approve":
+        await admin_totp(claims, body.totp)             # trusting a device is the sensitive direction
+    status = "trusted" if op == "approve" else "revoked"
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """UPDATE known_devices SET status = %s,
+                   verified_at = CASE WHEN %s = 'trusted' THEN now() ELSE verified_at END,
+                   verified_by = CASE WHEN %s = 'trusted' THEN %s ELSE verified_by END
+               WHERE id = %s RETURNING user_id, fingerprint, label""",
+            (status, status, status, f"administrator {claims['usr']}", device_id))
+        row = await cur.fetchone()
+        await conn.commit()
+    if row is None:
+        raise HTTPException(404, "device not found")
+    r = clients.redis()
+    await publish_device(row["user_id"], row["fingerprint"], status)
+    ended = 0
+    if status == "revoked":
+        for x in await sessions.active(r, str(row["user_id"])):
+            if x.get("dfp") == row["fingerprint"]:
+                await kill_session(r, x["sid"])
+                ended += 1
+    owner = await get_user_by_id(str(row["user_id"]))
+    clients.audit(actor=claims["usr"], action=f"admin.device_{op}", resource=row["label"],
+                  decision="alert" if op == "revoke" else "info",
+                  reason=("revoked_by_admin" if op == "revoke" else "approved_by_admin")
+                  + (f": {body.reason}" if body.reason else ""),
+                  details={"owner": owner["username"] if owner else None, "sessions_ended": ended})
+    return {"device_id": device_id, "status": status, "sessions_ended": ended}
+
+
+@app.get("/admin/sessions", dependencies=[gateway_only])
+async def admin_sessions(authorization: str | None = Header(None)):
+    require_admin(caller_claims(authorization))
+    live = await sessions.active(clients.redis())
+    devices_per_user: dict[str, set] = {}
+    for x in live:
+        devices_per_user.setdefault(x["sub"], set()).add(x.get("dfp"))
+    for x in live:
+        x["concurrent"] = len(devices_per_user[x["sub"]]) > 1
+        x["dfp"] = (x.get("dfp") or "")[:16]
+        x.pop("jti", None)                               # token ids stay server-side
+    return {"sessions": live, "access_token_minutes": tokens.ACCESS_TTL_SECONDS // 60,
+            "refresh_token_hours": REFRESH_TTL // 3600}
+
+
+@app.post("/admin/sessions/{sid}/revoke", dependencies=[gateway_only])
+async def admin_revoke_session(sid: str, authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    require_admin(claims)
+    r = clients.redis()
+    info = await r.hgetall(f"sessinfo:{sid}")
+    if not info:
+        raise HTTPException(404, "session not found or already ended")
+    if info.get("sub") == claims["sub"] and info.get("dfp") == claims["dfp"]:
+        raise HTTPException(400, "use Sign out to end your own current session")
+    await kill_session(r, sid)
+    clients.audit(actor=claims["usr"], action="admin.session_revoke", resource=info.get("user", "?"),
+                  decision="alert", reason="session_revoked_by_admin",
+                  details={"ip": info.get("ip"), "device": info.get("device")})
+    return {"sid": sid, "revoked": True}
 
 
 @app.get("/healthz")

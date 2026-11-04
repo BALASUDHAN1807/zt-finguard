@@ -7,7 +7,7 @@ belong to a separate **Operations** role (module 3).
 | # | Module | Status |
 |---|---|---|
 | 1 | Security Overview | done |
-| 2 | Identity & Devices | planned |
+| 2 | Identity & Devices | done |
 | 3 | Banking & Transactions (Operations role) | planned |
 | 4 | AI Fraud Intelligence | planned |
 | 5 | Container Security | planned |
@@ -59,3 +59,27 @@ belong to a separate **Operations** role (module 3).
   before they reach internal services.
 * Tests: `test_security_overview_is_admin_only_and_complete`,
   `test_global_search_hides_amounts_from_admin`, `test_admin_lock_force_logout_and_unlock`.
+
+## Module 2 - Identity & Devices
+
+One page, four tabs: **Users**, **Devices**, **Active sessions**, **Sign-in history**.
+
+| Item | How |
+|---|---|
+| 1. User directory | every user with role, status, masked mobile, MFA, devices, live sessions, failed sign-ins, last IP |
+| 2. Role management | change customer / teller / admin. Needs the **administrator's own authenticator code**; cannot change your own role or remove the last admin; the user's sessions end so the new role applies at next sign-in; a new customer gets an account opened |
+| 3-5. Devices, trust status, fingerprint | every registered device: owner, label, trusted / pending / revoked, SHA-256 fingerprint (first 16 hex), first/last IP and time, who approved it |
+| 6. Device registration | automatic at first sign-in (first device trusted, later ones pending); admin approval needs the admin's authenticator code |
+| 7. Device revocation | revoke = status revoked + every session on that device ends + the device can no longer sign in |
+| 8. Active session monitoring | live index in Redis (`sessinfo:<sid>`, `usess:<user>`): user, device, IP, method, start, idle time, idle limit |
+| 9-11. Sign-in history, IP and location, failed attempts | `auth.login` / SMS / refresh events from the audit log; location = network type of the address (a city/country GeoIP database is a licensed download, not bundled); failed sign-ins per user (24 h) |
+| 12. Suspicious sign-ins | flagged with the reason: denied, step-up, new device, new network, failed attempts, odd hour, risk >= 0.40, concurrent session |
+| 13-14. JWT sessions, token revocation | one session = one refresh-token family; revoking it kills its refresh tokens and the gateway rejects its access tokens on the next request |
+| 15. Concurrent sessions | the same user signed in on 2+ devices is flagged in the table and logged as `session.concurrent` |
+| 16. Force logout | ends every session and refresh token of a user |
+| 17. MFA enrollment | authenticator (every account) and SMS (registered mobile) |
+| 18. Lock / unlock | lock signs the user out everywhere and refuses correct credentials until unlocked |
+
+Tests: `test_user_directory_and_single_session_revocation`,
+`test_admin_device_approval_needs_code_and_revoke_ends_device_sessions`,
+`test_role_change_needs_admin_code_and_ends_sessions`.

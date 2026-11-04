@@ -467,7 +467,7 @@ def sidebar() -> str:
         pages = {
             "customer": ["My account", "Send money", "Security settings"],
             "teller": ["Account lookup", "Security settings"],
-            "admin": ["Security overview", "Access decisions", "Risk model", "Audit integrity",
+            "admin": ["Security overview", "Identity & devices", "Access decisions", "Risk model", "Audit integrity",
                       "Session & device policy", "Containers & quarantine", "Security settings"],
         }[ss.role]
         page = st.radio("Navigate", pages, label_visibility="collapsed")
@@ -1163,6 +1163,203 @@ def containers_page() -> None:
     containers_quarantine()
     quarantine_controls()
 
+# ------------------------------------------------ admin module 2: identity
+def identity_devices() -> None:
+    st.title("Identity & devices")
+    st.caption("Who can sign in, from which devices, and what is signed in right now.")
+    t = st.tabs(["Users", "Devices", "Active sessions", "Sign-in history"])
+    with t[0]:
+        identity_users()
+    with t[1]:
+        identity_device_list()
+    with t[2]:
+        identity_sessions()
+    with t[3]:
+        identity_logins()
+
+
+def ok_or_error(res, success: str) -> None:
+    if res is not None and res.status_code == 200:
+        st.success(success)
+    else:
+        d = detail(res) if res is not None else "no response"
+        st.error(d["error"] if isinstance(d, dict) and "error" in d else d)
+
+
+def identity_users() -> None:
+    r = api("GET", "/api/admin/users")
+    users = r.json() if r is not None and r.status_code == 200 else []
+    if not users:
+        st.info("No users found.")
+        return
+    df = pd.DataFrame(users)
+    k = st.columns(5)
+    k[0].metric("Users", len(df))
+    k[1].metric("Customers", int((df["role"] == "customer").sum()))
+    k[2].metric("Staff", int((df["role"] != "customer").sum()))
+    k[3].metric("Locked", int(df["locked"].sum()))
+    k[4].metric("Signed in now", int((df["active_sessions"] > 0).sum()))
+    f1, f2 = st.columns([1, 2])
+    roles = f1.multiselect("Role", sorted(df["role"].unique()), placeholder="All roles")
+    q = f2.text_input("Find user", placeholder="Username or mobile digits")
+    view = df[df["role"].isin(roles)] if roles else df
+    if q:
+        view = view[view["username"].str.contains(q, case=False) | view["mobile"].fillna("").str.contains(q)]
+    view = view.assign(
+        status=view["locked"].map({True: "Locked", False: "Active"}),
+        mfa=view.apply(lambda x: "Authenticator + SMS" if x["mfa_sms"] else "Authenticator", axis=1),
+        devices=view.apply(lambda x: f"{x['devices_trusted']} trusted, {x['devices_pending']} pending"
+                           + (f", {x['devices_revoked']} revoked" if x["devices_revoked"] else ""), axis=1),
+        last_seen=local_time(view["last_seen"], "%d %b %H:%M").fillna("never"))
+    st.dataframe(view[["username", "role", "status", "mobile", "mfa", "devices", "active_sessions",
+                       "failed_attempts", "last_login_ip", "last_seen"]],
+                 hide_index=True, use_container_width=True,
+                 column_config={"active_sessions": "sessions", "failed_attempts": "failed sign-ins",
+                                "last_login_ip": "last IP", "mfa": "MFA enrolled"})
+
+    st.subheader("Manage a user")
+    names = [u["username"] for u in users if u["username"] != S().user]
+    who = st.selectbox("User", names)
+    cur = next(u for u in users if u["username"] == who)
+    c = st.columns(3)
+    with c[0], st.form("role_form"):
+        st.markdown(f"**Role** (now: {cur['role']})")
+        role = st.selectbox("New role", ["customer", "teller", "admin"],
+                            index=["customer", "teller", "admin"].index(cur["role"])
+                            if cur["role"] in ("customer", "teller", "admin") else 0)
+        code = st.text_input("Your authenticator code", max_chars=6, key="role_code")
+        if st.form_submit_button("Change role", type="primary", use_container_width=True):
+            ok_or_error(api("PUT", f"/api/admin/users/{who}/role", json={"role": role, "totp": code.strip()}),
+                        f"{who} is now {role}. Their sessions were ended so the new role applies at next sign-in.")
+    with c[1], st.form("lock_form"):
+        st.markdown(f"**Account** ({'locked' if cur['locked'] else 'active'})")
+        reason = st.text_input("Reason", placeholder="e.g. reported stolen phone")
+        label = "Unlock account" if cur["locked"] else "Lock account"
+        if st.form_submit_button(label, type="primary", use_container_width=True):
+            ok_or_error(api("POST", f"/api/admin/users/{who}/lock",
+                            json={"locked": not cur["locked"], "reason": reason}),
+                        f"{who} {'unlocked' if cur['locked'] else 'locked and signed out everywhere'}.")
+    with c[2], st.form("logout_form"):
+        st.markdown(f"**Sessions** ({cur['active_sessions']} active)")
+        st.caption("Ends every session and refresh token of this user at once.")
+        if st.form_submit_button("Force sign-out", type="primary", use_container_width=True):
+            ok_or_error(api("POST", f"/api/admin/users/{who}/force-logout"), f"All sessions of {who} ended.")
+
+
+def identity_device_list() -> None:
+    r = api("GET", "/api/admin/devices")
+    d = r.json() if r is not None and r.status_code == 200 else {"counts": {}, "devices": []}
+    c = d["counts"]
+    k = st.columns(4)
+    k[0].metric("Devices", sum(c.values()))
+    k[1].metric("Trusted", c.get("trusted", 0))
+    k[2].metric("Waiting for approval", c.get("pending", 0))
+    k[3].metric("Revoked", c.get("revoked", 0))
+    if not d["devices"]:
+        st.info("No devices registered yet.")
+        return
+    df = pd.DataFrame(d["devices"])
+    status = st.radio("Show", ["All", "pending", "trusted", "revoked"], horizontal=True, key="dev_filter")
+    view = df if status == "All" else df[df["status"] == status]
+    view = view.assign(first_seen=local_time(view["first_seen"], "%d %b %H:%M"),
+                       last_seen=local_time(view["last_seen"], "%d %b %H:%M"))
+    st.dataframe(view[["id", "username", "label", "status", "fingerprint", "first_ip", "last_ip",
+                       "first_seen", "last_seen", "verified_by"]],
+                 hide_index=True, use_container_width=True,
+                 column_config={"label": "device", "fingerprint": "fingerprint (SHA-256, first 16)",
+                                "verified_by": "approved by"})
+    st.caption("A device is registered automatically at its first sign-in: the first device of a user is "
+               "trusted, every later one waits for approval. The fingerprint is a hash of the browser's "
+               "device id and user agent.")
+    st.subheader("Approve or revoke a device")
+    opts = {f"#{x['id']} {x['username']} - {x['label']} ({x['status']})": x for x in d["devices"]}
+    pick = st.selectbox("Device", list(opts))
+    dev = opts[pick]
+    a, b = st.columns(2)
+    with a, st.form("dev_approve"):
+        st.markdown("**Approve** (device becomes trusted, transfers allowed)")
+        code = st.text_input("Your authenticator code", max_chars=6, key="dev_code")
+        if st.form_submit_button("Approve device", type="primary", use_container_width=True,
+                                 disabled=dev["status"] == "trusted"):
+            ok_or_error(api("POST", f"/api/admin/devices/{dev['id']}/approve",
+                            json={"totp": code.strip(), "reason": "approved by administrator"}),
+                        "Device trusted.")
+    with b, st.form("dev_revoke"):
+        st.markdown("**Revoke** (signs the device out and blocks it)")
+        reason = st.text_input("Reason", placeholder="e.g. lost or stolen", key="dev_reason")
+        if st.form_submit_button("Revoke device", type="primary", use_container_width=True,
+                                 disabled=dev["status"] == "revoked"):
+            res = api("POST", f"/api/admin/devices/{dev['id']}/revoke", json={"reason": reason})
+            ok_or_error(res, f"Device revoked, {res.json().get('sessions_ended', 0) if res is not None and res.status_code == 200 else 0} session(s) ended.")
+
+
+def identity_sessions() -> None:
+    r = api("GET", "/api/admin/sessions")
+    d = r.json() if r is not None and r.status_code == 200 else {"sessions": []}
+    sess = d["sessions"]
+    k = st.columns(4)
+    k[0].metric("Active sessions", len(sess))
+    k[1].metric("Users signed in", len({x["user"] for x in sess}))
+    k[2].metric("Concurrent (2+ devices)", len({x["user"] for x in sess if x["concurrent"]}))
+    k[3].metric("Access token lifetime", f"{d.get('access_token_minutes', 15)} min",
+                help=f"Refresh tokens rotate on every use and live at most {d.get('refresh_token_hours', 8)} h")
+    if not sess:
+        st.info("Nobody is signed in.")
+        return
+    df = pd.DataFrame(sess)
+    df["started"] = pd.to_datetime(df["started_ms"].astype(int), unit="ms", utc=True).dt.tz_convert(
+        "Asia/Kolkata").dt.strftime("%d %b %H:%M")
+    df["idle"] = df["idle_seconds"].apply(lambda x: f"{x // 60} min {x % 60} s")
+    df["flag"] = df["concurrent"].map({True: "concurrent", False: ""})
+    st.dataframe(df[["user", "role", "device", "device_status", "ip", "method", "started", "idle",
+                     "timeout_minutes", "flag"]], hide_index=True, use_container_width=True,
+                 column_config={"timeout_minutes": "idle limit (min)", "device_status": "device trust",
+                                "method": "signed in with"})
+    st.caption("Each session is one refresh-token family (JWT access tokens are re-issued every 15 minutes). "
+               "Revoking a session stops its tokens immediately: the gateway checks it on every request.")
+    with st.form("sess_revoke"):
+        opts = {f"{x['user']} on {x['device']} from {x['ip']} (since {row})": x["sid"]
+                for x, row in zip(sess, df["started"])}
+        pick = st.selectbox("Session", list(opts))
+        if st.form_submit_button("Revoke this session", type="primary"):
+            ok_or_error(api("POST", f"/api/admin/sessions/{opts[pick]}/revoke"), "Session revoked.")
+
+
+def identity_logins() -> None:
+    f = st.columns([1, 1, 2])
+    user = f[0].text_input("User", placeholder="All users")
+    only = f[1].toggle("Suspicious only")
+    r = api("GET", "/api/admin/logins", params={"user": user.strip()} if user.strip() else {})
+    d = r.json() if r is not None and r.status_code == 200 else {"events": [], "failed_by_user_24h": []}
+    ev = d["events"]
+    if not ev:
+        st.info("No sign-in activity.")
+        return
+    df = pd.DataFrame(ev)
+    df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+    df["why"] = df["suspicious"].apply(lambda x: ", ".join(x))
+    df["event"] = df["action"].map({"auth.login": "sign-in", "auth.otp_request": "SMS code requested",
+                                    "auth.refresh": "token refresh", "session.concurrent": "concurrent session"})
+    k = st.columns(4)
+    k[0].metric("Sign-in attempts", int((df["action"] == "auth.login").sum()))
+    k[1].metric("Failed", int(((df["action"] == "auth.login") & (df["decision"] == "deny")).sum()))
+    k[2].metric("Suspicious", int((df["why"] != "").sum()))
+    k[3].metric("Distinct IPs", df["ip"].nunique())
+    view = df[df["why"] != ""] if only else df
+    st.dataframe(view[["time", "actor", "event", "decision", "reason", "ip", "location", "why"]],
+                 hide_index=True, use_container_width=True, height=420,
+                 column_config={"actor": "user", "decision": "result", "reason": "method / reason",
+                                "why": "suspicious because"})
+    st.caption("Location is the network type of the address. City/country needs a GeoIP database, "
+               "which is a licensed download and is not bundled.")
+    if d["failed_by_user_24h"]:
+        st.subheader("Failed sign-ins by user (24 h)")
+        fd = pd.DataFrame(d["failed_by_user_24h"]).rename(columns={"actor": "user", "n": "failed"})
+        st.altair_chart(alt.Chart(fd).mark_bar(color="#B42318", cornerRadiusEnd=2).encode(
+            x=alt.X("failed:Q", axis=alt.Axis(tickMinStep=1, format="d")), y=alt.Y("user:N", sort="-x", title=None),
+            tooltip=["user", "failed"]).properties(height=max(120, 26 * len(fd))), use_container_width=True)
+
+
 # -------------------------------------------------------------------- main
 ss = S()
 topbar(bool(ss.token))
@@ -1176,6 +1373,7 @@ else:
         "Send money": send_money,
         "Account lookup": account_lookup,
         "Security overview": security_overview,
+        "Identity & devices": identity_devices,
         "Access decisions": access_decisions,
         "Risk model": risk_model,
         "Audit integrity": audit_integrity,

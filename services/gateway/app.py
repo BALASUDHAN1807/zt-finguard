@@ -541,6 +541,57 @@ async def admin_devices(claims: dict = Depends(session)):
     return await forward("GET", "auth", "/admin/devices", claims)
 
 
+# ------------------------------------------- admin module 2: identity & devices
+class RoleBody(BaseModel):
+    role: str = Field(pattern=r"^[a-z]{3,20}$")
+    totp: str = Field(max_length=10)
+
+
+class AdminDeviceBody(BaseModel):
+    totp: str | None = Field(default=None, max_length=10)
+    reason: str = Field(default="", max_length=200)
+
+
+@app.get("/api/admin/users")
+async def admin_users(claims: dict = Depends(session)):
+    await require_admin_action("admin.user_control", claims)
+    return await forward("GET", "auth", "/admin/users", claims)
+
+
+@app.put("/api/admin/users/{username}/role")
+async def admin_set_role(body: RoleBody, username: str = Path(pattern=r"^[a-z0-9_]{3,20}$"),
+                         claims: dict = Depends(session)):
+    await require_admin_action("admin.user_control", claims)
+    return await forward("PUT", "auth", f"/admin/users/{username}/role", claims, body.model_dump())
+
+
+@app.post("/api/admin/devices/{device_id}/{op}")
+async def admin_device_action(body: AdminDeviceBody, device_id: int, op: str = Path(pattern=r"^(approve|revoke)$"),
+                              claims: dict = Depends(session)):
+    await require_admin_action("admin.devices", claims)
+    return await forward("POST", "auth", f"/admin/devices/{device_id}/{op}", claims, body.model_dump())
+
+
+@app.get("/api/admin/sessions")
+async def admin_sessions(claims: dict = Depends(session)):
+    await require_admin_action("admin.user_control", claims)
+    return await forward("GET", "auth", "/admin/sessions", claims)
+
+
+@app.post("/api/admin/sessions/{sid}/revoke")
+async def admin_revoke_session(sid: str = Path(pattern=r"^[0-9a-f]{32}$"), claims: dict = Depends(session)):
+    await require_admin_action("admin.user_control", claims)
+    return await forward("POST", "auth", f"/admin/sessions/{sid}/revoke", claims)
+
+
+@app.get("/api/admin/logins")
+async def admin_logins(user: str | None = None, limit: int = 200, claims: dict = Depends(session)):
+    await require_admin_action("admin.dashboard", claims)
+    params = {"limit": max(1, min(limit, 1000))} | ({"user": user[:40]} if user else {})
+    r = await mtls.client().get(mtls.url("audit", "/logins"), params=params)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
 class QuarantineBody(BaseModel):
     service: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,30}$")
     reason: str = Field(default="manual quarantine by administrator", max_length=200)

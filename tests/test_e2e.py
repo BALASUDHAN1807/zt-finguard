@@ -517,3 +517,76 @@ def test_admin_lock_force_logout_and_unlock():
     assert ok.status_code == 200, ok.text
     assert admin.req("POST", "/api/admin/users/admin/force-logout").status_code == 400   # not on yourself
     assert logged_in("alice").req("POST", "/api/admin/users/bob/force-logout").status_code == 403
+
+
+# ------------------------------------------- admin module 2: identity & devices
+def _password_login(c: Client, name: str, secret: str):
+    r = c.req("POST", "/api/auth/login", json={"username": name, "password": "Long-enough-pw-1",
+                                                "totp": pyotp.TOTP(secret).now()})
+    assert r.status_code == 200, r.text
+    c.token = r.json()["access_token"]
+    return r
+
+
+def test_user_directory_and_single_session_revocation():
+    name, _, secret = otp_user()
+    laptop, phone = Client(device=f"e2e-{name}-laptop"), Client(device=f"e2e-{name}-phone")
+    _password_login(laptop, name, secret)
+    time.sleep(31)
+    _password_login(phone, name, secret)
+    admin = logged_in("admin")
+    users = admin.req("GET", "/api/admin/users").json()
+    me = next(u for u in users if u["username"] == name)
+    assert me["active_sessions"] == 2 and me["mfa_authenticator"] and me["mfa_sms"]
+    assert all("totp_secret" not in u and "password_hash" not in u for u in users)
+    sess = [s for s in admin.req("GET", "/api/admin/sessions").json()["sessions"] if s["user"] == name]
+    assert len(sess) == 2 and all(s["concurrent"] for s in sess) and all("jti" not in s for s in sess)
+    newest = sess[0]                                   # sorted by last activity: the phone
+    assert admin.req("POST", f"/api/admin/sessions/{newest['sid']}/revoke").status_code == 200
+    assert phone.req("GET", "/api/accounts/me").status_code == 401     # that session is gone
+    assert laptop.req("GET", "/api/accounts/me").status_code == 200    # the other one is not
+    logins = admin.req("GET", "/api/admin/logins", params={"user": name}).json()["events"]
+    assert any("signed in on another device at the same time" in e["suspicious"] for e in logins)
+    assert all(e["location"] for e in logins)
+
+
+def test_admin_device_approval_needs_code_and_revoke_ends_device_sessions():
+    name, _, secret = otp_user()
+    first, second = Client(device=f"e2e-{name}-a"), Client(device=f"e2e-{name}-b")
+    _password_login(first, name, secret)
+    time.sleep(31)
+    _password_login(second, name, secret)
+    admin = logged_in("admin")
+    devs = [d for d in admin.req("GET", "/api/admin/devices").json()["devices"] if d["username"] == name]
+    trusted = next(d for d in devs if d["status"] == "trusted")
+    pending = next(d for d in devs if d["status"] == "pending")
+    assert len(trusted["fingerprint"]) == 16
+    assert admin.req("POST", f"/api/admin/devices/{pending['id']}/approve", json={}).status_code == 401
+    ok = admin.req("POST", f"/api/admin/devices/{pending['id']}/approve", json={"totp": fresh_code("admin")})
+    assert ok.status_code == 200, ok.text
+    rv = admin.req("POST", f"/api/admin/devices/{trusted['id']}/revoke", json={"reason": "lost laptop"})
+    assert rv.status_code == 200 and rv.json()["sessions_ended"] == 1
+    assert first.req("GET", "/api/accounts/me").status_code == 401
+    assert second.req("GET", "/api/accounts/me").status_code == 200
+    time.sleep(31)
+    again = first.req("POST", "/api/auth/login", json={"username": name, "password": "Long-enough-pw-1",
+                                                       "totp": pyotp.TOTP(secret).now()})
+    assert again.status_code == 403                                     # revoked device cannot sign in
+
+
+def test_role_change_needs_admin_code_and_ends_sessions():
+    name, _, secret = otp_user()
+    user = Client(device=f"e2e-{name}")
+    _password_login(user, name, secret)
+    admin = logged_in("admin")
+    bad = admin.req("PUT", f"/api/admin/users/{name}/role", json={"role": "teller", "totp": "000000"})
+    assert bad.status_code == 401
+    assert admin.req("PUT", f"/api/admin/users/{name}/role", json={"role": "root", "totp": "1"}).status_code == 400
+    ok = admin.req("PUT", f"/api/admin/users/{name}/role", json={"role": "teller", "totp": fresh_code("admin")})
+    assert ok.status_code == 200 and ok.json()["changed"], ok.text
+    assert user.req("GET", "/api/accounts/me").status_code == 401       # old token carried the old role
+    time.sleep(31)
+    r = _password_login(user, name, secret)
+    assert r.json()["role"] == "teller"
+    assert admin.req("PUT", "/api/admin/users/admin/role",
+                     json={"role": "customer", "totp": "000000"}).status_code == 400
