@@ -236,6 +236,7 @@ async def session(request: Request, authorization: str | None = Header(None),
             deny(request, stale_user(authorization), "expired_token_reuse")
         deny(request, "anonymous", str(exc.detail).replace(" ", "_"))
     if claims.get("dfp") != tokens.device_fingerprint(x_device_id, user_agent):
+        await ai_token_anomaly(claims["sub"])
         deny(request, claims["usr"], "token_used_from_different_device")
     r = clients.redis()
     if await r.exists(f"deny:jti:{claims['jti']}"):
@@ -293,7 +294,75 @@ async def session_watch(request: Request, r, claims: dict) -> None:
         await r.set(f"rtfam_revoked:{sid}", 1, ex=8 * 3600)
         await sessions.end(r, sid)
         await r.set(f"deny:jti:{claims['jti']}", 1, ex=tokens.ACCESS_TTL_SECONDS)
+        await ai_token_anomaly(claims["sub"])
         deny(request, claims["usr"], "token_abuse_session_revoked")
+
+
+# ----------------------------------------------- PART 5: AI risk context
+async def ai_token_anomaly(sub: str) -> None:
+    """Remember token misuse for 24 h: the account-takeover engine weighs it on the next request."""
+    try:
+        r = clients.redis()
+        await r.incr(f"ai:tokanom:{sub}")
+        await r.expire(f"ai:tokanom:{sub}", 24 * 3600)
+    except Exception:  # noqa: BLE001 - best effort; the deny itself already happened
+        pass
+
+
+async def security_ctx(request: Request, claims: dict) -> dict:
+    """Session and device signals for the adaptive risk engine (sent as X-ZT-Context)."""
+    r = clients.redis()
+    sid = claims.get("sid") or ""
+    info = await r.hgetall(f"sessinfo:{sid}") if sid else {}
+    tok = await r.get(f"ai:tokanom:{claims['sub']}")
+
+    def num(k, cast=float, default=None):
+        try:
+            return cast(info[k]) if info.get(k) not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
+    started = num("started_ms", int)
+    # the device may have been approved (or revoked) since sign-in: then the sign-in time device score
+    # and the untrusted-device part of the session risk are stale - use the current status instead
+    changed = bool(info.get("device_status")) and info.get("device_status") != claims.get("_device_trust")
+    login_risk = min(1.0, num("login_risk", float, 0.0))
+    return {"device_status": claims.get("_device_trust"),
+            "device_trust_score": None if changed else num("device_score", int),
+            "login_risk": login_risk,
+            "login_reasons": [x for x in (info.get("login_reasons") or "").split("|") if x][:5],
+            "session_risk": login_risk if changed else min(1.0, num("session_risk", float, 0.0)),
+            "ip_changed": bool(info.get("ip_changed")) or (bool(info.get("ip")) and info.get("ip") != client_ip(request)),
+            "new_network": info.get("new_network") == "1",
+            "os_changed": info.get("os_changed") == "1",
+            "device_switches_24h": num("devices_24h", int, 0),
+            "minutes_since_login": round((sessions.now_ms() - started) / 60000, 1) if started else None,
+            "token_anomalies": int(tok or 0),
+            "failed_logins_24h": num("failures_24h", int, 0)}
+
+
+SENSITIVE_ACTIONS = {"password_change", "contact_change", "mfa_reset", "beneficiary_add", "device_approve"}
+
+
+async def ai_gate(request: Request, claims: dict, action: str) -> dict:
+    """Adaptive risk recalculated for a sensitive request. Critical -> refused (fail closed)."""
+    ctx = await security_ctx(request, claims)
+    try:
+        rr = await mtls.client().post(mtls.url("risk", "/score/request"), json={"action": action, "context": ctx},
+                                      timeout=2.0)
+        rr.raise_for_status()
+        d = rr.json()
+    except Exception:  # noqa: BLE001
+        deny(request, claims["usr"], "risk_engine_unavailable", 503)
+    clients.audit(actor=claims["usr"], action="ai.risk_decision", resource=action,
+                  decision="deny" if d["severity"] == "critical" else "allow" if d["severity"] == "low" else "alert",
+                  reason=f"severity_{d['severity']}", risk=d["score"],
+                  details={"action": action, "severity": d["severity"], "recommended": d["recommended_action"],
+                           "engines": d["components"], "explanation": d["explanation"],
+                           "reasons": d["reasons"][:6]})
+    if d["severity"] == "critical":
+        raise HTTPException(403, {"error": "risk_too_high", "action": action, "explanation": d["explanation"],
+                                  "recommended_action": d["recommended_action"]})
+    return d
 
 
 async def forward(method: str, service: str, path: str, claims: dict | None = None,
@@ -438,11 +507,13 @@ class TransferBody(BaseModel):
 
 
 @app.post("/api/transfer")
-async def transfer(body: TransferBody, claims: dict = Depends(session)):
+async def transfer(body: TransferBody, request: Request, claims: dict = Depends(session)):
     # Device trust is decided here (the policy enforcement point) and passed on; the
     # transaction service only accepts this header from the gateway's mTLS identity.
+    ctx = await security_ctx(request, claims)
     return await forward("POST", "transaction", "/transfer", claims, body.model_dump(),
-                         extra_headers={"X-ZT-Device-Trust": claims["_device_trust"]})
+                         extra_headers={"X-ZT-Device-Trust": claims["_device_trust"],
+                                        "X-ZT-Context": json.dumps(ctx, separators=(",", ":"))})
 
 
 # ------------------------------------------- F19 / F21: user self-service
@@ -479,10 +550,12 @@ async def verify_current_device(body: TotpBody, claims: dict = Depends(session))
 
 
 @app.post("/api/me/devices/{device_id}/{op}")
-async def device_op(device_id: int, op: str, body: TotpBody, claims: dict = Depends(session)):
+async def device_op(device_id: int, op: str, body: TotpBody, request: Request, claims: dict = Depends(session)):
     if op not in ("approve", "revoke"):
         raise HTTPException(404, "unknown operation")
     await require_admin_action("self.manage", claims)
+    if op == "approve":                      # revoking a device is protective and is never risk-gated
+        await ai_gate(request, claims, "device_approve")
     return await forward("POST", "auth", f"/me/devices/{device_id}/{op}", claims, body.model_dump())
 
 
@@ -571,9 +644,10 @@ class CodeBody(BaseModel):
 
 
 @app.post("/api/me/{kind}/start")
-async def cp_contact_start(body: ContactBody, kind: str = Path(pattern=r"^(email|mobile)$"),
+async def cp_contact_start(body: ContactBody, request: Request, kind: str = Path(pattern=r"^(email|mobile)$"),
                            claims: dict = Depends(session)):
     await me_check(claims)
+    await ai_gate(request, claims, "contact_change")
     return await forward("POST", "auth", f"/me/{kind}/start", claims, body.model_dump())
 
 
@@ -591,8 +665,9 @@ class PasswordBody(BaseModel):
 
 
 @app.post("/api/me/password")
-async def cp_password(body: PasswordBody, claims: dict = Depends(session)):
+async def cp_password(body: PasswordBody, request: Request, claims: dict = Depends(session)):
     await me_check(claims)
+    await ai_gate(request, claims, "password_change")
     return await forward("POST", "auth", "/me/password", claims, body.model_dump())
 
 
@@ -602,8 +677,9 @@ class MfaResetBody(BaseModel):
 
 
 @app.post("/api/me/mfa/reset/start")
-async def cp_mfa_start(body: MfaResetBody, claims: dict = Depends(session)):
+async def cp_mfa_start(body: MfaResetBody, request: Request, claims: dict = Depends(session)):
     await me_check(claims)
+    await ai_gate(request, claims, "mfa_reset")
     return await forward("POST", "auth", "/me/mfa/reset/start", claims, body.model_dump())
 
 
@@ -1450,6 +1526,268 @@ async def fraud_label(body: FraudLabelBody, claims: dict = Depends(session)):
     return {"tx_id": body.tx_id, "label": body.label}
 
 
+# ======================================================= PART 5: AI security intelligence
+import assistant  # noqa: E402  (built-in, offline security assistant)
+
+
+@app.get("/api/admin/ai/intel")
+async def ai_intel(days: int = 7, subject: str | None = None, claims: dict = Depends(session)):
+    await require_admin_action("admin.fraud", claims)
+    params = {"days": max(1, min(days, 90))} | ({"subject": subject[:64]} if subject else {})
+    data = await get_json("audit", "/ai", params=params, timeout=30)
+    if data is None:
+        raise HTTPException(502, "audit service unavailable")
+    return data
+
+
+@app.get("/api/admin/ai/model")
+async def ai_model(claims: dict = Depends(session)):
+    await require_admin_action("admin.fraud", claims)
+    model = await get_json("risk", "/model")
+    if model is None:
+        raise HTTPException(502, "risk engine unavailable")
+    return model | {"monitoring": await get_json("risk", "/monitoring")}
+
+
+class ExplainBody(BaseModel):
+    amount: float = Field(gt=0, le=1e9)
+    sender_balance: float = Field(ge=0, le=1e10)
+    receiver_balance: float = Field(ge=0, le=1e10)
+    hour: int = Field(ge=0, le=23)
+    kind: str = Field(default="transfer", pattern=r"^(transfer|withdrawal)$")
+
+
+@app.post("/api/admin/ai/explain")
+async def ai_explain(body: ExplainBody, claims: dict = Depends(session)):
+    """What-if: explain the fraud model's probability for a hypothetical transfer (no money moves)."""
+    await require_admin_action("admin.fraud", claims)
+    return await forward("POST", "risk", "/explain", body=body.model_dump())
+
+
+def _rec(priority: int, kind: str, title: str, why: str, where: str, auth: bool, severity: str = "medium",
+         subject: str | None = None) -> dict:
+    return {"priority": max(0, min(100, priority)), "type": kind, "title": title, "why": why, "where": where,
+            "requires_authorization": auth, "severity": severity, "subject": subject}
+
+
+async def build_recommendations(days: int = 7) -> dict:
+    """AI security recommendations: evidence from every engine, ranked by priority (0-100)."""
+    threats, ai, quarantine, containers, model = await asyncio.gather(
+        get_json("audit", "/threats", params={"days": days}, timeout=30),
+        get_json("audit", "/ai", params={"days": days}, timeout=30),
+        get_json("responder", "/quarantine", timeout=15),
+        get_json("responder", "/containers", timeout=30),
+        get_json("risk", "/monitoring"))
+    threats, ai, quarantine, containers, model = (x or {} for x in (threats, ai, quarantine, containers, model))
+    sev_p = {"critical": 90, "high": 70, "medium": 45, "low": 20, "info": 5}
+    items: list[dict] = []
+    for inc in threats.get("incidents", []):
+        if inc["status"] == "resolved":
+            continue
+        base = sev_p.get(inc["severity"], 20) + min(9, inc.get("detections", 1))
+        subj, cat = inc.get("subject"), inc["category"]
+        if cat == "account_takeover":
+            items.append(_rec(base + 5, "session_revocation", f"Revoke every session of {subj} and restrict transfers",
+                              f"{inc['id']}: {inc['summary']}", "Identity & devices / Account protection", True,
+                              inc["severity"], subj))
+        elif cat == "jwt_theft":
+            items.append(_rec(base, "session_revocation", f"Revoke {subj}'s sessions and re-register the device",
+                              f"{inc['id']}: {inc['summary']}", "Session monitoring", True, inc["severity"], subj))
+        elif cat in CONTAINER_CATS:
+            items.append(_rec(base + 3, "container_investigation", f"Investigate container {subj}",
+                              f"{inc['id']}: {inc['summary']}", "Container security / Forensics", True,
+                              inc["severity"], subj))
+        elif cat == "suspicious_login":
+            items.append(_rec(base - 5, "additional_mfa", f"Require fresh MFA verification for {subj}",
+                              f"{inc['id']}: {inc['summary']}", "Identity & devices", True, inc["severity"], subj))
+        elif cat == "api_abuse":
+            items.append(_rec(base - 10, "policy_change", f"Review the blocked API client {subj}",
+                              f"{inc['id']}: {inc['summary']}. Consider a lower api_anomaly_threshold.",
+                              "API security / Settings", True, inc["severity"], subj))
+        elif cat == "image_tampering":
+            items.append(_rec(base + 5, "vulnerability_remediation", "Rebuild, re-sign and redeploy the images",
+                              f"{inc['id']}: {inc['summary']}", "Supply chain", True, inc["severity"], subj))
+        else:
+            items.append(_rec(base, "incident", f"Investigate {inc['id']}: {inc['title']}", inc["summary"] or "",
+                              "Incident response", False, inc["severity"], subj))
+    for p in ai.get("profiles", [])[:30]:
+        if p["takeover_max"] >= 60:
+            items.append(_rec(80, "transfer_restriction", f"Temporarily restrict transfers for {p['user']}",
+                              f"account-takeover score {p['takeover_max']}/100; {p.get('last') or ''}",
+                              "Account protection (teller / operations)", True, "high", p["user"]))
+    for d in ai.get("device_alerts", [])[:10]:
+        items.append(_rec(50, "device_reregistration", f"Ask {d['subject']} to re-register their device",
+                          f"device risk {d['engines'].get('device')}/100 on {d.get('ref')}", "Identity & devices",
+                          False, "medium", d["subject"]))
+    for d in ai.get("velocity_alerts", [])[:10]:
+        items.append(_rec(55, "transaction_verification", f"Verify the recent burst of transactions by {d['subject']}",
+                          f"velocity {d['engines'].get('velocity')}/100: {d.get('explanation') or ''}",
+                          "Transaction approvals", False, "medium", d["subject"]))
+    for d in ai.get("login_anomalies", [])[:10]:
+        if d["severity"] in ("high", "critical"):
+            items.append(_rec(60, "additional_mfa", f"Require additional MFA for {d['subject']}",
+                              d.get("explanation") or _reasons_text(d.get("reasons")), "Identity & devices", True,
+                              d["severity"], d["subject"]))
+    for svc, info in (quarantine.get("quarantined") or {}).items():
+        items.append(_rec(85, "container_investigation", f"Finish the investigation of quarantined {svc}",
+                          str((info or {}).get("reason") if isinstance(info, dict) else info),
+                          "Container security", True, "critical", svc))
+    trivy = read_report("trivy-summary.json") or {}
+    for img in trivy.get("images", []):
+        if img.get("critical") or img.get("high", 0) >= 5:
+            items.append(_rec(65 if img.get("critical") else 40, "vulnerability_remediation",
+                              f"Patch {img['image']}", f"{img.get('critical', 0)} critical / {img.get('high', 0)} high "
+                              "vulnerabilities (Trivy)", "Container security", False,
+                              "high" if img.get("critical") else "medium", img["image"]))
+    for c in containers.get("containers", []):
+        if (c.get("memory_percent") or 0) >= 85:
+            items.append(_rec(45, "container_investigation", f"{c['service']} is close to its memory limit",
+                              f"{c['memory_percent']}% of the limit", "Container security", False, "medium",
+                              c["service"]))
+    drift = (model.get("drift") or {}).get("status")
+    if drift in ("drift", "moderate_shift"):
+        items.append(_rec(35 if drift == "drift" else 20, "model_retraining", "Retrain the fraud model",
+                          f"live traffic {drift.replace('_', ' ')} vs. the training data (PSI)", "AI intelligence",
+                          False, "low"))
+    fp, flagged = (ai.get("totals") or {}).get("false_positive_reports", 0), (ai.get("totals") or {}).get("flagged", 0)
+    if fp >= 3 and flagged and fp / flagged > 0.3:
+        items.append(_rec(30, "policy_change", "Review the medium-risk threshold",
+                          f"{fp} false-positive reports for {flagged} flagged transactions", "Policy editor", True,
+                          "low"))
+    seen, ranked = set(), []
+    for it in sorted(items, key=lambda x: -x["priority"]):
+        key = (it["type"], it["subject"])
+        if key not in seen:
+            seen.add(key)
+            ranked.append(it | {"rank": len(ranked) + 1})
+    crit = sum(1 for i in ranked if i["severity"] == "critical")
+    summary = (f"{len(ranked)} recommendations ({crit} critical). " + (f"First: {ranked[0]['title']}." if ranked
+                                                                       else "Nothing needs attention right now."))
+    return {"days": days, "items": ranked[:60], "summary": summary,
+            "by_type": {t: sum(1 for i in ranked if i["type"] == t) for t in sorted({i["type"] for i in ranked})}}
+
+
+def _reasons_text(rs) -> str:
+    return "; ".join((r.get("text") if isinstance(r, dict) else str(r)) for r in (rs or [])[:3])
+
+
+@app.get("/api/admin/ai/recommendations")
+async def ai_recommendations(days: int = 7, claims: dict = Depends(session)):
+    await require_admin_action("admin.fraud", claims)
+    return await build_recommendations(max(1, min(days, 90)))
+
+
+@app.get("/api/admin/ai/predictive")
+async def ai_predictive(days: int = 14, claims: dict = Depends(session)):
+    """Predictive security: risky periods, trends with forecasts, emerging fraud patterns, users whose
+    behaviour is changing, recurring threats, service and container behaviour."""
+    await require_admin_action("admin.fraud", claims)
+    days = max(2, min(days, 90))
+    ai, threats, containers = await asyncio.gather(
+        get_json("audit", "/ai", params={"days": days}, timeout=30),
+        get_json("audit", "/threats", params={"days": days}, timeout=30),
+        get_json("responder", "/containers", timeout=30))
+    ai, threats, containers = ai or {}, threats or {}, containers or {}
+    pred = ai.get("predictive") or {}
+    by_cat: dict[str, list] = {}
+    for inc in threats.get("incidents", []):
+        by_cat.setdefault(inc["category"], []).append(inc)
+    recurring = [{"category": c, "incidents": len(v), "title": v[0]["title"],
+                  "subjects": sorted({i.get("subject") or "" for i in v})[:6]}
+                 for c, v in by_cat.items() if len(v) >= 2]
+    comm = [{"service": d["subject"], "summary": d["summary"], "severity": d["severity"]}
+            for d in threats.get("falco", []) if d["category"] == "network_connection"][:20]
+    res = []
+    for c in containers.get("containers", []):
+        warn = []
+        if (c.get("memory_percent") or 0) >= 75:
+            warn.append(f"memory at {c['memory_percent']}% of the limit - an out-of-memory restart is likely")
+        if c.get("pids") and c.get("pids_limit") and c["pids"] >= 0.75 * c["pids_limit"]:
+            warn.append(f"{c['pids']} of {c['pids_limit']} processes")
+        if c.get("restart_count"):
+            warn.append(f"restarted {c['restart_count']} time(s)")
+        if c.get("oom_killed"):
+            warn.append("was killed for using too much memory")
+        res.append({"service": c["service"], "memory_percent": c.get("memory_percent"), "cpu_percent":
+                    c.get("cpu_percent"), "pids": c.get("pids"), "restarts": c.get("restart_count"),
+                    "risk": "elevated" if warn else "normal", "warnings": warn})
+    compromise = [p for p in ai.get("profiles", []) if p["takeover_max"] >= 40 or p["logins_flagged"] >= 3][:15]
+    trend = pred.get("flagged_trend") or {}
+    report = [f"Flagged money movements are {trend.get('direction', 'n/a').replace('_', ' ')}"
+              + (f" (forecast next 3 days: {', '.join(str(x) for x in trend.get('forecast', []))})"
+                 if trend.get("forecast") else "") + "."]
+    if pred.get("risky_hours"):
+        report.append("Highest-risk hours: " + ", ".join(f"{h['hour']:02d}:00 ({round(h['flag_rate'] * 100)}% flagged)"
+                                                         for h in pred["risky_hours"][:3]) + ".")
+    if pred.get("emerging_patterns"):
+        report.append("Emerging patterns in the last 24 h: " + ", ".join(e["pattern"].replace("_", " ")
+                                                                         for e in pred["emerging_patterns"]) + ".")
+    if compromise:
+        report.append(f"{len(compromise)} account(s) show signs of possible compromise.")
+    if recurring:
+        report.append("Recurring threats: " + ", ".join(f"{r['title']} x{r['incidents']}" for r in recurring[:3]) + ".")
+    elevated = [r for r in res if r["risk"] == "elevated"]
+    if elevated:
+        report.append("Containers to watch: " + ", ".join(r["service"] for r in elevated) + ".")
+    return pred | {"days": days, "recurring_threats": recurring, "service_communication": comm,
+                   "container_resources": res, "possible_compromise": compromise, "report": report,
+                   "note": "Predictions are trend extrapolations and simple statistics over this platform's own "
+                           "history - indicators to investigate, not certainties."}
+
+
+class AssistantBody(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/admin/ai/assistant")
+async def ai_assistant(body: AssistantBody, claims: dict = Depends(session)):
+    """Built-in AI security assistant: answers from live platform data, within the caller's permissions."""
+    await require_admin_action("admin.dashboard", claims)
+    cache: dict[str, bool] = {}
+
+    async def allowed(action: str) -> bool:
+        if action not in cache:
+            d = await clients.authorize({"subject": {"user": claims["usr"], "role": claims["role"],
+                                                     "mfa": claims.get("mfa", False)},
+                                         "action": action, "resource": {}, "context": {"caller": "gateway"}})
+            cache[action] = bool(d.get("allow"))
+        return cache[action]
+
+    async def fetch(path: str, params: dict):
+        if path == "ai":
+            return await get_json("audit", "/ai", params=params, timeout=30)
+        if path == "threats":
+            return await get_json("audit", "/threats", params=params, timeout=30)
+        if path.startswith("incident:"):
+            inc = await get_json("audit", f"/threats/incidents/{path.split(':', 1)[1]}", params={"days": 90},
+                                 timeout=30)
+            return inc | {"playbook": playbook_for(inc)} if inc else None
+        if path == "quarantine":
+            return await get_json("responder", "/quarantine", timeout=15)
+        if path == "devices":
+            return await get_json("auth", "/admin/devices", claims)
+        if path == "containers":
+            return {"trivy": read_report("trivy-summary.json")}
+        if path == "model":
+            return await get_json("risk", "/model")
+        if path == "monitoring":
+            return await get_json("risk", "/monitoring")
+        if path == "explore":
+            return await get_json("audit", "/explore", params=params, timeout=30)
+        if path == "recommendations":
+            return await build_recommendations(7)
+        return None
+
+    users = [u["username"] for u in (await get_json("auth", "/admin/users", claims) or [])]
+    services = ["gateway", "auth", "account", "transaction", "risk", "audit", "responder", "dashboard", "opa",
+                "postgres", "redis"]
+    answer = await assistant.compose(body.question, fetch, allowed, users, services)
+    clients.audit(actor=claims["usr"], action="ai.assistant", resource=answer["intent"], decision="info",
+                  reason="question", details={"question": body.question[:200], "intent": answer["intent"],
+                                              "sources": answer["sources"], "denied": answer.get("denied")})
+    return answer
+
+
 # ------------------------------------------- module 3: banking & transactions
 class BeneficiaryBody(BaseModel):
     account_no: str = Field(pattern=r"^ZT\d{10}$")
@@ -1479,7 +1817,8 @@ async def beneficiaries(claims: dict = Depends(session)):
 
 
 @app.post("/api/beneficiaries")
-async def add_beneficiary(body: BeneficiaryBody, claims: dict = Depends(session)):
+async def add_beneficiary(body: BeneficiaryBody, request: Request, claims: dict = Depends(session)):
+    await ai_gate(request, claims, "beneficiary_add")
     v = await forward("POST", "auth", "/me/verify-totp", claims, {"totp": body.totp, "purpose": "add_beneficiary"})
     if v.status_code != 200:
         return v
@@ -2705,7 +3044,9 @@ async def teller_risk(days: int = 7, claims: dict = Depends(session)):
                 "reasons": [r.get("text") for r in reasons], "factors": [r.get("factor") for r in reasons],
                 "new_payee": sig.get("new_payee"), "times_usual": sig.get("times_usual"),
                 "velocity": sig.get("velocity_10m"), "hour": sig.get("hour"), "device_trust": sig.get("device_trust"),
-                "drain_ratio": sig.get("drain_ratio")}
+                "drain_ratio": sig.get("drain_ratio"),
+                "severity": sig.get("severity") or d.get("severity"), "ai_action": sig.get("action") or d.get("ai_action"),
+                "explanation": sig.get("explanation") or d.get("explanation"), "engines": sig.get("engines") or d.get("engines")}
         item["warnings"] = [w for w, on in (
             ("unusual amount", (item["times_usual"] or 0) >= 3 or "unusual_amount" in item["factors"]),
             ("unusual time", "hour" in item["factors"] or (item["hour"] is not None and item["hour"] < 6)),

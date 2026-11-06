@@ -286,6 +286,28 @@ needs_approval if {
 	input.context.amount >= high_value_threshold
 }
 
+# the adaptive AI risk engine asked for a human review (severity "high"): step-up MFA
+# first (risk level medium), then a bank officer approves before money moves
+needs_approval if {
+	is_outgoing
+	input.context.risk_action == "hold"
+}
+
+approval_reasons contains "high_value" if {
+	is_outgoing
+	input.context.amount >= high_value_threshold
+}
+
+approval_reasons contains "ai_risk_hold" if {
+	is_outgoing
+	input.context.risk_action == "hold"
+}
+
+approval_reasons contains "large_cash_deposit" if {
+	input.action == "branch.deposit"
+	input.context.amount >= 200000
+}
+
 # large cash deposits are also checked by a second person
 needs_approval if {
 	input.action == "branch.deposit"
@@ -300,6 +322,8 @@ approvals_required := 2 if {
 	input.context.amount >= dual_control_threshold
 } else := 2 if {
 	input.context.risk_level in {"medium", "high", "unknown"}
+} else := 2 if {
+	input.context.risk_action == "hold"
 } else := 1
 
 is_approval if input.action == "ops.approve"
@@ -347,6 +371,7 @@ decision := {
 	"step_up": step_up,
 	"needs_approval": needs_approval,
 	"approvals_required": approvals_required,
+	"approval_reasons": approval_reasons,
 	"reasons": reasons,
 }
 

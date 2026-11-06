@@ -15,6 +15,7 @@ the context built here, so they are policy-as-code like every other rule.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from contextlib import asynccontextmanager
@@ -116,14 +117,82 @@ async def record(conn, sender: str, receiver: str, amount: Decimal, status: str,
     tx_id = (await cur.fetchone())["id"]
     if risk:
         await conn.execute(
-            "INSERT INTO risk_scores (subject, kind, score, level, reasons) VALUES (%s,'transfer',%s,%s,%s)",
-            (username, risk["score"], risk["level"], json.dumps(risk["reasons"])))
+            """INSERT INTO risk_scores (subject, kind, score, level, reasons, severity, action, components,
+                                        explanation, model_version, ml_probability, ref)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (username, kind if kind in ("deposit", "withdrawal") else "transfer", risk["score"], risk["level"],
+             json.dumps(risk["reasons"]), risk.get("severity"), risk.get("recommended_action"),
+             json.dumps({"engines": risk.get("components"), "contributions": risk.get("contributions"),
+                         "categories": risk.get("categories"), "fraud_class": risk.get("fraud_class"),
+                         "status": status, "channel": channel})
+             if risk.get("components") else None,
+             risk.get("explanation"), risk.get("model_version"), risk.get("ml_probability"), f"tx:{tx_id}"))
     return tx_id
+
+
+async def ai_inputs(conn, account_no: str) -> tuple[list[dict], dict]:
+    """The customer's own history (behaviour engine) and recent activity counts (velocity engine)."""
+    cur = await conn.execute(
+        """SELECT amount, kind, extract(epoch FROM created_at) AS ts,
+                  extract(hour FROM created_at AT TIME ZONE 'Asia/Kolkata')::int AS hour,
+                  row_number() OVER (PARTITION BY to_account ORDER BY id) = 1 AS new_payee
+           FROM transactions WHERE from_account = %s AND status = 'completed'
+           ORDER BY id DESC LIMIT 200""", (account_no,))
+    rows = (await cur.fetchall())[:50]
+    history = [{"amount": float(r["amount"]), "hour": int(r["hour"]), "new_payee": bool(r["new_payee"]),
+                "kind": r["kind"], "ts": float(r["ts"])} for r in rows]
+    cur = await conn.execute(
+        """SELECT count(*) FILTER (WHERE created_at > now() - interval '1 minute') AS per_minute,
+                  count(*) FILTER (WHERE created_at > now() - interval '1 hour') AS per_hour,
+                  -- usual rate while active: transactions per active hour over the last 7 days
+                  (count(*) FILTER (WHERE created_at BETWEEN now() - interval '7 days' AND now() - interval '1 hour'))::float
+                      / greatest(1, count(DISTINCT date_trunc('hour', created_at)) FILTER (
+                          WHERE created_at BETWEEN now() - interval '7 days' AND now() - interval '1 hour'))
+                      AS usual_per_hour,
+                  count(*) FILTER (WHERE kind = 'withdrawal' AND created_at > now() - interval '1 hour')
+                      AS withdrawals_1h,
+                  coalesce((SELECT max(n) FROM (SELECT count(*) AS n FROM transactions
+                            WHERE from_account = %(a)s AND created_at > now() - interval '1 hour'
+                            GROUP BY to_account, amount) g), 0) AS same_amount_repeats_1h,
+                  (SELECT count(DISTINCT t.to_account) FROM transactions t
+                    WHERE t.from_account = %(a)s AND t.created_at > now() - interval '24 hours'
+                      AND NOT EXISTS (SELECT 1 FROM transactions o WHERE o.from_account = %(a)s
+                                      AND o.to_account = t.to_account AND o.status = 'completed'
+                                      AND o.created_at <= now() - interval '24 hours')) AS new_payees_24h
+           FROM transactions WHERE from_account = %(a)s AND created_at > now() - interval '30 days'""",
+        {"a": account_no})
+    v = await cur.fetchone()
+    return history, {k: (float(v[k]) if k == "usual_per_hour" else int(v[k])) for k in v}
+
+
+async def takeover_alert(user: str, risk: dict, tx_id: int, revoked: bool) -> None:
+    """Account-takeover engine fired: alert the security team and the customer (once per transaction)."""
+    ato = (risk.get("components") or {}).get("takeover") or 0
+    if ato < 60:
+        return
+    clients.audit(actor=user, action="ai.account_takeover", resource=f"tx:{tx_id}", decision="alert",
+                  reason="account_takeover_suspected", risk=risk["score"],
+                  details={"tx_id": tx_id, "takeover_score": ato, "reasons": risk.get("takeover_reasons", []),
+                           "explanation": risk.get("explanation"), "session_revoked": revoked,
+                           "recommendations": risk.get("recommendations", [])})
+    clients.notify(user, "suspicious", "Possible account takeover",
+                   "We stopped a transfer because your account is being used in an unusual way "
+                   f"({', '.join(r['text'] for r in risk.get('takeover_reasons', [])[:2])}). If this was not you, "
+                   "use 'Lock my account' and contact the bank.", "critical", {"tx_id": tx_id})
+
+
+def security_context(header: str | None) -> dict:
+    """Session / device signals the gateway attached (X-ZT-Context). Missing -> no signals."""
+    try:
+        ctx = json.loads(header) if header else {}
+        return ctx if isinstance(ctx, dict) else {}
+    except ValueError:
+        return {}
 
 
 @app.post("/transfer", dependencies=[Depends(mtls.require_caller("gateway"))])
 async def transfer(body: TransferIn, response: Response, authorization: str | None = Header(None),
-                   x_zt_device_trust: str | None = Header(None)):
+                   x_zt_device_trust: str | None = Header(None), x_zt_context: str | None = Header(None)):
     started = time.perf_counter()
     claims = tokens.verify_access(tokens.bearer(authorization))
     user, sub = claims["usr"], claims["sub"]
@@ -163,7 +232,9 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
             {"to": body.to_account, "frm": sender["account_no"]})
         h = await cur.fetchone()
         daily_used = await used_today(conn, sender["account_no"])
+        history, vel = await ai_inputs(conn, sender["account_no"])
         await conn.rollback()
+    ctx = security_context(x_zt_context) | {"device_status": x_zt_device_trust or "unknown"}
 
     # ---------------------------------------------------------------- risk
     t_risk = time.perf_counter()
@@ -177,6 +248,8 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
             "transfers_last_10m": h["last_10m"],
             "history_count": h["n_done"],
             "avg_amount": float(h["avg_amt"]),
+            "kind": "transfer", "channel": "online", "context": ctx, "velocity": vel, "history": history,
+            "profile_id": hashlib.sha256(sender["account_no"].encode()).hexdigest()[:24],
         }, timeout=2.0)   # normally ~10 ms; a hung risk engine must fail closed well within the gateway's 5 s
         rr.raise_for_status()
         risk = rr.json()
@@ -195,6 +268,7 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
         "resource": {"owner": sender["owner"], "account": sender["account_no"]},
         "context": {"caller": "transaction", "amount": float(amount),
                     "risk_level": risk["level"], "step_up": stepped_up,
+                    "risk_action": risk.get("recommended_action", "allow"),
                     # set by the gateway (only caller allowed on this endpoint); absent -> denied
                     "device_trust": x_zt_device_trust or "unknown",
                     "sender_status": sender["status"], "receiver_status": receiver["status"],
@@ -212,7 +286,10 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
                "times_usual": round(float(amount) / float(h["avg_amt"]), 2) if float(h["avg_amt"]) > 0 else None,
                "new_payee": h["to_payee"] == 0, "hour": datetime.now().hour,
                "velocity_10m": h["last_10m"], "history_count": h["n_done"],
-               "device_trust": x_zt_device_trust or "unknown"}
+               "device_trust": x_zt_device_trust or "unknown",
+               "severity": risk.get("severity"), "action": risk.get("recommended_action"),
+               "engines": risk.get("components"), "categories": risk.get("categories"),
+               "explanation": risk.get("explanation")}
     audit_details = {"to": body.to_account, "amount": float(amount), "method": body.method, "charges": float(fee),
                      "reasons": risk["reasons"],
                      "policy": decision["reasons"], "stepped_up": stepped_up, "signals": signals, **timing}
@@ -253,6 +330,7 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
         clients.audit(actor=user, action="transaction.transfer", resource=sender["account_no"],
                       decision="deny", reason=",".join(decision["reasons"]), risk=risk["score"],
                       details=audit_details | {"session_revoked": revoked, "tx_id": tx_id})
+        await takeover_alert(user, risk, tx_id, revoked)
         if not revoked:     # the high-risk path already sent a critical alert from the auth service
             clients.notify(user, "transaction_failed", "Transfer not completed",
                            f"{inr(amount)} to {body.to_account} was refused: "
@@ -266,12 +344,17 @@ async def transfer(body: TransferIn, response: Response, authorization: str | No
         async with p.connection() as conn:
             tx_id = await record(conn, sender["account_no"], body.to_account, amount, "pending_approval", risk, user, **rec)
             await conn.commit()
+        ai_hold = risk.get("recommended_action") == "hold"
         clients.audit(actor=user, action="transaction.transfer", resource=sender["account_no"],
-                      decision="alert", reason="high_value_pending_approval", risk=risk["score"],
-                      details=audit_details | {"tx_id": tx_id})
-        clients.notify(user, "high_value", "High-value transfer waiting for approval",
-                       f"{inr(amount)} to {body.to_account} will be sent after a bank officer approves it. "
-                       "You can cancel it until then.", "medium", {"tx_id": tx_id})
+                      decision="alert", reason="ai_risk_hold" if "high_value" not in (decision.get("approval_reasons") or [])
+                      else "high_value_pending_approval",
+                      risk=risk["score"], details=audit_details | {"tx_id": tx_id, "ai_hold": ai_hold})
+        await takeover_alert(user, risk, tx_id, False)
+        clients.notify(user, "high_value", "Transfer waiting for review" if ai_hold else
+                       "High-value transfer waiting for approval",
+                       f"{inr(amount)} to {body.to_account} will be sent after a bank officer "
+                       + ("reviews it (unusual activity)" if ai_hold else "approves it")
+                       + ". You can cancel it until then.", "medium", {"tx_id": tx_id})
         return JSONResponse(status_code=202, headers={"X-ZT-Overhead-ms": f"{risk_ms + policy_ms:.1f}"}, content={
             "decision": "pending_approval", "transaction_id": tx_id, "risk": risk,
             "message": "High-value transfer: it will be completed after an operations officer approves it."})
@@ -575,6 +658,7 @@ async def branch_txn(kind: str, body: BranchIn, response: Response, authorizatio
                FROM (SELECT * FROM transactions WHERE from_account = %s ORDER BY id DESC LIMIT 50) r""",
             (cust["account_no"],))
         h = await cur.fetchone()
+        history, vel = await ai_inputs(conn, cust["account_no"])
         await conn.rollback()
     level = None
     if body.verification_id:
@@ -589,7 +673,9 @@ async def branch_txn(kind: str, body: BranchIn, response: Response, authorizatio
             "amount": float(amount), "sender_balance": float(sender["balance"]),
             "receiver_balance": float(receiver["balance"]), "hour": datetime.now().hour,
             "new_payee": kind == "transfer", "transfers_last_10m": h["last_10m"],
-            "history_count": h["n_done"], "avg_amount": float(h["avg_amt"])}, timeout=2.0)
+            "history_count": h["n_done"], "avg_amount": float(h["avg_amt"]),
+            "kind": kind, "channel": "branch", "velocity": vel, "history": history,
+            "profile_id": hashlib.sha256(cust["account_no"].encode()).hexdigest()[:24]}, timeout=2.0)
         rr.raise_for_status()
         risk = rr.json()
     except Exception:  # noqa: BLE001
@@ -608,7 +694,9 @@ async def branch_txn(kind: str, body: BranchIn, response: Response, authorizatio
     rec = {"method": method, "charges": fee, "description": desc}
     details = {"customer": cust["owner"], "kind": kind, "amount": float(amount), "to": receiver["account_no"],
                "verification_id": body.verification_id, "verification": level, "reasons": risk["reasons"],
-               "policy": decision["reasons"], "method": method, "charges": float(fee)}
+               "policy": decision["reasons"], "method": method, "charges": float(fee),
+               "severity": risk.get("severity"), "ai_action": risk.get("recommended_action"),
+               "explanation": risk.get("explanation"), "engines": risk.get("components")}
 
     async def store(status: str) -> int:
         async with p.connection() as conn:

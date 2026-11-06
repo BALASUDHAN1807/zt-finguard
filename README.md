@@ -15,6 +15,7 @@ Runs unchanged on **Docker** or **rootless Podman**.
 | Verify every service | **mTLS (TLS 1.3)** on every hop with a private CA; each endpoint has an allow-list of workload identities (cert CN) |
 | Least privilege, per request | **OPA / Rego** policy evaluated on every action; separation of duties (admins can't move money) |
 | Real-time risk | Fraud model trained on **PaySim** (leak-free features) + context rules; **explainable** reasons on every score |
+| **AI security intelligence** | five fraud models compared on held-out data (XGBoost / Random Forest / HistGradientBoosting / Logistic Regression / Decision Tree, champion by PR-AUC), per-customer Isolation Forest behaviour profiles, device / login / velocity / location / account-takeover engines, an **adaptive risk engine** (allow · step-up · hold · block), exact Shapley (SHAP) explanations, decision history, drift and latency monitoring, ranked recommendations, predictive analytics and a built-in offline **AI security assistant** ([docs/ai-ml.md](docs/ai-ml.md)) |
 | Adaptive access | Medium risk ⇒ **step-up MFA** bound to that exact transfer; high risk ⇒ deny **and revoke every session** (continuous evaluation) |
 | Microsegmentation | 4 container networks (`edge`, `app`, `auth`, `db`); only the edge is reachable from the host |
 | No shared DB account, no DB passwords | One Postgres role per service, **certificate login** (`pg_hba` `cert`), column-level grants |
@@ -116,7 +117,7 @@ through the same checks as any API call.
 | teller | **Teller dashboard** · **Customer lookup** · **Identity verification** (SMS + authenticator at the counter) · **Transaction management** (deposit / withdrawal / transfer) · **Transaction approvals** (maker-checker, dual control) · **AI risk assessment** · **Transaction history** · **Branch operations** · **Teller security center** · **Customer support** · **Reports & audit history** · **Teller profile & settings** - see [docs/teller-portal.md](docs/teller-portal.md) |
 | operations | **Banking & transactions** (accounts, pending approvals, freeze, daily limits, receipts, support tickets) · **Transaction approvals** |
 | every role | **Security settings** (inactivity timeout, my devices: approve / revoke) |
-| admin | **Security overview** · **Identity & devices** · **AI fraud intelligence** · **Container security** · **Threat center** · **Incident response** · **Network visualization** · **Policy management** (restrict-only editor, simulation, versions, rollback) · **Audit & compliance** (explorer, export, compliance report) · **Access decisions** · **Session & device policy** · **Security settings** (platform settings, keys & certificates) - see [docs/admin-dashboard.md](docs/admin-dashboard.md) |
+| admin | **Security overview** · **Identity & devices** · **AI fraud intelligence** · **AI security intelligence** · **AI model monitoring** · **AI security assistant** · **Container security** · **Threat center** · **Incident response** · **Network visualization** · **Policy management** (restrict-only editor, simulation, versions, rollback) · **Audit & compliance** (explorer, export, compliance report) · **Access decisions** · **Session & device policy** · **Security settings** (platform settings, keys & certificates) - see [docs/admin-dashboard.md](docs/admin-dashboard.md) |
 
 | | |
 |---|---|
@@ -127,8 +128,8 @@ through the same checks as any API call.
 ## Tests
 
 ```bash
-make opa-test     # 40 policy unit tests
-make test         # 78 end-to-end tests (49 core + 7 customer + 5 teller + 8 hardening + 9 container tests)
+make opa-test     # 41 policy unit tests
+make test         # 86 end-to-end tests (49 core + 7 customer + 5 teller + 8 hardening + 9 container + 8 AI/ML tests)
 make sbom         # CycloneDX SBOM per image (also on every deploy)
 make guard        # supply-chain deployment gate (signatures + vulnerability policy)
 make revoke-cert CERT=<service>     make rotate-secrets SECRET=jwt|redis|metrics|signing|all
@@ -160,6 +161,9 @@ make train                                   # synthetic PaySim-shaped sample (b
 make train DATA=/path/PS_20174392719_1491204439457_log.csv   # real PaySim from Kaggle
 ```
 
+`make train` trains **five models** inside the risk image (60 / 20 / 20 stratified train / validation /
+test split), serves the one with the best validation PR-AUC and records accuracy, precision, recall, F1,
+the confusion matrix, FPR / FNR, ROC-AUC, PR-AUC, latency, dataset statistics and the evaluation history.
 Only features known **before** money moves are used (`type`, `amount`, `amount / sender balance`,
 empty sender/receiver balance, hour). `train.py` also trains a *leaky* baseline with the
 post-transaction balances to show why those columns must be excluded. Metrics are written to
@@ -178,7 +182,7 @@ db/                     schema, per-service roles, pg_hba (cert auth), TLS start
 falco/zt_rules.yaml     runtime detection rules
 scripts/                PKI, secrets, Trivy scan, demo users
 tests/test_e2e.py       end-to-end Zero Trust tests
-docs/                   evaluation, cloud deployment, features 19-21 (session-device-quarantine.md)
+docs/                   evaluation, cloud deployment, features 19-21 (session-device-quarantine.md), AI/ML (ai-ml.md)
 ```
 
 ## References

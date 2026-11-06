@@ -228,9 +228,20 @@ def test_admin_dashboard_but_no_customer_data():
 
 
 # ---------------------------------------------------- risk-based transfers
+def fresh_customer() -> str:
+    """A new customer with a clean history. The AI engines learn each customer's behaviour, so tests
+    that need 'normal' behaviour must not use a demo user the rest of the suite hammers."""
+    name = "fc_" + uuid.uuid4().hex[:8]
+    r = Client().req("POST", "/api/auth/register", json={"username": name, "password": "Long-enough-pw-1",
+                                                           "mobile": new_mobile()})
+    assert r.status_code == 200, r.text
+    USERS[name] = {"password": "Long-enough-pw-1", "totp_secret": r.json()["totp_secret"]}
+    return name
+
+
 def test_small_transfer_to_known_pattern_is_allowed():
     bob = account_of("bob")
-    c = logged_in("alice")
+    c = logged_in(fresh_customer())
     r = c.req("POST", "/api/transfer", json={"to_account": bob, "amount": 500})
     assert r.status_code == 200, r.text
     body = r.json()
@@ -248,7 +259,8 @@ def new_payee_account() -> str:
 
 def test_medium_risk_transfer_needs_step_up_bound_to_that_transfer():
     payee = new_payee_account()          # first transfer to this payee
-    c = logged_in("alice")
+    who = fresh_customer()               # clean behaviour history
+    c = logged_in(who)
     amount = 20000.0                     # large, little history
     r = c.req("POST", "/api/transfer", json={"to_account": payee, "amount": amount})
     if r.json().get("decision") == "deny" and any(x.get("factor") == "hour" for x in r.json()["risk"]["reasons"]):
@@ -256,7 +268,7 @@ def test_medium_risk_transfer_needs_step_up_bound_to_that_transfer():
         assert "risk_too_high" in r.json()["reasons"] and r.json()["session_revoked"]
         pytest.skip("night hours: the medium-risk step-up path is only reachable in the daytime")
     assert r.status_code == 403 and r.json()["decision"] == "step_up", r.text
-    s = c.req("POST", "/api/auth/step-up", json={"totp": fresh_code("alice"), "to_account": payee, "amount": amount})
+    s = c.req("POST", "/api/auth/step-up", json={"totp": fresh_code(who), "to_account": payee, "amount": amount})
     assert s.status_code == 200
     stepup = s.json()["step_up_token"]
     # the step-up token cannot be reused for a different amount
@@ -312,18 +324,19 @@ def _pending_device_id(trusted: Client, label_hint: str) -> int:
 
 def test_new_device_is_pending_and_cannot_move_money_until_approved():
     bob = account_of("bob")
-    home = logged_in("alice")                       # alice's usual (trusted) device
+    who = fresh_customer()
+    home = logged_in(who)                           # the customer's first (trusted) device
     phone = Client(device="phone-" + uuid.uuid4().hex[:8], ua="Mozilla/5.0 (Linux; Android 14) Chrome/130")
-    r = phone.login("alice")
+    r = phone.login(who)
     assert r.status_code == 200 and r.json()["device"]["status"] == "pending"
     assert phone.req("GET", "/api/accounts/me").status_code == 200          # may look ...
     t = phone.req("POST", "/api/transfer", json={"to_account": bob, "amount": 100})
     assert t.status_code == 403 and "device_not_trusted" in t.json()["reasons"]   # ... but not move money
     dev_id = _pending_device_id(home, "Android")
     # a pending device cannot approve itself
-    own = phone.req("POST", f"/api/me/devices/{dev_id}/approve", json={"totp": fresh_code("alice")})
+    own = phone.req("POST", f"/api/me/devices/{dev_id}/approve", json={"totp": fresh_code(who)})
     assert own.status_code == 403
-    ok = home.req("POST", f"/api/me/devices/{dev_id}/approve", json={"totp": fresh_code("alice")})
+    ok = home.req("POST", f"/api/me/devices/{dev_id}/approve", json={"totp": fresh_code(who)})
     assert ok.status_code == 200, ok.text
     t2 = phone.req("POST", "/api/transfer", json={"to_account": bob, "amount": 100})
     assert t2.status_code == 200 and t2.json()["decision"] == "allow", t2.text

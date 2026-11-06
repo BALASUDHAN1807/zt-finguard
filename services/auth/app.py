@@ -294,7 +294,7 @@ async def publish_device(sub, dfp: str, status: str) -> None:
 async def register_device(conn, user: dict, dfp: str, ctx) -> dict:
     """First device of a user is trusted (bootstrap); every later new device is pending."""
     cur = await conn.execute(
-        "SELECT id, status, label FROM known_devices WHERE user_id = %s AND fingerprint = %s",
+        "SELECT id, status, label, first_seen, first_ip FROM known_devices WHERE user_id = %s AND fingerprint = %s",
         (user["id"], dfp))
     row = await cur.fetchone()
     if row:
@@ -309,7 +309,7 @@ async def register_device(conn, user: dict, dfp: str, ctx) -> dict:
     cur = await conn.execute(
         """INSERT INTO known_devices (user_id, fingerprint, label, status, first_ip, last_ip, verified_at, verified_by,
                                      user_agent)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id, status, label""",
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id, status, label, first_seen, first_ip""",
         (user["id"], dfp, label, status, ctx.ip, ctx.ip,
          datetime.now(timezone.utc) if first else None, "first device" if first else None, ctx.user_agent[:400]))
     return dict(await cur.fetchone()) | {"new": True}
@@ -332,6 +332,40 @@ class LoginIn(BaseModel):
 INVALID = HTTPException(401, "invalid credentials or account locked")
 
 
+def _net(ip: str | None) -> str:
+    """Network prefix used as the 'location' of a sign-in (/24 for IPv4, /48 for IPv6)."""
+    if not ip:
+        return ""
+    return ".".join(ip.split(".")[:3]) if "." in ip else ":".join(ip.split(":")[:3])
+
+
+async def login_signals(user: dict, ctx: ClientCtx, known: bool) -> dict:
+    """Login intelligence: this customer's usual sign-in hours, frequency, networks and devices."""
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """SELECT extract(hour FROM created_at AT TIME ZONE 'Asia/Kolkata')::int AS hour,
+                      created_at > now() - interval '1 hour' AS last_hour
+               FROM risk_scores WHERE subject = %s AND kind = 'login' ORDER BY id DESC LIMIT 30""",
+            (user["username"],))
+        logins = await cur.fetchall()
+        cur = await conn.execute(
+            "SELECT status, first_ip, last_ip, user_agent, last_seen > now() - interval '24 hours' AS recent "
+            "FROM known_devices WHERE user_id = %s", (user["id"],))
+        devices = await cur.fetchall()
+    nets = {_net(d["first_ip"]) for d in devices} | {_net(d["last_ip"]) for d in devices}
+    trusted_os = {device_parts(d["user_agent"] or "")["os"] for d in devices if d["status"] == "trusted"}
+    cur_os = device_parts(ctx.user_agent)["os"]
+    return {"usual_hours": [r["hour"] for r in logins],
+            "logins_last_hour": sum(1 for r in logins if r["last_hour"]),
+            "failures_24h": int(user["failed_attempts"] or 0),
+            "os_changed": (not known) and bool(trusted_os) and cur_os != "Unknown" and cur_os not in trusted_os
+            and "Unknown" not in trusted_os,
+            "devices_24h": sum(1 for d in devices if d["recent"]) + (0 if known else 1),
+            "new_network": bool(nets - {""}) and _net(ctx.ip) not in nets,
+            "known_devices": len(devices)}
+
+
 async def assess_login(user: dict, ctx: ClientCtx, dfp: str, actor: str) -> tuple[bool, str | None, dict]:
     """Device check (F21: revoked devices cannot sign in) + login risk score (fail closed)."""
     # device trust (F21): a revoked device cannot sign in again
@@ -345,15 +379,16 @@ async def assess_login(user: dict, ctx: ClientCtx, dfp: str, actor: str) -> tupl
         clients.audit(actor=actor, action="auth.login", resource="device", decision="deny",
                       reason="device_revoked", details={"ip": ctx.ip})
         raise HTTPException(403, "this device was revoked - remove it from 'My devices' on a trusted device first")
+    signals = await login_signals(user, ctx, known)
     try:
         rr = await mtls.client().post(mtls.url("risk", "/score/login"), json={
             "new_device": not known,
             "recent_failures": user["failed_attempts"],
             "hour": datetime.now().hour,
             "ip_changed": bool(user["last_login_ip"]) and user["last_login_ip"] != ctx.ip,
-        })
+        } | signals)
         rr.raise_for_status()
-        risk = rr.json()
+        risk = rr.json() | {"_signals": signals}
     except Exception:  # noqa: BLE001
         clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
                       reason="risk_engine_unavailable")
@@ -367,9 +402,17 @@ async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known
     """Shared by password and SMS-OTP sign-in: block high risk, register the device, issue tokens."""
     p = await db.pool()
     async with p.connection() as conn:
+        signals = risk.pop("_signals", {})
         await conn.execute(
-            "INSERT INTO risk_scores (subject, kind, score, level, reasons) VALUES (%s,'login',%s,%s,%s)",
-            (actor, risk["score"], risk["level"], json.dumps(risk["reasons"])))
+            """INSERT INTO risk_scores (subject, kind, score, level, reasons, severity, action, components,
+                                        explanation, model_version, ref)
+               VALUES (%s,'login',%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (actor, risk["score"], risk["level"], json.dumps(risk["reasons"]), risk.get("severity"),
+             "block" if risk["level"] == "high" else "step_up" if risk["level"] == "medium" else "allow",
+             json.dumps({"takeover": risk.get("takeover_risk"), "signals": {k: v for k, v in signals.items()
+                                                                           if k != "usual_hours"},
+                         "method": method, "ip": ctx.ip}),
+             risk.get("explanation"), risk.get("model_version"), f"login:{method}"))
         if risk["level"] == "high":
             await conn.commit()
             clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
@@ -395,7 +438,19 @@ async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known
     await sessions.start(r, sid, {"sub": user["id"], "user": user["username"], "role": user["role"],
                                   "dfp": dfp, "device": device["label"], "device_status": device["status"],
                                   "ip": ctx.ip, "method": method, "jti": claims["jti"],
-                                  "session_risk": session_risk, "risky": int(risky)})
+                                  "session_risk": session_risk, "risky": int(risky),
+                                  # PART 5: context for the adaptive risk engine on later requests
+                                  "login_risk": risk["score"],
+                                  "login_reasons": "|".join(x["text"] for x in risk["reasons"][:5]),
+                                  "device_score": device_trust_score(
+                                      {"status": device["status"], "verified_by": None,
+                                       "first_seen": device.get("first_seen") or datetime.now(timezone.utc),
+                                       "last_seen": datetime.now(timezone.utc), "first_ip": device.get("first_ip"),
+                                       "last_ip": ctx.ip}, device_parts(ctx.user_agent))["trust_score"],
+                                  "os_changed": int(bool(signals.get("os_changed"))),
+                                  "new_network": int(bool(signals.get("new_network"))),
+                                  "devices_24h": signals.get("devices_24h", 0),
+                                  "failures_24h": signals.get("failures_24h", 0)})
     if risky:
         await r.set(f"sesscap:{sid}", await setting("risky_session_idle_minutes"), ex=sessions.SESSION_TTL)
     if others:
@@ -1211,11 +1266,13 @@ async def admin_devices(authorization: str | None = Header(None)):
         counts = {r["status"]: r["n"] for r in await cur.fetchall()}
         cur = await conn.execute(
             """SELECT d.id, u.username, d.fingerprint, d.label, d.status, d.first_ip, d.last_ip, d.first_seen,
-                      d.last_seen, d.verified_at, d.verified_by
+                      d.last_seen, d.verified_at, d.verified_by, d.user_agent
                FROM known_devices d JOIN users u ON u.id = d.user_id
                ORDER BY d.last_seen DESC LIMIT 300""")
         rows = await cur.fetchall()
     for r in rows:
+        r |= device_trust_score(r, device_parts(r.get("user_agent") or r["label"]))
+        r.pop("user_agent", None)
         r["fingerprint"] = r["fingerprint"][:16]          # enough to tell devices apart, not the full value
         for k in ("first_seen", "last_seen", "verified_at"):
             r[k] = r[k].isoformat() if r[k] else None

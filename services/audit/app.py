@@ -540,6 +540,199 @@ async def fraud(days: int = Query(7, ge=1, le=90), _caller: str = Depends(mtls.r
     }
 
 
+# ---------------------------------------------- PART 5: AI security intelligence
+def _f(v):
+    return float(v) if v is not None else None
+
+
+def _trend(values: list[float]) -> dict:
+    """Least-squares slope and a 3-step forecast (predictive analytics, no extra library)."""
+    n = len(values)
+    if n < 3:
+        return {"slope": 0.0, "forecast": [], "direction": "not_enough_data"}
+    xs = list(range(n))
+    mx, my = sum(xs) / n, sum(values) / n
+    den = sum((x - mx) ** 2 for x in xs) or 1
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, values)) / den
+    icpt = my - slope * mx
+    fc = [round(max(0.0, icpt + slope * (n + k)), 2) for k in range(3)]
+    rel = slope / max(my, 1e-9)
+    return {"slope": round(slope, 4), "forecast": fc,
+            "direction": "rising" if rel > 0.1 else "falling" if rel < -0.1 else "stable"}
+
+
+@app.get("/ai")
+async def ai_intel(days: int = Query(7, ge=1, le=90), subject: str | None = Query(None, max_length=64),
+                   _caller: str = Depends(mtls.require_caller("gateway"))):
+    """Risk decision history and the AI engines' analytics (from risk_scores + audit events)."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(IST)
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """SELECT id, subject, kind, score, level, reasons, severity, action, components, explanation,
+                      model_version, ml_probability, ref, created_at FROM risk_scores
+               WHERE created_at > now() - make_interval(days => %s) AND (%s::text IS NULL OR subject = %s)
+               ORDER BY id DESC LIMIT 20000""", (days, subject, subject))
+        rows = await cur.fetchall()
+        cur = await conn.execute(
+            """SELECT id, ts, actor, action, resource, decision, reason, risk, details FROM audit_log
+               WHERE ts > now() - make_interval(days => %s)
+                 AND action IN ('ai.account_takeover', 'ai.risk_decision', 'fraud.label', 'fraud.false_positive_report')
+               ORDER BY id DESC LIMIT 5000""", (days,))
+        events = await cur.fetchall()
+    dec = []
+    for r in rows:
+        comp = r["components"] or {}
+        sev = r["severity"] or ("critical" if float(r["score"]) >= 0.75 else "medium" if float(r["score"]) >= 0.4
+                                else "low")
+        local = r["created_at"].astimezone(tz)
+        dec.append({"id": r["id"], "subject": r["subject"], "kind": r["kind"], "score": float(r["score"]),
+                    "level": r["level"], "severity": sev, "action": r["action"],
+                    "engines": comp.get("engines") or {}, "categories": comp.get("categories") or [],
+                    "fraud_class": comp.get("fraud_class"), "status": comp.get("status"),
+                    "takeover": comp.get("takeover"), "signals": comp.get("signals"),
+                    "explanation": r["explanation"], "reasons": (r["reasons"] or [])[:6],
+                    "model_version": r["model_version"], "ml_probability": _f(r["ml_probability"]), "ref": r["ref"],
+                    "ts": chain.norm_ts(r["created_at"]), "hour": local.hour, "day": local.strftime("%Y-%m-%d")})
+    money = [d for d in dec if d["kind"] in ("transfer", "withdrawal", "deposit")]
+    logins = [d for d in dec if d["kind"] == "login"]
+
+    def count(items, key):
+        out: dict = {}
+        for d in items:
+            out[d[key]] = out.get(d[key], 0) + 1
+        return out
+    engines = ["fraud_ml", "behaviour", "velocity", "device", "login", "session", "location", "takeover"]
+    with_eng = [d for d in money if d["engines"]]
+    eng_avg = {e: round(sum((d["engines"].get(e) or 0) for d in with_eng) / len(with_eng), 1) if with_eng else 0
+               for e in engines}
+    cats: dict[str, int] = {}
+    for d in money:
+        for c in d["categories"]:
+            cats[c] = cats.get(c, 0) + 1
+
+    # user-specific risk profiles
+    prof: dict[str, dict] = {}
+    for d in dec:
+        u = prof.setdefault(d["subject"], {"user": d["subject"], "decisions": 0, "max_score": 0.0, "score_sum": 0.0,
+                                           "critical": 0, "high": 0, "logins_flagged": 0, "transfers_flagged": 0,
+                                           "behaviour_max": 0, "takeover_max": 0, "last": None, "last_ts": None})
+        u["decisions"] += 1
+        u["max_score"] = max(u["max_score"], d["score"])
+        u["score_sum"] += d["score"]
+        u["critical"] += int(d["severity"] == "critical")
+        u["high"] += int(d["severity"] == "high")
+        flagged_ = d["severity"] != "low"
+        u["logins_flagged" if d["kind"] == "login" else "transfers_flagged"] += int(flagged_)
+        u["behaviour_max"] = max(u["behaviour_max"], d["engines"].get("behaviour") or 0)
+        u["takeover_max"] = max(u["takeover_max"], d["engines"].get("takeover") or d.get("takeover") or 0)
+        if u["last"] is None and flagged_:
+            u["last"], u["last_ts"] = d["explanation"], d["ts"]
+    for u in prof.values():
+        u["avg_score"] = round(u.pop("score_sum") / u["decisions"], 3)
+        u["risk_rank"] = round(0.5 * u["max_score"] + 0.3 * u["avg_score"] + 0.05 * u["critical"]
+                               + 0.002 * u["takeover_max"] + 0.001 * u["behaviour_max"], 3)
+    profiles = sorted(prof.values(), key=lambda u: -u["risk_rank"])
+
+    # prediction distribution (persistent: every scored transfer, across restarts)
+    probs = [d["ml_probability"] for d in money if d["ml_probability"] is not None]
+    hist = [0] * 20
+    for v in probs:
+        hist[min(int(v / 0.05), 19)] += 1
+
+    # predictive security: risky hours, daily trend + forecast, emerging patterns, rising users
+    by_hour = {h: {"hour": h, "n": 0, "flagged": 0, "score_sum": 0.0} for h in range(24)}
+    for d in money + logins:
+        b = by_hour[d["hour"]]
+        b["n"] += 1
+        b["flagged"] += int(d["severity"] != "low")
+        b["score_sum"] += d["score"]
+    hours = []
+    for b in by_hour.values():
+        hours.append({"hour": b["hour"], "decisions": b["n"], "flagged": b["flagged"],
+                      "flag_rate": round(b["flagged"] / b["n"], 3) if b["n"] else 0,
+                      "avg_score": round(b["score_sum"] / b["n"], 3) if b["n"] else 0})
+    risky_hours = sorted((h for h in hours if h["decisions"] >= 3), key=lambda h: (-h["flag_rate"], -h["avg_score"]))[:5]
+    from datetime import timedelta
+    today = datetime.now(tz).date()
+    day_keys = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days - 1, -1, -1)]
+    daily = {k: {"day": k, "decisions": 0, "flagged": 0, "critical": 0, "logins_flagged": 0} for k in day_keys}
+    for d in dec:
+        if d["day"] in daily:
+            x = daily[d["day"]]
+            x["decisions"] += 1
+            x["flagged"] += int(d["severity"] != "low" and d["kind"] != "login")
+            x["logins_flagged"] += int(d["severity"] != "low" and d["kind"] == "login")
+            x["critical"] += int(d["severity"] == "critical")
+    daily_l = list(daily.values())
+    recent_cut = datetime.now(timezone.utc).timestamp() - 86400
+    recent = [d for d in money if datetime.fromisoformat(d["ts"]).timestamp() >= recent_cut]
+    older = [d for d in money if datetime.fromisoformat(d["ts"]).timestamp() < recent_cut]
+    emerging = []
+    for c in sorted(cats):
+        r_n = sum(1 for d in recent if c in d["categories"])
+        o_n = sum(1 for d in older if c in d["categories"])
+        o_rate = o_n / max(len(older), 1)
+        r_rate = r_n / max(len(recent), 1)
+        if r_n >= 2 and r_rate > 1.5 * o_rate:
+            emerging.append({"pattern": c, "last_24h": r_n, "share_last_24h": round(r_rate, 3),
+                             "share_before": round(o_rate, 3)})
+    rising = []
+    for u, items in {d["subject"]: [x for x in dec if x["subject"] == d["subject"]] for d in recent}.items():
+        now_avg = sum(x["score"] for x in items if datetime.fromisoformat(x["ts"]).timestamp() >= recent_cut) / max(
+            1, sum(1 for x in items if datetime.fromisoformat(x["ts"]).timestamp() >= recent_cut))
+        before = [x["score"] for x in items if datetime.fromisoformat(x["ts"]).timestamp() < recent_cut]
+        if before and now_avg > max(0.25, 2 * (sum(before) / len(before))):
+            rising.append({"user": u, "avg_score_last_24h": round(now_avg, 3),
+                           "avg_score_before": round(sum(before) / len(before), 3)})
+    ato = []
+    for e in events:
+        if e["action"] == "ai.account_takeover":
+            d = e["details"] or {}
+            ato.append({"ts": chain.norm_ts(e["ts"]), "user": e["actor"], "score": d.get("takeover_score"),
+                        "reasons": d.get("reasons") or [], "explanation": d.get("explanation"),
+                        "session_revoked": d.get("session_revoked"), "tx_id": d.get("tx_id"),
+                        "recommendations": d.get("recommendations") or []})
+    gate = [{"ts": chain.norm_ts(e["ts"]), "user": e["actor"], "action": e["resource"], "decision": e["decision"],
+             "severity": (e["details"] or {}).get("severity"), "explanation": (e["details"] or {}).get("explanation"),
+             "engines": (e["details"] or {}).get("engines")} for e in events if e["action"] == "ai.risk_decision"]
+    labels = {}
+    for e in events:
+        if e["action"] == "fraud.label":
+            tx = (e["details"] or {}).get("tx_id")
+            if tx is not None and tx not in labels:
+                labels[tx] = (e["details"] or {}).get("label")
+    fp_reports = sum(1 for e in events if e["action"] == "fraud.false_positive_report")
+
+    def alerts(engine_name, threshold):
+        return [d for d in money if (d["engines"].get(engine_name) or 0) >= threshold][:40]
+    return {
+        "days": days,
+        "totals": {"decisions": len(dec), "money": len(money), "logins": len(logins), "requests": len(gate),
+                   "flagged": sum(1 for d in money if d["severity"] != "low"),
+                   "critical": sum(1 for d in dec if d["severity"] == "critical"),
+                   "takeover_alerts": len(ato), "false_positive_reports": fp_reports},
+        "by_severity": count(dec, "severity"), "by_action": count([d for d in dec if d["action"]], "action"),
+        "by_kind": count(dec, "kind"),
+        "fraud_classes": count([d for d in money if d["fraud_class"]], "fraud_class"),
+        "engine_average": eng_avg, "categories": cats,
+        "decisions": dec[:300],
+        "login_anomalies": [d for d in logins if d["severity"] != "low"][:60],
+        "behaviour_alerts": alerts("behaviour", 50), "velocity_alerts": alerts("velocity", 30),
+        "device_alerts": alerts("device", 40), "location_alerts": alerts("location", 50),
+        "takeover": ato[:50], "request_decisions": gate[:100],
+        "profiles": profiles[:50],
+        "prediction_distribution": {"bins": SCORE_BINS, "counts": hist, "n": len(probs)},
+        "labels": {"fraud": sum(1 for v in labels.values() if v == "fraud"),
+                   "legit": sum(1 for v in labels.values() if v == "legit")},
+        "predictive": {"hours": hours, "risky_hours": risky_hours, "daily": daily_l,
+                       "flagged_trend": _trend([float(d["flagged"]) for d in daily_l]),
+                       "login_trend": _trend([float(d["logins_flagged"]) for d in daily_l]),
+                       "emerging_patterns": emerging, "rising_users": rising[:20]},
+    }
+
+
 # ---------------------------------------------- admin module 5: container history
 @app.get("/container-history")
 async def container_history(service: str | None = Query(None, max_length=40), limit: int = Query(200, ge=1, le=1000),
@@ -787,6 +980,13 @@ def detect(e: dict) -> dict | None:
             or d.get("category") == "fraud" else "high"
         return {"category": "customer_report", "subject": e["actor"], "severity": sev,
                 "summary": (d.get("subject") or reason.replace("_", " "))[:200], "source": "customer"}
+    if e["action"] == "ai.account_takeover":
+        return {"category": "account_takeover", "subject": e["actor"], "severity": "critical",
+                "summary": f"AI account-takeover score {d.get('takeover_score')}/100: "
+                           + ", ".join(r.get("text", "") for r in (d.get("reasons") or [])[:3]), "source": "risk"}
+    if e["action"] == "ai.risk_decision" and e["decision"] == "deny":
+        return {"category": "suspicious_login", "subject": e["actor"], "severity": "high",
+                "summary": f"sensitive request ({e['resource']}) refused by the adaptive risk engine", "source": "risk"}
     if e["action"] == "transaction.transfer" and e["decision"] == "deny" and "risk_too_high" in reason:
         return {"category": "account_takeover", "subject": e["actor"], "severity": "critical",
                 "summary": "high-risk transfer blocked, sessions ended", "source": "transaction"}
@@ -800,7 +1000,8 @@ async def threat_events(days: int) -> list[dict]:
             """SELECT id, ts, service, actor, action, resource, decision, reason, risk, details FROM audit_log
                WHERE ts > now() - make_interval(days => %s)
                  AND (service = 'falco' OR action LIKE 'runtime.%%' OR action LIKE 'incident.%%' OR action = ANY(%s)
-                      OR action IN ('session.ip_changed', 'api.anomaly', 'audit.integrity_failure')
+                      OR action IN ('session.ip_changed', 'api.anomaly', 'audit.integrity_failure', 'ai.account_takeover')
+                      OR (action = 'ai.risk_decision' AND decision = 'deny')
                       OR (decision = 'deny' AND action IN ('gateway.verify', 'auth.refresh', 'auth.login',
                                                            'transaction.transfer')))
                ORDER BY id ASC LIMIT 100000""",

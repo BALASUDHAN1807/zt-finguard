@@ -1,7 +1,17 @@
 {
-  "trained_at": "2026-10-26T09:32:05+00:00",
+  "trained_at": "2026-11-06T16:16:09+00:00",
+  "version": "xgb-2026-11-06T16:16:09+00:00",
+  "champion": "xgb",
+  "champion_name": "XGBoost",
+  "selection": "highest PR-AUC on the validation split (within 0.002 = tie, the faster model wins); numbers below are from the separate test split",
   "dataset": "paysim_sample.csv",
   "synthetic": true,
+  "split": {
+    "train": 77974,
+    "validation": 25992,
+    "test": 25992,
+    "stratified": true
+  },
   "rows_transfer_cashout": 129958,
   "fraud_rate": 0.00923,
   "features": [
@@ -13,23 +23,301 @@
     "hour"
   ],
   "test": {
-    "pr_auc": 0.9156,
-    "roc_auc": 0.9954,
+    "threshold": 0.5,
+    "accuracy": 0.9977,
+    "precision": 0.8543,
+    "recall": 0.9042,
+    "f1": 0.8785,
+    "roc_auc": 0.9913,
+    "pr_auc": 0.9452,
+    "false_positive_rate": 0.00144,
+    "false_negative_rate": 0.09583,
+    "confusion_matrix": {
+      "tn": 25715,
+      "fp": 37,
+      "fn": 23,
+      "tp": 217
+    },
     "at_medium": {
       "threshold": 0.4,
-      "precision": 0.584,
-      "recall": 0.95,
-      "flagged_share": 0.01502
+      "precision": 0.8321,
+      "recall": 0.9083,
+      "flagged_share": 0.01008
     },
     "at_high": {
       "threshold": 0.75,
-      "precision": 0.6955,
-      "recall": 0.9367,
-      "flagged_share": 0.01243
+      "precision": 0.9114,
+      "recall": 0.9,
+      "flagged_share": 0.00912
     }
   },
+  "latency": {
+    "p50_single_ms": 0.345,
+    "p95_single_ms": 0.54,
+    "per_row_batch_ms": 0.00521
+  },
+  "candidates": [
+    {
+      "key": "rf",
+      "name": "Random Forest",
+      "train_seconds": 5.47,
+      "validation_pr_auc": 0.9594,
+      "test": {
+        "threshold": 0.5,
+        "accuracy": 0.9983,
+        "precision": 0.9149,
+        "recall": 0.8958,
+        "f1": 0.9053,
+        "roc_auc": 0.9891,
+        "pr_auc": 0.9393,
+        "false_positive_rate": 0.00078,
+        "false_negative_rate": 0.10417,
+        "confusion_matrix": {
+          "tn": 25732,
+          "fp": 20,
+          "fn": 25,
+          "tp": 215
+        },
+        "at_medium": {
+          "threshold": 0.4,
+          "precision": 0.8696,
+          "recall": 0.9167,
+          "flagged_share": 0.00973
+        },
+        "at_high": {
+          "threshold": 0.75,
+          "precision": 0.9764,
+          "recall": 0.8625,
+          "flagged_share": 0.00816
+        }
+      },
+      "latency": {
+        "p50_single_ms": 5.114,
+        "p95_single_ms": 8.594,
+        "per_row_batch_ms": 0.00917
+      }
+    },
+    {
+      "key": "xgb",
+      "name": "XGBoost",
+      "train_seconds": 0.68,
+      "validation_pr_auc": 0.9593,
+      "test": {
+        "threshold": 0.5,
+        "accuracy": 0.9977,
+        "precision": 0.8543,
+        "recall": 0.9042,
+        "f1": 0.8785,
+        "roc_auc": 0.9913,
+        "pr_auc": 0.9452,
+        "false_positive_rate": 0.00144,
+        "false_negative_rate": 0.09583,
+        "confusion_matrix": {
+          "tn": 25715,
+          "fp": 37,
+          "fn": 23,
+          "tp": 217
+        },
+        "at_medium": {
+          "threshold": 0.4,
+          "precision": 0.8321,
+          "recall": 0.9083,
+          "flagged_share": 0.01008
+        },
+        "at_high": {
+          "threshold": 0.75,
+          "precision": 0.9114,
+          "recall": 0.9,
+          "flagged_share": 0.00912
+        }
+      },
+      "latency": {
+        "p50_single_ms": 0.345,
+        "p95_single_ms": 0.54,
+        "per_row_batch_ms": 0.00521
+      }
+    },
+    {
+      "key": "dt",
+      "name": "Decision Tree",
+      "train_seconds": 0.1,
+      "validation_pr_auc": 0.9426,
+      "test": {
+        "threshold": 0.5,
+        "accuracy": 0.9861,
+        "precision": 0.3934,
+        "recall": 0.9375,
+        "f1": 0.5542,
+        "roc_auc": 0.9681,
+        "pr_auc": 0.9192,
+        "false_positive_rate": 0.01347,
+        "false_negative_rate": 0.0625,
+        "confusion_matrix": {
+          "tn": 25405,
+          "fp": 347,
+          "fn": 15,
+          "tp": 225
+        },
+        "at_medium": {
+          "threshold": 0.4,
+          "precision": 0.3934,
+          "recall": 0.9375,
+          "flagged_share": 0.02201
+        },
+        "at_high": {
+          "threshold": 0.75,
+          "precision": 0.5979,
+          "recall": 0.9292,
+          "flagged_share": 0.01435
+        }
+      },
+      "latency": {
+        "p50_single_ms": 0.064,
+        "p95_single_ms": 0.097,
+        "per_row_batch_ms": 7e-05
+      }
+    },
+    {
+      "key": "hgb",
+      "name": "HistGradientBoosting",
+      "train_seconds": 0.33,
+      "validation_pr_auc": 0.9326,
+      "test": {
+        "threshold": 0.5,
+        "accuracy": 0.995,
+        "precision": 0.6637,
+        "recall": 0.9292,
+        "f1": 0.7743,
+        "roc_auc": 0.9824,
+        "pr_auc": 0.9084,
+        "false_positive_rate": 0.00439,
+        "false_negative_rate": 0.07083,
+        "confusion_matrix": {
+          "tn": 25639,
+          "fp": 113,
+          "fn": 17,
+          "tp": 223
+        },
+        "at_medium": {
+          "threshold": 0.4,
+          "precision": 0.6331,
+          "recall": 0.9417,
+          "flagged_share": 0.01373
+        },
+        "at_high": {
+          "threshold": 0.75,
+          "precision": 0.7458,
+          "recall": 0.9167,
+          "flagged_share": 0.01135
+        }
+      },
+      "latency": {
+        "p50_single_ms": 0.458,
+        "p95_single_ms": 0.627,
+        "per_row_batch_ms": 0.00148
+      }
+    },
+    {
+      "key": "lr",
+      "name": "Logistic Regression",
+      "train_seconds": 0.18,
+      "validation_pr_auc": 0.8547,
+      "test": {
+        "threshold": 0.5,
+        "accuracy": 0.9806,
+        "precision": 0.3166,
+        "recall": 0.9458,
+        "f1": 0.4744,
+        "roc_auc": 0.9958,
+        "pr_auc": 0.8562,
+        "false_positive_rate": 0.01903,
+        "false_negative_rate": 0.05417,
+        "confusion_matrix": {
+          "tn": 25262,
+          "fp": 490,
+          "fn": 13,
+          "tp": 227
+        },
+        "at_medium": {
+          "threshold": 0.4,
+          "precision": 0.2847,
+          "recall": 0.9583,
+          "flagged_share": 0.03109
+        },
+        "at_high": {
+          "threshold": 0.75,
+          "precision": 0.3801,
+          "recall": 0.9375,
+          "flagged_share": 0.02278
+        }
+      },
+      "latency": {
+        "p50_single_ms": 0.216,
+        "p95_single_ms": 0.291,
+        "per_row_batch_ms": 0.00024
+      }
+    }
+  ],
+  "dataset_stats": {
+    "rows_transfer_cashout": 129958,
+    "fraud_rows": 1200,
+    "fraud_rate": 0.00923,
+    "type_mix": {
+      "CASH_OUT": 105248,
+      "TRANSFER": 24710
+    },
+    "fraud_by_type": {
+      "TRANSFER": 606,
+      "CASH_OUT": 594
+    },
+    "amount_quantiles": {
+      "legit": [
+        5957.72,
+        46073.58,
+        212288.04
+      ],
+      "fraud": [
+        67701.8,
+        369854.91,
+        1454452.21
+      ],
+      "q": [
+        0.5,
+        0.9,
+        0.99
+      ]
+    },
+    "fraud_rate_by_hour": [
+      0.38684,
+      0.37067,
+      0.20364,
+      0.12854,
+      0.10218,
+      0.07589,
+      0.00737,
+      0.00422,
+      0.00427,
+      0.00329,
+      0.0021,
+      0.00291,
+      0.00188,
+      0.00214,
+      0.00167,
+      0.00129,
+      0.00213,
+      0.00285,
+      0.00306,
+      0.00477,
+      0.00598,
+      0.00904,
+      0.01191,
+      0.00845
+    ],
+    "fraud_full_drain_share": 0.7942
+  },
   "leaky_baseline_with_post_balances": {
-    "pr_auc": 0.9623,
+    "pr_auc": 0.9521,
     "note": "uses newbalanceOrig/newbalanceDest, unavailable at decision time"
-  }
+  },
+  "caveat": "PaySim is synthetic. These are held-out results on simulated data, not proof of real-world banking fraud detection performance."
 }

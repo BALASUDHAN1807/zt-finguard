@@ -352,3 +352,17 @@ test_dual_control_and_maker_checker if {
 	ops := {"user": "ops", "role": "operations", "mfa": true}
 	authz.decision.allow with input as approval(ops, {"prior_approvers": ["teller"]})
 }
+
+# PART 5: the adaptive AI engine's "hold" = step-up MFA first, then a bank officer's review
+test_ai_hold_needs_step_up_then_review if {
+	first := authz.decision with input as transfer(customer, {"risk_level": "medium", "risk_action": "hold"})
+	first.step_up
+	not first.allow
+	after := authz.decision with input as transfer(customer, {"risk_level": "medium", "risk_action": "hold", "step_up": true})
+	after.allow
+	after.needs_approval
+	"ai_risk_hold" in after.approval_reasons
+	not "high_value" in after.approval_reasons
+	plain := authz.decision with input as transfer(customer, {"risk_level": "medium", "step_up": true})
+	not plain.needs_approval
+}

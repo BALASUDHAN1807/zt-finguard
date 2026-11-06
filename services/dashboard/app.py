@@ -497,7 +497,8 @@ def sidebar() -> str:
                        "Teller security center", "Customer support", "Reports & audit history",
                        "Teller profile & settings"],
             "operations": ["Banking & transactions", "Transaction approvals", "Security settings"],
-            "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Container security",
+            "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "AI security intelligence",
+                      "AI model monitoring", "AI security assistant", "Container security",
                       "Threat center", "Incident response", "Network visualization", "API security", "Policy management",
                       "Audit & compliance", "Access decisions", "Session & device policy",
                       "Security settings"],
@@ -3991,6 +3992,9 @@ def tl_risk() -> None:
                             unsafe_allow_html=True)
                 if i["warnings"]:
                     st.markdown("Warnings: " + ", ".join(i["warnings"]))
+                if i.get("severity"):
+                    st.markdown(f"Adaptive risk engine: severity **{esc(i['severity'])}**, action "
+                                f"**{esc(i.get('ai_action') or '-')}**. {esc(i.get('explanation') or '')}")
                 if i["reasons"]:
                     st.markdown("AI explanation: " + "; ".join(r for r in i["reasons"] if r))
                 st.markdown("Recommended: " + "; ".join(i["recommended"]))
@@ -3999,8 +4003,9 @@ def tl_risk() -> None:
         if not df.empty:
             df["time"] = local_time(df["ts"], "%d %b %H:%M")
             df["warnings"] = df["warnings"].apply(", ".join)
-            st.dataframe(df[["time", "customer", "channel", "amount", "decision", "risk", "probability", "warnings",
-                             "tx_id"]], hide_index=True, use_container_width=True, height=420,
+            df["severity"] = df["severity"] if "severity" in df else None
+            st.dataframe(df[["time", "customer", "channel", "amount", "decision", "risk", "severity", "probability",
+                             "warnings", "tx_id"]], hide_index=True, use_container_width=True, height=420,
                          column_config={"risk": st.column_config.ProgressColumn("Risk", min_value=0, max_value=1,
                                                                                 format="%.2f")})
     with t[2]:
@@ -4445,6 +4450,412 @@ def forensics_tab() -> None:
             st.dataframe(pd.DataFrame(procs["Processes"], columns=procs.get("Titles")), hide_index=True,
                          use_container_width=True)
         st.text_area("Last log lines", (b.get("logs_tail") or "")[-6000:], height=200)
+
+
+# ======================================================= PART 5: AI security intelligence
+SEV4_COLORS = alt.Scale(domain=["low", "medium", "high", "critical"],
+                        range=["#1F7A4D", "#B8892B", "#B42318", "#8E1B12"])
+ENGINE_LABELS = {"fraud_ml": "Fraud model", "behaviour": "Behaviour", "velocity": "Velocity", "device": "Device risk",
+                 "login": "Login anomaly", "session": "Session risk", "location": "Location", "takeover":
+                 "Account takeover"}
+
+
+def engine_bars(values: dict, height: int = 250, title: str = "0-100") -> None:
+    rows = [{"engine": ENGINE_LABELS.get(k, k), "score": v or 0} for k, v in values.items() if k in ENGINE_LABELS]
+    if not rows:
+        st.caption("No engine data yet.")
+        return
+    df = pd.DataFrame(rows)
+    df["band"] = df["score"].apply(lambda v: "high" if v >= 60 else "medium" if v >= 30 else "low")
+    st.altair_chart(alt.Chart(df).mark_bar(cornerRadiusEnd=3).encode(
+        x=alt.X("score:Q", scale=alt.Scale(domain=[0, 100]), title=title),
+        y=alt.Y("engine:N", sort=None, title=None, axis=alt.Axis(labelOverlap=False, labelLimit=160)),
+        color=alt.Color("band:N", legend=None, scale=alt.Scale(domain=["low", "medium", "high"],
+                                                               range=["#0B3D4A", "#B8892B", "#B42318"])),
+        tooltip=["engine", "score"]).properties(height=height), use_container_width=True)
+
+
+def decision_frame(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+    df["score"] = (df["score"] * 100).round().astype(int)
+    for k in ("behaviour", "velocity", "device", "takeover", "fraud_ml"):
+        df[ENGINE_LABELS[k]] = df["engines"].apply(lambda e, k=k: (e or {}).get(k))
+    cols = ["time", "subject", "kind", "score", "severity", "action", "Fraud model", "Behaviour", "Velocity",
+            "Device risk", "Account takeover", "explanation", "ref"]
+    return df[[c for c in cols if c in df.columns]]
+
+
+def ai_intelligence() -> None:
+    st.title("AI security intelligence")
+    top = st.columns([3, 1])
+    top[0].caption("Six engines feed the Zero Trust decision on every login, transfer, counter transaction and "
+                   "sensitive request: fraud model, behaviour, device, login, velocity / location and account "
+                   "takeover. The adaptive engine combines them into one score, a severity and an action - "
+                   "allow, step-up MFA, hold for review or block - with a plain-English explanation.")
+    days = top[1].selectbox("Window", [1, 7, 30, 90], index=1, key="ai_days",
+                            format_func=lambda d: f"Last {d} day{'s' * (d > 1)}")
+    a = cp_json("/api/admin/ai/intel", days=days)
+    if not a:
+        return
+    t = a["totals"]
+    k = st.columns(6)
+    k[0].metric("Risk decisions", t["decisions"])
+    k[1].metric("Money movements flagged", t["flagged"], help="severity medium or above")
+    k[2].metric("Critical", t["critical"])
+    k[3].metric("Account-takeover alerts", t["takeover_alerts"])
+    k[4].metric("Sensitive requests re-scored", t["requests"])
+    k[5].metric("False-positive reports", t["false_positive_reports"])
+    tabs = st.tabs(["Adaptive risk engine", "Decision history", "Behaviour & profiles", "Login, device & velocity",
+                    "Account takeover", "Explainable AI", "Recommendations", "Predictive security"])
+    with tabs[0]:
+        c = st.columns([1.2, 1])
+        with c[0]:
+            st.markdown("**Average engine scores (money movements)**")
+            engine_bars(a["engine_average"])
+        with c[1]:
+            sev = pd.DataFrame([{"severity": k_, "decisions": v} for k_, v in a["by_severity"].items()])
+            st.markdown("**Severity of every decision**")
+            if not sev.empty:
+                st.altair_chart(alt.Chart(sev).mark_arc(innerRadius=50).encode(
+                    theta="decisions:Q", color=alt.Color("severity:N", scale=SEV4_COLORS),
+                    tooltip=["severity", "decisions"]).properties(height=220), use_container_width=True)
+        st.markdown("**How the decision is made**")
+        st.dataframe(pd.DataFrame([
+            {"combined score": "below 40", "severity": "low", "Zero Trust action": "Allow"},
+            {"combined score": "40 - 59", "severity": "medium", "Zero Trust action": "Step-up MFA (fresh authenticator code)"},
+            {"combined score": "60 - 74", "severity": "high",
+             "Zero Trust action": "Step-up MFA, then hold for a bank officer's review (dual control)"},
+            {"combined score": "75 and above", "severity": "critical",
+             "Zero Trust action": "Block, end every session, identity verification needed"}]),
+            hide_index=True, use_container_width=True)
+        st.caption("Combined score = noisy-OR of the fraud-model probability, the bank's rules and each engine's "
+                   "weighted score. A quiet engine adds nothing; independent warnings add up. Recalculated on every "
+                   "transfer, counter transaction, sign-in and sensitive request (password, contact, MFA, payee, "
+                   "device approval).")
+        cats = pd.DataFrame([{"pattern": k_.replace("_", " "), "transactions": v} for k_, v in a["categories"].items()])
+        if not cats.empty:
+            st.markdown("**Transaction risk categories**")
+            st.altair_chart(alt.Chart(cats).mark_bar(cornerRadiusEnd=3, color="#0B3D4A").encode(
+                x="transactions:Q", y=alt.Y("pattern:N", sort="-x", title=None),
+                tooltip=["pattern", "transactions"]).properties(height=30 + 22 * len(cats)), use_container_width=True)
+    with tabs[1]:
+        f = st.columns(3)
+        kinds = f[0].multiselect("Kind", sorted(a["by_kind"]), key="ai_kind")
+        sevs = f[1].multiselect("Severity", ["low", "medium", "high", "critical"], key="ai_sev")
+        who = f[2].text_input("User", key="ai_user")
+        rows = [d for d in a["decisions"] if (not kinds or d["kind"] in kinds) and (not sevs or d["severity"] in sevs)
+                and (not who or who.lower() in d["subject"].lower())]
+        st.dataframe(decision_frame(rows), hide_index=True, use_container_width=True, height=420)
+        st.caption("Stored in risk_scores with every engine's score, the severity, the action, the explanation and "
+                   "the model version (the risk decision history).")
+    with tabs[2]:
+        st.markdown("**User risk profiles** (ranked)")
+        prof = pd.DataFrame(a["profiles"])
+        if not prof.empty:
+            st.dataframe(prof[["user", "risk_rank", "decisions", "max_score", "avg_score", "critical", "high",
+                               "transfers_flagged", "logins_flagged", "behaviour_max", "takeover_max", "last"]],
+                         hide_index=True, use_container_width=True, height=300)
+        st.markdown("**Behavioural anomaly alerts** - Isolation Forest over each customer's own history "
+                    "(usual amounts, times, payees, frequency)")
+        st.dataframe(decision_frame(a["behaviour_alerts"]), hide_index=True, use_container_width=True)
+    with tabs[3]:
+        st.markdown("**Login anomalies** (unusual time, new network, new / switched device, OS change, failures, "
+                    "frequency)")
+        la = pd.DataFrame(a["login_anomalies"])
+        if not la.empty:
+            la["time"] = local_time(la["ts"], "%d %b %H:%M:%S")
+            la["score"] = (la["score"] * 100).round().astype(int)
+            st.dataframe(la[["time", "subject", "score", "severity", "action", "explanation"]], hide_index=True,
+                         use_container_width=True)
+        else:
+            st.caption("No unusual sign-ins.")
+        c = st.columns(2)
+        with c[0]:
+            st.markdown("**Device risk alerts**")
+            st.dataframe(decision_frame(a["device_alerts"]), hide_index=True, use_container_width=True)
+        with c[1]:
+            st.markdown("**Velocity alerts** (per minute / hour, repeats, new payees, withdrawals)")
+            st.dataframe(decision_frame(a["velocity_alerts"]), hide_index=True, use_container_width=True)
+        st.markdown("**Sensitive requests re-scored** (password, contact, MFA reset, payee, device approval)")
+        rq = pd.DataFrame(a["request_decisions"])
+        if not rq.empty:
+            rq["time"] = local_time(rq["ts"], "%d %b %H:%M:%S")
+            st.dataframe(rq[["time", "user", "action", "decision", "severity", "explanation"]], hide_index=True,
+                         use_container_width=True)
+    with tabs[4]:
+        st.caption("Account-takeover risk combines a risky sign-in, an unfamiliar or changed device, token reuse, "
+                   "failed authentication, a network change and abnormal transactions right after sign-in. At 60/100 "
+                   "the transfer is stopped, the customer is notified and the Threat center opens an incident.")
+        if not a["takeover"]:
+            st.success("No account-takeover alerts in this window.")
+        for x in a["takeover"][:20]:
+            with st.container(border=True):
+                st.markdown(f"**{esc(x['user'])}** · takeover score **{x['score']}/100** · {when(x['ts'])} · "
+                            f"sessions revoked: {'yes' if x.get('session_revoked') else 'no'}")
+                st.write("; ".join(r.get("text", "") for r in x["reasons"]))
+                if x.get("recommendations"):
+                    st.caption("Recommended: " + " · ".join(x["recommendations"]))
+    with tabs[5]:
+        ai_xai(a)
+    with tabs[6]:
+        ai_recommendations_tab(days)
+    with tabs[7]:
+        ai_predictive_tab(max(days, 7))
+
+
+def ai_xai(a: dict) -> None:
+    st.markdown("**Why was it flagged?** Pick a flagged decision.")
+    flagged = [d for d in a["decisions"] if d["severity"] != "low"][:80]
+    if flagged:
+        pick = st.selectbox("Decision", flagged, key="xai_pick",
+                            format_func=lambda d: f"{when(d['ts'], '%d %b %H:%M')} · {d['subject']} · {d['kind']} · "
+                                                  f"{round(d['score'] * 100)}/100 {d['severity']}")
+        st.info(pick.get("explanation") or "-")
+        c = st.columns([1, 1.2])
+        with c[0]:
+            engine_bars(pick.get("engines") or {})
+        with c[1]:
+            rs = pd.DataFrame(pick.get("reasons") or [])
+            if not rs.empty:
+                st.dataframe(rs[[x for x in ("text", "weight", "source", "factor") if x in rs.columns]],
+                             hide_index=True, use_container_width=True)
+        st.caption(f"Model {pick.get('model_version') or '-'} · fraud probability "
+                   f"{round((pick.get('ml_probability') or 0) * 100)}% ({pick.get('fraud_class') or '-'})")
+    else:
+        st.caption("No flagged decisions yet.")
+    st.divider()
+    st.markdown("**What-if: explain the fraud model** (SHAP - exact Shapley values; no money moves)")
+    with st.form("xai_form"):
+        c = st.columns(5)
+        amount = c[0].number_input("Amount", 1.0, 1e8, 45000.0, step=1000.0)
+        bal = c[1].number_input("Sender balance", 0.0, 1e9, 50000.0, step=1000.0)
+        dest = c[2].number_input("Receiver balance", 0.0, 1e9, 0.0, step=1000.0)
+        hour = c[3].slider("Hour", 0, 23, 3)
+        kind = c[4].selectbox("Type", ["transfer", "withdrawal"])
+        go = st.form_submit_button("Explain")
+    if go:
+        r = api("POST", "/api/admin/ai/explain", json={"amount": amount, "sender_balance": bal,
+                                                       "receiver_balance": dest, "hour": hour, "kind": kind})
+        if r is None or r.status_code != 200:
+            st.error(detail(r) if r is not None else "unavailable")
+            return
+        e = r.json()
+        k = st.columns(3)
+        k[0].metric("Fraud probability", f"{e['ml_probability']:.1%}")
+        k[1].metric("Class", e["fraud_class"].replace("_", " "))
+        k[2].metric("Model confidence", f"{e['model_confidence']:.0%}")
+        fd = pd.DataFrame(e["features"])
+        st.altair_chart(alt.Chart(fd).mark_bar().encode(
+            x=alt.X("shap:Q", title="contribution to the probability (SHAP)"),
+            y=alt.Y("label:N", sort=alt.EncodingSortField("shap", op="max", order="descending"), title=None),
+            color=alt.condition("datum.shap > 0", alt.value("#B42318"), alt.value("#1F7A4D")),
+            tooltip=["label", "text", "shap", "value"]).properties(height=220), use_container_width=True)
+        st.caption(f"Base value (average legitimate transfer) {e['base_value']:.3f} + contributions = "
+                   f"{e['check']:.3f}. Red pushes towards fraud, green away from it.")
+
+
+def ai_recommendations_tab(days: int) -> None:
+    rec = cp_json("/api/admin/ai/recommendations", days=days)
+    if not rec:
+        return
+    st.markdown(f"**{esc(rec['summary'])}**")
+    st.caption("Ranked by priority from every engine, open incidents, quarantine, vulnerabilities, container health "
+               "and model drift. Recommendations marked 🔐 change the platform and need your explicit authorization "
+               "(authenticator code) on the page shown - nothing is done automatically from here.")
+    if not rec["items"]:
+        st.success("Nothing needs attention.")
+    df = pd.DataFrame(rec["items"])
+    if not df.empty:
+        df["auth"] = df["requires_authorization"].map({True: "🔐", False: ""})
+        st.dataframe(df[["rank", "priority", "severity", "auth", "title", "why", "where", "type"]], hide_index=True,
+                     use_container_width=True, height=420)
+
+
+def ai_predictive_tab(days: int) -> None:
+    p = cp_json("/api/admin/ai/predictive", days=days)
+    if not p:
+        return
+    st.info(" ".join(p["report"]))
+    st.caption(p["note"])
+    c = st.columns(2)
+    with c[0]:
+        st.markdown("**High-risk periods** (flag rate by hour of day)")
+        h = pd.DataFrame(p.get("hours", []))
+        if not h.empty:
+            st.altair_chart(alt.Chart(h).mark_bar(color="#0B3D4A").encode(
+                x=alt.X("hour:O", axis=alt.Axis(labelAngle=0)), y=alt.Y("flag_rate:Q", axis=alt.Axis(format="%")),
+                tooltip=["hour", "decisions", "flagged", "flag_rate"]).properties(height=200), use_container_width=True)
+    with c[1]:
+        st.markdown("**Flagged per day and the 3-day forecast**")
+        d = pd.DataFrame(p.get("daily", []))
+        fc = (p.get("flagged_trend") or {}).get("forecast", [])
+        if not d.empty:
+            d["series"] = "observed"
+            extra = pd.DataFrame([{"day": f"+{i + 1}d", "flagged": v, "series": "forecast"} for i, v in enumerate(fc)])
+            dd = pd.concat([d[["day", "flagged", "series"]], extra])
+            st.altair_chart(alt.Chart(dd).mark_line(point=True).encode(
+                x=alt.X("day:N", sort=None, axis=alt.Axis(labelAngle=-40)), y="flagged:Q",
+                color=alt.Color("series:N", scale=alt.Scale(range=["#0B3D4A", "#B8892B"])),
+                tooltip=["day", "flagged", "series"]).properties(height=200), use_container_width=True)
+    c = st.columns(2)
+    with c[0]:
+        st.markdown("**Emerging fraud patterns** (last 24 h vs before)")
+        st.dataframe(pd.DataFrame(p.get("emerging_patterns", [])), hide_index=True, use_container_width=True)
+        st.markdown("**Customers whose behaviour is changing**")
+        st.dataframe(pd.DataFrame(p.get("rising_users", [])), hide_index=True, use_container_width=True)
+        st.markdown("**Possible account compromise**")
+        pc = pd.DataFrame(p.get("possible_compromise", []))
+        if not pc.empty:
+            st.dataframe(pc[["user", "takeover_max", "logins_flagged", "max_score", "last"]], hide_index=True,
+                         use_container_width=True)
+    with c[1]:
+        st.markdown("**Recurring threats**")
+        st.dataframe(pd.DataFrame(p.get("recurring_threats", [])), hide_index=True, use_container_width=True)
+        st.markdown("**Container resources** (predicted anomalies)")
+        st.dataframe(pd.DataFrame(p.get("container_resources", [])), hide_index=True, use_container_width=True)
+        st.markdown("**Unusual service communication** (Falco network events)")
+        st.dataframe(pd.DataFrame(p.get("service_communication", [])), hide_index=True, use_container_width=True)
+
+
+def ai_model_monitoring() -> None:
+    st.title("AI model monitoring")
+    m = cp_json("/api/admin/ai/model")
+    if not m:
+        return
+    st.warning(m.get("caveat") or "PaySim is synthetic: held-out results, not proof of real-world performance.")
+    t = m["test"]
+    st.markdown(f"**Serving:** {esc(m.get('champion_name', '-'))} · version `{esc(m.get('version'))}` · "
+                f"{esc(m.get('selection', ''))}")
+    k = st.columns(4) + st.columns(4)
+    for i, (lbl, key) in enumerate([("Accuracy", "accuracy"), ("Precision", "precision"), ("Recall", "recall"),
+                                    ("F1-score", "f1"), ("ROC-AUC", "roc_auc"), ("PR-AUC", "pr_auc")]):
+        k[i].metric(lbl, f"{t.get(key, 0):.3f}")
+    k[6].metric("False-positive rate", f"{t.get('false_positive_rate') or 0:.2%}")
+    k[7].metric("False-negative rate", f"{t.get('false_negative_rate') or 0:.2%}")
+    tabs = st.tabs(["Model comparison", "Confusion matrix", "Latency & live predictions", "Drift", "Dataset",
+                    "Evaluation history"])
+    with tabs[0]:
+        cand = pd.DataFrame([{"model": c["name"], "key": c["key"], "validation PR-AUC": c["validation_pr_auc"],
+                              "test PR-AUC": c["test"]["pr_auc"], "ROC-AUC": c["test"]["roc_auc"],
+                              "precision": c["test"]["precision"], "recall": c["test"]["recall"],
+                              "F1": c["test"]["f1"], "accuracy": c["test"]["accuracy"],
+                              "FPR": c["test"]["false_positive_rate"], "latency ms": c["latency"]["p50_single_ms"],
+                              "train s": c["train_seconds"], "serving": "✔" if c["key"] == m.get("champion") else ""}
+                             for c in m.get("candidates", [])])
+        if not cand.empty:
+            st.dataframe(cand, hide_index=True, use_container_width=True)
+            long = cand.melt(id_vars=["model"], value_vars=["test PR-AUC", "F1", "recall", "precision"],
+                             var_name="metric", value_name="value")
+            st.altair_chart(alt.Chart(long).mark_bar().encode(
+                x=alt.X("value:Q", scale=alt.Scale(domain=[0, 1])), y=alt.Y("model:N", title=None),
+                color=alt.Color("metric:N", scale=alt.Scale(range=["#0B3D4A", "#5A8A9A", "#B8892B", "#A7B4B9"])),
+                yOffset="metric:N", tooltip=["model", "metric", "value"]).properties(height=320),
+                use_container_width=True)
+        st.caption("Five models trained on the same leak-free features. The champion is chosen on the validation "
+                   "split; every number above comes from a separate test split no choice was made on.")
+    with tabs[1]:
+        cm = t["confusion_matrix"]
+        st.dataframe(pd.DataFrame([["actual fraud", cm["tp"], cm["fn"]], ["actual legitimate", cm["fp"], cm["tn"]]],
+                                  columns=["", "predicted fraud", "predicted legitimate"]), hide_index=True)
+        st.caption(f"At threshold {t['threshold']}. At 0.40 (step-up): precision {t['at_medium']['precision']:.1%}, "
+                   f"recall {t['at_medium']['recall']:.1%}. At 0.75 (block): precision {t['at_high']['precision']:.1%},"
+                   f" recall {t['at_high']['recall']:.1%}.")
+    mon = m.get("monitoring") or {}
+    with tabs[2]:
+        lat = mon.get("latency_ms") or {}
+        k = st.columns(4)
+        k[0].metric("Predictions since start", mon.get("predictions", 0))
+        k[1].metric("p50 latency (full engine)", f"{lat.get('p50', 0)} ms")
+        k[2].metric("p95 latency", f"{lat.get('p95', 0)} ms")
+        k[3].metric("Model-only latency (training)", f"{m['latency']['p50_single_ms']} ms")
+        pdist = mon.get("prediction_distribution") or {}
+        if pdist.get("live"):
+            dd = pd.DataFrame({"bin": pdist["edges"][:-1], "reference (test set)": pdist.get("reference") or
+                               [0] * (len(pdist["edges"]) - 1), "live": pdist["live"]}).melt(
+                id_vars="bin", var_name="data", value_name="share")
+            st.markdown("**Prediction distribution: live vs. reference**")
+            st.altair_chart(alt.Chart(dd).mark_bar(opacity=0.75).encode(
+                x=alt.X("bin:O", title="fraud probability"), y=alt.Y("share:Q", axis=alt.Axis(format="%"), stack=None),
+                color=alt.Color("data:N", scale=alt.Scale(range=["#B8892B", "#0B3D4A"])),
+                tooltip=["bin", "data", "share"]).properties(height=220), use_container_width=True)
+        fr = mon.get("flag_rate") or {}
+        st.caption(f"Flag rate (probability ≥ 0.40): live {fr.get('live')} vs reference {fr.get('reference')}. "
+                   f"Severity counts: {mon.get('severity')}")
+    with tabs[3]:
+        drift = mon.get("drift") or {}
+        st.markdown(f"**Status: {esc(drift.get('status', 'unknown')).replace('_', ' ')}** "
+                    f"({drift.get('samples', 0)} live transfers, needs {drift.get('min_samples', 30)})")
+        if drift.get("psi"):
+            st.dataframe(pd.DataFrame([{"feature": k_, "PSI": v,
+                                        "reading": "-" if v is None else "drift" if v > 0.25 else
+                                        "moderate" if v > 0.1 else "stable"} for k_, v in drift["psi"].items()]),
+                         hide_index=True, use_container_width=True)
+        st.caption(drift.get("note", ""))
+    with tabs[4]:
+        ds = m.get("dataset_stats") or {}
+        k = st.columns(4)
+        k[0].metric("Rows (TRANSFER + CASH_OUT)", f"{ds.get('rows_transfer_cashout', 0):,}")
+        k[1].metric("Fraud rows", f"{ds.get('fraud_rows', 0):,}")
+        k[2].metric("Fraud rate", f"{ds.get('fraud_rate', 0):.3%}")
+        k[3].metric("Split", " / ".join(str(m.get('split', {}).get(x, '-')) for x in ("train", "validation", "test")))
+        if ds.get("fraud_rate_by_hour"):
+            st.markdown("**Fraud rate by hour in the training data**")
+            st.altair_chart(alt.Chart(pd.DataFrame({"hour": range(24), "fraud rate": ds["fraud_rate_by_hour"]}))
+                            .mark_bar(color="#B42318").encode(x="hour:O", y=alt.Y("fraud rate:Q",
+                                                                                 axis=alt.Axis(format="%")))
+                            .properties(height=180), use_container_width=True)
+        st.json({"dataset": m.get("dataset"), "synthetic": m.get("synthetic"), "features": m.get("features"),
+                 "type_mix": ds.get("type_mix"), "amount_quantiles": ds.get("amount_quantiles"),
+                 "leaky_baseline": m.get("leaky_baseline_with_post_balances")}, expanded=False)
+    with tabs[5]:
+        h = m.get("history") or []
+        if h:
+            rows = [{"trained_at": x["trained_at"], "model": k_, "PR-AUC": v["pr_auc"], "F1": v["f1"],
+                     "champion": x["champion"] == k_} for x in h for k_, v in x["scores"].items()]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.caption("`make train` adds an entry each time the models are retrained.")
+
+
+def ai_assistant_page() -> None:
+    st.title("AI security assistant")
+    st.caption("Built in and offline: it understands the question, reads only the live platform data your role may "
+               "see, and answers from it. It never takes actions - anything that changes the platform needs your "
+               "explicit authorization on the page that performs it.")
+    ss_ = st.session_state
+    ss_.setdefault("assistant_log", [])
+    ex = ["Why was the last transaction blocked?", "Which container is currently quarantined?",
+          "Show today's critical security incidents", "Why was a device marked untrusted?",
+          "What caused the highest risk score?", "Generate today's security report",
+          "What should I investigate first?", "How accurate is the fraud model?"]
+    cols = st.columns(4)
+    for i, e in enumerate(ex):
+        if cols[i % 4].button(e, key=f"ex{i}", use_container_width=True):
+            ss_["assistant_q"] = e
+    with st.form("assistant", clear_on_submit=True):
+        q = st.text_input("Ask a security question", value=ss_.pop("assistant_q", ""), max_chars=500)
+        go = st.form_submit_button("Ask")
+    if go and q.strip():
+        r = api("POST", "/api/admin/ai/assistant", json={"question": q.strip()})
+        if r is None or r.status_code != 200:
+            st.error(detail(r) if r is not None else "unavailable")
+        else:
+            ss_["assistant_log"].insert(0, r.json())
+            ss_["assistant_log"] = ss_["assistant_log"][:10]
+    for a in ss_["assistant_log"]:
+        with st.container(border=True):
+            st.markdown(f"**You:** {esc(a['question'])}")
+            st.markdown(f"**Assistant** · _{esc(a['intent'].replace('_', ' '))}_")
+            st.write(a["answer"])
+            if a.get("items"):
+                st.dataframe(pd.DataFrame(a["items"]), hide_index=True, use_container_width=True)
+            for s_ in a.get("suggested_actions", []):
+                st.caption(("🔐 needs your authorization: " if s_.get("requires_authorization") else "Suggested: ")
+                           + f"{s_['action']}" + (f" ({s_['where']})" if s_.get("where") else ""))
+            if a.get("sources"):
+                st.caption("Data used: " + ", ".join(a["sources"]))
 
 
 def api_security() -> None:
@@ -5371,6 +5782,9 @@ else:
         "Threat center": threat_center,
         "Network visualization": network_view,
         "API security": api_security,
+        "AI security intelligence": ai_intelligence,
+        "AI model monitoring": ai_model_monitoring,
+        "AI security assistant": ai_assistant_page,
         "Policy management": policy_management,
         "Dashboard": cp_dashboard,
         "Teller dashboard": tl_dashboard,

@@ -53,7 +53,12 @@ secrets:
 
 DATA ?= data/paysim_sample.csv
 train:
-	cd services/risk && ( [ -f "$(DATA)" ] || python3 make_sample.py --out $(DATA) ) && python3 train.py --data $(DATA)
+	@# trains inside the risk image, so the saved models match the library versions that serve them
+	@[ -f "services/risk/$(DATA)" ] || $(ENGINE) run --rm --network none -v "$(PWD)/services/risk:/work" -w /work \
+		--user 0 --entrypoint python $(or $(IMAGE_PREFIX),zt-finguard/)risk:latest make_sample.py --out $(DATA)
+	$(ENGINE) run --rm --network none -v "$(PWD)/services/risk:/work" -w /work --user 0 \
+		--entrypoint python $(or $(IMAGE_PREFIX),zt-finguard/)risk:latest train.py --data $(DATA)
+	@echo "model trained - rebuild and redeploy the risk service: ./deploy.sh"
 
 build:
 	$(COMPOSE) build

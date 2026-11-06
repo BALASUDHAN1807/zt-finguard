@@ -32,6 +32,17 @@ HUMAN = {
 }
 
 
+# histogram edges per feature: the drift monitor compares live traffic to training data
+BINS = {
+    "is_transfer": [0, 0.5, 1.01],
+    "log_amount": [0, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 10],
+    "drain_ratio": [0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0, 1.51],
+    "orig_balance_zero": [0, 0.5, 1.01],
+    "dest_balance_zero": [0, 0.5, 1.01],
+    "hour": [0, 3, 6, 9, 12, 15, 18, 21, 24],
+}
+
+
 def drain_ratio(amount: float, balance: float) -> float:
     if balance <= 0:
         return 1.5
