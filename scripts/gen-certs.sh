@@ -53,7 +53,31 @@ EOF
   echo "[pki] issued $name (valid ${CERT_DAYS}d)"
 }
 
-for s in "${SERVICES[@]}"; do issue "$s"; done
+if [[ -n "${ONLY:-}" ]]; then issue "$ONLY"; else for s in "${SERVICES[@]}"; do issue "$s"; done; fi
+
+# ---------------------------------------------------------- revocation (CRL)
+# A minimal `openssl ca` database so certificates can be revoked (scripts/revoke-cert.sh).
+# The CRL is mounted into every Python service, which refuses revoked peers on every handshake.
+PKI="$OUT/pki"
+mkdir -p "$PKI"
+[[ -f "$PKI/index.txt" ]] || : > "$PKI/index.txt"
+[[ -f "$PKI/crlnumber" ]] || echo 1000 > "$PKI/crlnumber"
+cat > "$PKI/openssl.cnf" <<EOF
+[ ca ]
+default_ca = zt
+[ zt ]
+database = $PKI/index.txt
+crlnumber = $PKI/crlnumber
+certificate = $OUT/ca.crt
+private_key = $OUT/ca.key
+default_md = sha256
+default_crl_days = 60
+EOF
+tmpcrl=$(mktemp)
+openssl ca -config "$PKI/openssl.cnf" -gencrl -out "$tmpcrl" 2>/dev/null
+# write in place (same inode) so containers that mount the file see the update without a restart
+cat "$tmpcrl" > "$OUT/crl.pem"; rm -f "$tmpcrl"
+chmod 644 "$OUT/crl.pem"
 
 # Files are mounted one-by-one into containers that run as non-root UIDs
 # (10001, postgres, redis...). The certs/ directory itself is 0700 so other

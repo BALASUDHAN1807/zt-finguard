@@ -4,13 +4,13 @@
 #   ./scripts/sign-images.sh [docker|podman]
 #
 # Writes reports/image-manifest.json = {"manifest": {service: {image, id}}, "signature": base64(Ed25519)}.
-# The responder verifies the signature with secrets/image_signing.pub and compares every running
+# The responder verifies the signature with ${SECRETS_DIR:-secrets}/image_signing.pub and compares every running
 # container's image ID with the signed one: a swapped or rebuilt-behind-our-back image shows as
 # "digest mismatch". Same idea as cosign / Notary, kept local so it needs no registry or internet.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ENGINE="${1:-docker}"
-KEY=secrets/image_signing.key
+KEY=${SECRETS_DIR:-secrets}/image_signing.key
 [[ -f "$KEY" ]] || { echo "[sign] no $KEY - run scripts/gen-secrets.sh"; exit 1; }
 mkdir -p reports
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
@@ -47,5 +47,25 @@ sig = base64.b64encode(open(sys.argv[2], "rb").read()).decode()
 json.dump({"manifest": json.loads(payload), "payload": payload, "signature": sig, "algorithm": "Ed25519"},
           open(sys.argv[3], "w"), indent=2)
 PY
-chmod 644 reports/image-manifest.json
-echo "[sign] signed $(wc -l < "$tmp/ids") image digests -> reports/image-manifest.json"
+# Cosign: sign the same payload as a blob (ECDSA P-256 / SHA-256), verifiable with
+#   cosign verify-blob --key ${SECRETS_DIR:-secrets}/cosign.pub --signature reports/image-manifest.sig reports/image-manifest.payload.json
+cp "$tmp/payload" reports/image-manifest.payload.json
+if [[ -f ${SECRETS_DIR:-secrets}/cosign.key ]]; then
+  openssl dgst -sha256 -sign ${SECRETS_DIR:-secrets}/cosign.key -out "$tmp/cosign.der" "$tmp/payload"
+  base64 -w0 "$tmp/cosign.der" > reports/image-manifest.sig
+  tool="openssl, cosign sign-blob format"
+  if command -v cosign >/dev/null 2>&1; then     # double-check with the real cosign CLI when it is installed
+    cosign verify-blob --key ${SECRETS_DIR:-secrets}/cosign.pub --signature reports/image-manifest.sig \
+      reports/image-manifest.payload.json >/dev/null 2>&1 && tool="$tool, verified by cosign CLI"
+  fi
+  python3 - reports/image-manifest.json reports/image-manifest.sig "$tool" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+doc["cosign_signature"] = open(sys.argv[2]).read().strip()
+doc["cosign_algorithm"] = "ECDSA-P256-SHA256 (cosign sign-blob format)"
+doc["cosign_tool"] = sys.argv[3]
+json.dump(doc, open(sys.argv[1], "w"), indent=2)
+PY
+fi
+chmod 644 reports/image-manifest.json reports/image-manifest.payload.json reports/image-manifest.sig 2>/dev/null || true
+echo "[sign] signed $(wc -l < "$tmp/ids") image digests -> reports/image-manifest.json (+ cosign signature)"

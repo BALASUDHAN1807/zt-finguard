@@ -8,7 +8,10 @@ GET  /verify  - re-compute the hash chain (gateway only)
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -27,8 +30,41 @@ CHAIN_LOCK = 7_204_001  # pg advisory lock id: serialises chain appends
 @asynccontextmanager
 async def lifespan(_app):
     await db.pool()
+    watcher = asyncio.create_task(integrity_watch())
     yield
+    watcher.cancel()
     await db.close()
+
+
+VERIFY_EVERY = int(os.environ.get("AUDIT_VERIFY_SECONDS", "600"))
+_last_alert: dict = {"broken_at": None}
+
+
+async def verify_now() -> dict:
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute("SELECT id, ts, service, actor, action, resource, decision, reason, risk, details, "
+                                 "prev_hash, hash FROM audit_log ORDER BY id ASC")
+        return chain.verify(await cur.fetchall())
+
+
+async def integrity_watch() -> None:
+    """Re-verify the whole hash chain on a schedule; a break raises an audit alert (and an incident)
+    once per broken entry, so tampering is noticed even if nobody presses 'verify'."""
+    while True:
+        await asyncio.sleep(VERIFY_EVERY)
+        try:
+            v = await verify_now()
+            if not v.get("ok") and v.get("broken_at") != _last_alert["broken_at"]:
+                _last_alert["broken_at"] = v.get("broken_at")
+                await append({"ts": datetime.now(timezone.utc).isoformat(), "service": "audit", "actor": "audit",
+                              "action": "audit.integrity_failure", "resource": "audit_log", "decision": "alert",
+                              "reason": f"entry #{v.get('broken_at')}: {v.get('problem')}", "risk": None,
+                              "details": v})
+            elif v.get("ok"):
+                _last_alert["broken_at"] = None
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("audit").warning("scheduled chain verification failed: %s", exc)
 
 
 app = FastAPI(title="ZT-FinGuard audit", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -653,6 +689,9 @@ CATEGORY_TITLE = {
     "suspicious_login": "Suspicious sign-in activity",
     "account_takeover": "Possible account takeover (high-risk transfer blocked)",
     "customer_report": "Customer reported fraud, unauthorised access or a stolen device",
+    "image_tampering": "Unsigned or modified container image running",
+    "api_abuse": "Suspicious API usage (scanning / brute force)",
+    "audit_tampering": "Audit log integrity failure",
 }
 SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 RESPONSE_ACTIONS = {"container.release", "container.restart", "container.recover", "auth.revoke_sessions",
@@ -668,11 +707,13 @@ def service_of(container_name: str | None) -> str:
 
 
 CONTAINER_CATEGORIES = {"unauthorized_shell", "privilege_escalation", "file_modification", "credential_access",
-                        "network_connection", "suspicious_process", "container_compromise"}
+                        "network_connection", "suspicious_process", "container_compromise", "image_tampering"}
 
 
 def falco_category(rule: str) -> str:
     r = rule.lower()
+    if "image_mismatch" in r or "unsigned or modified image" in r:
+        return "image_tampering"
     if "shell" in r or "tool spawned" in r:
         return "unauthorized_shell"
     if "privilege" in r:
@@ -695,7 +736,9 @@ def detect(e: dict) -> dict | None:
     if e["service"] == "falco" or e["action"].startswith("runtime."):
         fields = d.get("fields") or {}
         return {"category": falco_category(d.get("rule") or e["action"]),
-                "subject": service_of(fields.get("container.name") or e["actor"] or e["resource"]),
+                "subject": service_of(fields.get("container.name")
+                                      or (e["resource"] if e["action"] == "runtime.image_mismatch" else e["actor"])
+                                      or e["resource"]),
                 "severity": severity(e), "summary": reason[:200], "source": "falco"}
     if e["action"] == "container.quarantine":
         return {"category": "container_compromise", "subject": e["resource"], "severity": "critical",
@@ -722,6 +765,23 @@ def detect(e: dict) -> dict | None:
         if reason in ("bad_password", "bad_or_replayed_totp", "bad_sms_otp"):
             return {"category": "suspicious_login", "subject": e["actor"], "severity": "low",
                     "summary": reason.replace("_", " "), "source": "auth"}
+    if e["action"] == "session.ip_changed":
+        return {"category": "jwt_theft", "subject": e["actor"], "severity": "medium",
+                "summary": f"session moved from {d.get('from')} to {d.get('to')} mid-session", "source": "gateway"}
+    if e["action"] == "gateway.verify" and e["decision"] == "deny" and reason in ("expired_token_reuse",
+                                                                                   "token_abuse_session_revoked"):
+        return {"category": "jwt_theft", "subject": e["actor"],
+                "severity": "high" if reason == "token_abuse_session_revoked" else "medium",
+                "summary": {"expired_token_reuse": "long-expired token replayed",
+                            "token_abuse_session_revoked": "one token used at machine speed - session ended"}[reason],
+                "source": "gateway"}
+    if e["action"] == "api.anomaly":
+        return {"category": "api_abuse", "subject": (d.get("client") or e["actor"]).split("|")[0], "severity": "high",
+                "summary": f"{d.get('refused_per_minute')} refused requests in a minute on {e['resource']} - "
+                           f"client blocked {d.get('blocked_minutes')} min", "source": "gateway"}
+    if e["action"] == "audit.integrity_failure":
+        return {"category": "audit_tampering", "subject": "audit_log", "severity": "critical",
+                "summary": reason[:200], "source": "audit"}
     if e["action"] in CUSTOMER_REPORT_ACTIONS:
         sev = "critical" if e["action"] in ("customer.report_access", "device.reported_stolen", "account.lockdown") \
             or d.get("category") == "fraud" else "high"
@@ -740,6 +800,7 @@ async def threat_events(days: int) -> list[dict]:
             """SELECT id, ts, service, actor, action, resource, decision, reason, risk, details FROM audit_log
                WHERE ts > now() - make_interval(days => %s)
                  AND (service = 'falco' OR action LIKE 'runtime.%%' OR action LIKE 'incident.%%' OR action = ANY(%s)
+                      OR action IN ('session.ip_changed', 'api.anomaly', 'audit.integrity_failure')
                       OR (decision = 'deny' AND action IN ('gateway.verify', 'auth.refresh', 'auth.login',
                                                            'transaction.transfer')))
                ORDER BY id ASC LIMIT 100000""",

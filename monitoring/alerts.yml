@@ -1,0 +1,15 @@
+groups:
+  - name: zt-finguard
+    rules:
+      - alert: ApiServerErrors
+        expr: increase(zt_http_server_errors_total[5m]) > 5
+        labels: {severity: high}
+        annotations: {summary: "Gateway is returning 5xx errors"}
+      - alert: ApiAbuse
+        expr: increase(zt_api_anomalies_total[5m]) > 0
+        labels: {severity: high}
+        annotations: {summary: "A client was blocked for suspicious API usage"}
+      - alert: SlowZeroTrustChecks
+        expr: zt_gateway_check_ms{quantile="0.95"} > 100
+        labels: {severity: medium}
+        annotations: {summary: "Gateway checks exceed the 100 ms budget"}

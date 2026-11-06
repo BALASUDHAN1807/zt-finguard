@@ -26,11 +26,13 @@ for arg in "$@"; do
     --status) ACTION=status ;;
     --stop)   ACTION=stop ;;
     --reset)  ACTION=reset ;;
+    --env=prod|--prod) export SECRETS_DIR=secrets-prod ZT_ENV=prod ;;   # separate production secrets
     -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
     *) echo "unknown option: $arg"; exit 2 ;;
   esac
 done
 COMPOSE="$ENGINE compose"
+export SECRETS_DIR="${SECRETS_DIR:-./secrets}"
 # a previous cloud deployment leaves .env with SITE_DOMAIN: keep using the overlay
 if [[ $CLOUD -eq 1 ]] || grep -qs '^SITE_DOMAIN=' .env; then
   CLOUD=1
@@ -165,10 +167,17 @@ if [[ $BUILD -eq 1 ]]; then
 fi
 # admin module 5: sign the exact image digests this deployment runs
 if ./scripts/sign-images.sh "$ENGINE" >/dev/null 2>&1; then
-  c_ok "image digests signed (reports/image-manifest.json)"
+  c_ok "image digests signed (reports/image-manifest.json, Ed25519 + cosign format)"
 else
-  c_warn "could not sign image digests - the dashboard will show images as unsigned"
+  c_warn "could not sign image digests"
 fi
+# supply-chain gate: unsigned / modified images or a failed vulnerability policy stop the deployment
+if guard_out=$(./scripts/deploy-guard.sh "$ENGINE" 2>&1); then
+  c_ok "deployment gate passed (signatures + vulnerability policy)"
+else
+  echo "$guard_out"; c_err "deployment blocked by the image security policy"; exit 1
+fi
+./scripts/sbom.sh "$ENGINE" >/dev/null 2>&1 && c_ok "SBOM generated (reports/sbom/)" || c_warn "SBOM generation skipped"
 c_info "starting containers"
 if ! $COMPOSE up -d --force-recreate --no-build; then
   show_failures; exit 1

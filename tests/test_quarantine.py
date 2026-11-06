@@ -190,3 +190,49 @@ def test_only_the_gateway_can_write_policy_data():
     for cert in ("falco", "account", "transaction"):
         assert _call(cert, "PUT", "https://opa:8181/v1/data/zt_policy", '{"transfer_limit_customer": 9999999}') in ("401", "403")
     assert _call("gateway", "PUT", "https://opa:8181/v1/policies/evil", "package evil") in ("401", "403")
+
+
+def test_quarantine_preserves_forensic_evidence():
+    """Security list 7.8 / 13.10: evidence is written (write-once, SHA-256 in the audit chain) before isolation."""
+    admin = logged_in("admin")
+    bundles = admin.req("GET", "/api/admin/forensics").json()
+    assert bundles, "earlier quarantine tests should have produced evidence"
+    b = bundles[0]
+    full = admin.req("GET", f"/api/admin/forensics/{b['file']}").json()
+    assert {"processes", "logs_tail", "networks", "config", "state"} <= full.keys()
+    ev = admin.req("GET", "/api/admin/audit/explore", params={"action": "container.forensics", "limit": 50}).json()
+    assert any((r["details"] or {}).get("sha256") == b["sha256"] for r in ev["rows"] if r["action"] == "container.forensics")
+
+
+def test_revoked_certificate_is_refused_within_a_minute():
+    """Security list 5.6: a certificate leaked from a workload is revoked (CRL) and refused on every handshake."""
+    import tempfile
+    d = tempfile.mkdtemp(dir=os.path.join(ROOT, "reports"))
+    os.chmod(d, 0o755)
+    key, csr, crt = (os.path.join(d, n) for n in ("rogue.key", "rogue.csr", "rogue.crt"))
+    subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key], check=True)
+    subprocess.run(["openssl", "req", "-new", "-key", key, "-subj", "/O=ZT-FinGuard/CN=gateway", "-out", csr],
+                   check=True, capture_output=True)
+    ext = os.path.join(d, "ext")
+    open(ext, "w").write("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
+                         "extendedKeyUsage=clientAuth\n")
+    subprocess.run(["openssl", "x509", "-req", "-in", csr, "-CA", os.path.join(ROOT, "certs", "ca.crt"),
+                    "-CAkey", os.path.join(ROOT, "certs", "ca.key"), "-CAcreateserial", "-days", "1",
+                    "-extfile", ext, "-out", crt], check=True, capture_output=True)
+    for f in (key, crt):
+        os.chmod(f, 0o644)
+    script = ("import ssl,sys,urllib.request as u\n"
+              "c=ssl.create_default_context(cafile='/c/ca.crt');c.load_cert_chain('/r/rogue.crt','/r/rogue.key')\n"
+              "try: print(u.urlopen('https://responder:8443/quarantine',context=c,timeout=10).status)\n"
+              "except Exception as x: print('TLSERR', type(x).__name__)")
+
+    def call() -> str:
+        return subprocess.run(
+            ["docker", "run", "--rm", "--network", f"{PROJECT}_auth-net", *cert_mounts("ca"),
+             "-v", f"{d}:/r:ro", "--entrypoint", "python", HELPER_IMAGE, "-c", script],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+
+    assert call() == "200"                                   # a valid gateway certificate works ...
+    out = subprocess.run(["./scripts/revoke-cert.sh", crt], cwd=ROOT, capture_output=True, text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert wait_until(lambda: call().startswith("TLSERR"), timeout=90)   # ... until it is revoked

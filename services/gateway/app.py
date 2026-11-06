@@ -70,10 +70,119 @@ def harden(response, path: str):
     return response
 
 
+# ------------------------------------------------------------ API protection (security list, area 12)
+MAX_BODY = int(os.environ.get("MAX_REQUEST_BYTES", str(320 * 1024)))   # profile pictures are the largest body
+CORS_ORIGINS = {o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()}
+STATE_CHANGING = {"POST", "PUT", "PATCH", "DELETE"}
+API_STATS: dict = {"started": time.time(), "requests": {}, "latency": {}, "errors": {}, "anomalies": deque(maxlen=200)}
+_route_cache: dict[str, str] = {}
+
+
+def route_of(request: Request) -> str:
+    """Route template (/api/teller/customers/{username}) so metrics do not explode per id."""
+    r = request.scope.get("route")
+    return getattr(r, "path", None) or request.url.path.split("?")[0]
+
+
+async def _gw_setting(name: str) -> int:
+    lo, hi, base, _ = SETTINGS[name]
+    try:
+        v = int((await clients.redis().hget("zt:settings", name)) or base)
+    except Exception:  # noqa: BLE001
+        v = base
+    return max(lo, min(hi, v))
+
+
+async def record_api(request: Request, status: int, ms: float) -> None:
+    """Request logging + metrics + suspicious-usage detection. A client (address + device id) that
+    collects too many refusals (401/403/404) in a minute is blocked for a while and reported."""
+    route = route_of(request)
+    key = f"{request.method} {route}"
+    API_STATS["requests"][(key, status)] = API_STATS["requests"].get((key, status), 0) + 1
+    lat = API_STATS["latency"].setdefault(key, deque(maxlen=200))
+    lat.append(ms)
+    if status >= 500:
+        API_STATS["errors"][key] = API_STATS["errors"].get(key, 0) + 1
+    if status in (401, 403, 404):
+        who = f"{client_ip(request)}|{(request.headers.get('x-device-id') or '-')[:64]}"
+        window = int(time.time() // 60)
+        try:
+            r = clients.redis()
+            n = await r.incr(f"apifail:{who}:{window}")
+            if n == 1:
+                await r.expire(f"apifail:{who}:{window}", 70)
+            limit = await _gw_setting("api_anomaly_threshold")
+            if n == limit:
+                minutes = await _gw_setting("api_block_minutes")
+                await r.set(f"apiblock:{who}", route, ex=minutes * 60)
+                API_STATS["anomalies"].append({"at": time.time(), "client": who, "route": route, "count": n})
+                clients.audit(actor=client_ip(request), action="api.anomaly", resource=route, decision="alert",
+                              reason="too_many_refused_requests",
+                              details={"client": who, "refused_per_minute": n, "blocked_minutes": minutes,
+                                       "last_status": status})
+        except Exception:  # noqa: BLE001
+            pass
+    elif status >= 500:
+        window = int(time.time() // 60)
+        try:
+            r = clients.redis()
+            n = await r.incr(f"api5xx:{window}")
+            if n == 1:
+                await r.expire(f"api5xx:{window}", 70)
+            if n == 10:
+                clients.audit(actor="gateway", action="api.error_spike", resource=route, decision="alert",
+                              reason="server_errors", details={"errors_per_minute": n})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _reject(path: str, status: int, detail: str):
+    return harden(JSONResponse({"detail": detail}, status_code=status), path)
+
+
 @app.middleware("http")
 async def zero_trust_edge(request: Request, call_next):
     path = request.url.path
+    started = time.perf_counter()
+    if path.startswith("/api/") or path == "/metrics":
+        response = await _edge_checks(request, call_next, path)
+        try:
+            await record_api(request, response.status_code, (time.perf_counter() - started) * 1000)
+        except Exception:  # noqa: BLE001 - monitoring must never break a request
+            pass
+        return response
+    return harden(await call_next(request), path)
+
+
+async def _edge_checks(request: Request, call_next, path: str):
     if path.startswith("/api/"):
+        # request size restriction (also protects JSON parsing)
+        length = request.headers.get("content-length")
+        if length is not None and (not length.isdigit() or int(length) > MAX_BODY):
+            return _reject(path, 413, f"request body larger than {MAX_BODY // 1024} KB")
+        if request.method in STATE_CHANGING and length is None and request.headers.get("transfer-encoding"):
+            return _reject(path, 411, "send a Content-Length")
+        # CSRF / CORS: the API takes bearer tokens (never cookies) and only JSON. A browser form or a
+        # cross-site script cannot set the Authorization header, and a foreign Origin is refused.
+        origin = request.headers.get("origin")
+        if origin and origin not in CORS_ORIGINS and request.method in STATE_CHANGING:
+            return _reject(path, 403, "cross-origin request refused")
+        ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if request.method in STATE_CHANGING and int(length or 0) > 0 and ctype != "application/json":
+            return _reject(path, 415, "send JSON (Content-Type: application/json)")
+        if request.method == "OPTIONS":
+            if origin in CORS_ORIGINS:
+                return harden(Response(status_code=204, headers={
+                    "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Device-Id",
+                    "Access-Control-Max-Age": "600", "Vary": "Origin"}), path)
+            return _reject(path, 403, "cross-origin request refused")
+        who = f"{client_ip(request)}|{(request.headers.get('x-device-id') or '-')[:64]}"
+        try:
+            if await clients.redis().exists(f"apiblock:{who}"):
+                return _reject(path, 429, "too many refused requests from this client - temporarily blocked")
+        except Exception:  # noqa: BLE001
+            pass
         ip = client_ip(request)
         if ip_blocked(ip):  # module 8: blocked address ranges from the active policy version
             clients.audit(actor=ip, action="gateway.ip_blocked", resource=path, decision="deny",
@@ -99,7 +208,12 @@ async def zero_trust_edge(request: Request, call_next):
                           reason="rate_limited")
             return harden(JSONResponse({"detail": "too many requests"}, status_code=429,
                                        headers={"Retry-After": "60"}), path)
-    return harden(await call_next(request), path)
+    response = harden(await call_next(request), path)
+    origin = request.headers.get("origin")
+    if origin and origin in CORS_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    return response
 
 
 # ------------------------------------------------------------ session check
@@ -116,6 +230,10 @@ async def session(request: Request, authorization: str | None = Header(None),
     try:
         claims = tokens.verify_access(tokens.bearer(authorization))
     except HTTPException as exc:
+        stale = tokens.expired_for(authorization)
+        if stale is not None and stale > 600:
+            # a correctly signed token presented long after expiry: replayed from a log, cache or stolen copy
+            deny(request, stale_user(authorization), "expired_token_reuse")
         deny(request, "anonymous", str(exc.detail).replace(" ", "_"))
     if claims.get("dfp") != tokens.device_fingerprint(x_device_id, user_agent):
         deny(request, claims["usr"], "token_used_from_different_device")
@@ -137,11 +255,45 @@ async def session(request: Request, authorization: str | None = Header(None),
     if idle_reason:
         await r.set(f"rtfam_revoked:{claims.get('sid')}", 1, ex=8 * 3600)
         deny(request, claims["usr"], idle_reason)
+    await session_watch(request, r, claims)
     claims["_device_trust"] = device_trust
     claims["_idle_left"] = left
     GATEWAY_CHECK_MS.append((time.perf_counter() - t0) * 1000)
     claims["_raw"] = tokens.bearer(authorization)
     return claims
+
+
+TOKEN_USES_PER_MIN = int(os.environ.get("TOKEN_USES_PER_MIN", "180"))
+
+
+def stale_user(authorization: str | None) -> str:
+    try:
+        return tokens.unverified_claims(authorization).get("usr", "anonymous")
+    except Exception:  # noqa: BLE001
+        return "anonymous"
+
+
+async def session_watch(request: Request, r, claims: dict) -> None:
+    """Session-hijacking signals on every request: the session's network address changed, or one
+    access token is used far more often than a person could (scripted replay) - the latter ends it."""
+    sid = claims.get("sid")
+    if not sid:
+        return
+    ip = client_ip(request)
+    first_ip = await r.hget(f"sessinfo:{sid}", "ip")
+    if first_ip and ip != first_ip and await r.set(f"ipchg:{sid}:{ip}", 1, nx=True, ex=3600):
+        await r.hset(f"sessinfo:{sid}", mapping={"ip_changed": ip, "risk_flags": "ip_changed"})
+        clients.audit(actor=claims["usr"], action="session.ip_changed", resource=sid[:8], decision="alert",
+                      reason="session_ip_changed", details={"from": first_ip, "to": ip, "jti": claims["jti"][:8]})
+    window = int(time.time() // 60)
+    n = await r.incr(f"tokuse:{claims['jti']}:{window}")
+    if n == 1:
+        await r.expire(f"tokuse:{claims['jti']}:{window}", 70)
+    if n > TOKEN_USES_PER_MIN:
+        await r.set(f"rtfam_revoked:{sid}", 1, ex=8 * 3600)
+        await sessions.end(r, sid)
+        await r.set(f"deny:jti:{claims['jti']}", 1, ex=tokens.ACCESS_TTL_SECONDS)
+        deny(request, claims["usr"], "token_abuse_session_revoked")
 
 
 async def forward(method: str, service: str, path: str, claims: dict | None = None,
@@ -2000,7 +2152,7 @@ async def admin_compliance_report(days: int = 30, claims: dict = Depends(session
 SLA = {"critical": (15, 240), "high": (60, 1440), "medium": (240, 4320), "low": (1440, 10080), "info": (1440, 10080)}
 REPORT_WINDOW_H = 6
 CONTAINER_CATS = {"unauthorized_shell", "privilege_escalation", "file_modification", "credential_access",
-                  "network_connection", "suspicious_process", "container_compromise"}
+                  "network_connection", "suspicious_process", "container_compromise", "image_tampering"}
 
 
 def _step(sid, title, kind="manual", action=None, containment=False, code=False, help=""):
@@ -2021,6 +2173,13 @@ PLAYBOOKS = {
     "account_takeover": USER_PLAYBOOK[:3] + [
         _step("ops_freeze", "Ask Operations to freeze the account (admins cannot - separation of duties)"),
         _step("fraud_label", "Label the blocked transfer in AI fraud intelligence")],
+    "api_abuse": [_step("review", "Review the refused requests in Audit & compliance → Audit explorer"),
+                  _step("block_ip", "Block the address range permanently (Policy management)"),
+                  _step("rotate", "If a token or key was guessed or leaked: rotate it (make rotate-secrets)")],
+    "audit_tampering": [_step("verify", "Verify the chain and note the first broken entry (Audit & compliance)"),
+                        _step("evidence", "Export the audit log and the database role privileges as evidence"),
+                        _step("restore", "Restore the audit table from backup and find who had database access"),
+                        _step("report", "Report to the regulator (CERT-In, 6 hours)")],
     "customer_report": [USER_PLAYBOOK[0], USER_PLAYBOOK[2],
                         _step("ticket", "Work the customer's support ticket with Operations (Support tickets)"),
                         _step("fraud_label", "Label the reported transfer in AI fraud intelligence"),
@@ -2219,8 +2378,12 @@ SETTINGS = {
     "password_min_length": (10, 32, 10, "Minimum password length for new accounts"),
     "otp_ttl_seconds": (60, 300, 300, "SMS code validity (seconds)"),
     "otp_max_tries": (1, 3, 3, "Wrong SMS codes before the code is destroyed"),
+    "api_anomaly_threshold": (5, 60, 60, "Refused API calls per minute from one client before it is blocked"),
+    "api_block_minutes": (10, 1440, 10, "How long a client flagged as anomalous stays blocked (minutes)"),
+    "risky_session_idle_minutes": (1, 10, 10, "Inactivity timeout for risky sessions (new device / medium risk)"),
 }
-STRICTER_IS_LOWER = {"lockout_threshold", "otp_ttl_seconds", "otp_max_tries"}
+STRICTER_IS_LOWER = {"lockout_threshold", "otp_ttl_seconds", "otp_max_tries", "api_anomaly_threshold",
+                     "risky_session_idle_minutes"}
 
 
 async def current_settings() -> dict:
@@ -2274,6 +2437,7 @@ async def admin_settings(claims: dict = Depends(session)):
             "ca": _cert_info(config.CA_FILE),
             "gateway_certificate": _cert_info(config.CERT_FILE),
             "jwt_signing_key_sha256": hashlib.sha256(jwt_pub.encode()).hexdigest(),
+            "crl": crl_info(),
             "services": {k: {"server_cn": v.get("server_cn"), "days_left": v.get("cert_days_left"),
                              "reachable": v.get("reachable")} for k, v in probes.items()},
         },
@@ -2686,6 +2850,199 @@ async def teller_protect(body: CounterProtectBody, acct_no: str = Path(pattern=r
     await require_admin_action("customer.service", claims)
     return await forward("POST", "account", f"/teller/accounts/{acct_no}/protect", claims, body.model_dump())
 
+
+# ======================================================================= supply chain & forensics (security list)
+@app.get("/api/admin/supply-chain")
+async def admin_supply_chain(claims: dict = Depends(session)):
+    await require_admin_action("admin.containers", claims)
+    data = await get_json("responder", "/supply-chain", timeout=20)
+    if data is None:
+        raise HTTPException(502, "responder unavailable")
+    return data | {"trivy": read_report("trivy-summary.json")}
+
+
+@app.get("/api/admin/sbom/{service}")
+async def admin_sbom(service: str = SERVICE_NAME, claims: dict = Depends(session)):
+    await require_admin_action("admin.containers", claims)
+    return await forward("GET", "responder", f"/sbom/{service}")
+
+
+@app.get("/api/admin/forensics")
+async def admin_forensics(claims: dict = Depends(session)):
+    await require_admin_action("admin.containers", claims)
+    return await forward("GET", "responder", "/forensics")
+
+
+@app.get("/api/admin/forensics/{name}")
+async def admin_forensics_file(name: str = Path(pattern=r"^[0-9TZ]+-[a-z0-9_-]+-[0-9a-f]{12}\.json$"),
+                               claims: dict = Depends(session)):
+    await require_admin_action("admin.containers", claims)
+    clients.audit(actor=claims["usr"], action="container.forensics_read", resource=name, decision="info")
+    return await forward("GET", "responder", f"/forensics/{name}")
+
+
+def crl_info() -> dict:
+    """Revocation list the services enforce (scripts/revoke-cert.sh)."""
+    try:
+        from cryptography import x509
+        crl = x509.load_pem_x509_crl(open(mtls.CRL_FILE, "rb").read())
+        return {"revoked": len(list(crl)), "last_update": crl.last_update_utc.isoformat(),
+                "next_update": crl.next_update_utc.isoformat() if crl.next_update_utc else None,
+                "serials": [format(r.serial_number, "X") for r in crl][:50], **mtls.crl_status()}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": exc.__class__.__name__, **mtls.crl_status()}
+
+# ======================================================================= observability (security list, areas 12 + tech)
+METRICS_TOKEN_FILE = os.environ.get("METRICS_TOKEN_FILE", "/run/secrets/metrics_token")
+
+
+def _pctl(values, q):
+    v = sorted(values)
+    return v[min(len(v) - 1, int(q * len(v)))] if v else 0
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics(authorization: str | None = Header(None)):
+    """Prometheus exposition format. Scraped with a bearer token (secrets/metrics_token), never public."""
+    import hmac as _hmac
+    try:
+        expected = config.read_secret(METRICS_TOKEN_FILE)
+    except OSError:
+        raise HTTPException(404, "metrics disabled")
+    if not authorization or not _hmac.compare_digest(authorization, f"Bearer {expected}"):
+        raise HTTPException(401, "metrics token required")
+    lines = ["# HELP zt_http_requests_total API requests by route, method and status",
+             "# TYPE zt_http_requests_total counter"]
+    for (key, status), n in sorted(API_STATS["requests"].items()):
+        method, route = key.split(" ", 1)
+        lines.append(f'zt_http_requests_total{{method="{method}",route="{route}",status="{status}"}} {n}')
+    lines += ["# HELP zt_http_request_latency_ms API latency (last 200 requests per route)",
+              "# TYPE zt_http_request_latency_ms summary"]
+    for key, vals in sorted(API_STATS["latency"].items()):
+        method, route = key.split(" ", 1)
+        for q in (0.5, 0.95, 0.99):
+            lines.append(f'zt_http_request_latency_ms{{method="{method}",route="{route}",quantile="{q}"}} '
+                         f'{_pctl(vals, q):.2f}')
+    lines += ["# HELP zt_http_server_errors_total 5xx responses", "# TYPE zt_http_server_errors_total counter"]
+    for key, n in sorted(API_STATS["errors"].items()):
+        method, route = key.split(" ", 1)
+        lines.append(f'zt_http_server_errors_total{{method="{method}",route="{route}"}} {n}')
+    lines += ["# TYPE zt_api_anomalies_total counter", f"zt_api_anomalies_total {len(API_STATS['anomalies'])}",
+              "# TYPE zt_gateway_check_ms gauge", f'zt_gateway_check_ms{{quantile="0.95"}} {_pctl(GATEWAY_CHECK_MS, .95):.2f}',
+              "# TYPE zt_transfer_decision_ms gauge",
+              f'zt_transfer_decision_ms{{quantile="0.95"}} {_pctl(TRANSFER_DECISION_MS, .95):.2f}',
+              "# TYPE zt_policy_version gauge", f"zt_policy_version {_POLICY['version']}",
+              "# TYPE zt_uptime_seconds gauge", f"zt_uptime_seconds {time.time() - API_STATS['started']:.0f}"]
+    crl = crl_info()
+    if "revoked" in crl:
+        lines += ["# TYPE zt_certificates_revoked gauge", f"zt_certificates_revoked {crl['revoked']}"]
+    return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+
+@app.get("/api/admin/api-security")
+async def admin_api_security(claims: dict = Depends(session)):
+    """API protection status: traffic, latency, errors, refused requests, anomalies and blocked clients."""
+    await require_admin_action("admin.dashboard", claims)
+    routes = {}
+    for (key, status), n in API_STATS["requests"].items():
+        r = routes.setdefault(key, {"route": key, "requests": 0, "2xx": 0, "4xx": 0, "5xx": 0})
+        r["requests"] += n
+        r[f"{str(status)[0]}xx"] = r.get(f"{str(status)[0]}xx", 0) + n
+    for key, r in routes.items():
+        vals = API_STATS["latency"].get(key, [])
+        r["p50_ms"], r["p95_ms"] = round(_pctl(vals, .5), 1), round(_pctl(vals, .95), 1)
+    blocked = []
+    try:
+        async for k in clients.redis().scan_iter(match="apiblock:*", count=200):
+            ttl = await clients.redis().ttl(k)
+            blocked.append({"client": k.split(":", 1)[1], "seconds_left": ttl})
+    except Exception:  # noqa: BLE001
+        pass
+    events = await get_json("audit", "/explore", params={"action": "api.", "limit": 100}) or {"rows": []}
+    return {"since": API_STATS["started"], "routes": sorted(routes.values(), key=lambda r: -r["requests"])[:60],
+            "anomalies": list(API_STATS["anomalies"])[-50:], "blocked_clients": blocked, "events": events["rows"],
+            "protections": {"max_request_kb": MAX_BODY // 1024, "rate_limit_per_min": RATE_LIMIT,
+                            "login_rate_limit_per_min": LOGIN_RATE_LIMIT, "cors_origins": sorted(CORS_ORIGINS),
+                            "anomaly_threshold_per_min": await _gw_setting("api_anomaly_threshold"),
+                            "block_minutes": await _gw_setting("api_block_minutes"),
+                            "token_uses_per_min": TOKEN_USES_PER_MIN, "json_only": True,
+                            "security_headers": sorted(SECURITY_HEADERS)}}
+
+
+@app.post("/api/admin/api-security/unblock")
+async def admin_api_unblock(body: dict, claims: dict = Depends(session)):
+    await require_admin_action("admin.dashboard", claims)
+    client = str(body.get("client", ""))[:200]
+    n = await clients.redis().delete(f"apiblock:{client}")
+    clients.audit(actor=claims["usr"], action="api.unblock", resource=client, decision="info")
+    return {"unblocked": bool(n)}
+
+
+# ---- real-time events over WebSocket
+from fastapi import WebSocket, WebSocketDisconnect  # noqa: E402
+
+
+@app.websocket("/api/ws/events")
+async def ws_events(ws: WebSocket):
+    """Live security feed. The first message must be {"token": ..., "device_id": ...}: the token is
+    never put in the URL, and the same checks as any API call apply (signature, device binding,
+    revocation, admin role via OPA). Re-checked every 30 s; the stream ends when the session does."""
+    await ws.accept()
+    try:
+        hello = await asyncio.wait_for(ws.receive_json(), timeout=10)
+    except Exception:  # noqa: BLE001
+        await ws.close(code=4401)
+        return
+    ua = ws.headers.get("user-agent", "")
+    r = clients.redis()
+
+    async def check() -> dict | None:
+        try:
+            claims = tokens.verify_access(str(hello.get("token", "")))
+        except HTTPException:
+            return None
+        if claims.get("dfp") != tokens.device_fingerprint(hello.get("device_id"), ua):
+            return None
+        if await r.exists(f"deny:jti:{claims['jti']}"):
+            return None
+        revoked_at = await r.get(f"revoked:{claims['sub']}")
+        if revoked_at and claims.get("iat_ms", claims["iat"] * 1000) <= int(revoked_at):
+            return None
+        reason, _ = await sessions.check(r, claims.get("sid"), claims["sub"], touch=False)
+        if reason:
+            return None
+        d = await clients.authorize({"subject": {"user": claims["usr"], "role": claims["role"],
+                                                 "mfa": claims.get("mfa", False)},
+                                     "action": "admin.dashboard", "resource": {}, "context": {"caller": "gateway"}})
+        return claims if d["allow"] else None
+
+    claims = await check()
+    if claims is None:
+        clients.audit(actor="anonymous", action="gateway.websocket", resource="/api/ws/events", decision="deny",
+                      reason="websocket_auth_failed", details={"ip": ws.client.host if ws.client else None})
+        await ws.close(code=4403)
+        return
+    clients.audit(actor=claims["usr"], action="gateway.websocket", resource="/api/ws/events", decision="allow",
+                  reason="live_feed_opened")
+    last_id, last_check = 0, time.time()
+    try:
+        first = await get_json("audit", "/events", params={"limit": 20}) or []
+        last_id = max([e["id"] for e in first] + [0])
+        await ws.send_json({"type": "hello", "user": claims["usr"], "events": list(reversed(first))})
+        while True:
+            await asyncio.sleep(2)
+            if time.time() - last_check > 30:
+                last_check = time.time()
+                if await check() is None:
+                    await ws.send_json({"type": "bye", "reason": "session ended"})
+                    await ws.close(code=4401)
+                    return
+            new = [e for e in (await get_json("audit", "/events", params={"limit": 50}) or []) if e["id"] > last_id]
+            if new:
+                last_id = max(e["id"] for e in new)
+                await ws.send_json({"type": "events", "events": list(reversed(new))})
+    except (WebSocketDisconnect, RuntimeError):
+        return
 
 
 @app.get("/healthz")

@@ -70,6 +70,7 @@ class Client:
             h["Authorization"] = f"Bearer {self.token}"
         if background:
             h["X-ZT-Background"] = "1"
+        h.update(kw.pop("headers", None) or {})
         return self.http.request(method, path, headers=h, **kw)
 
     def login(self, username: str, code: str | None = None):

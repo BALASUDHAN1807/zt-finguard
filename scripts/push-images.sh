@@ -35,6 +35,15 @@ for svc in "${SERVICES[@]}"; do
     --label org.opencontainers.image.source="https://hub.docker.com/r/${PREFIX%/*}" \
     -t "${PREFIX}${svc}:${TAG}" -t "${PREFIX}${svc}:${DATE_TAG}" \
     --push services/
+  # Cosign: sign the pushed image in the registry (by digest). Needs the cosign CLI; the key is the same
+  # ECDSA P-256 key the local deployment uses, so `cosign verify --key ${SECRETS_DIR:-secrets}/cosign.pub <image>` works.
+  if command -v cosign >/dev/null 2>&1 && [[ -f ${SECRETS_DIR:-secrets}/cosign.key ]]; then
+    digest=$(docker buildx imagetools inspect "${PREFIX}${svc}:${TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+    [[ -f ${SECRETS_DIR:-secrets}/cosign-import.key ]] || COSIGN_PASSWORD="" cosign import-key-pair --key ${SECRETS_DIR:-secrets}/cosign.key \
+      --output-key-prefix ${SECRETS_DIR:-secrets}/cosign-import >/dev/null
+    COSIGN_PASSWORD="" cosign sign --yes --key ${SECRETS_DIR:-secrets}/cosign-import.key "${PREFIX}${svc}@${digest}" \
+      && echo "    cosign signed ${PREFIX}${svc}@${digest}"
+  fi
 done
 
 cat <<EOF

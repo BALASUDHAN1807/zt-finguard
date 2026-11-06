@@ -41,6 +41,7 @@ from ztcommon import clients, config, db, mtls, sessions, tokens
 log = logging.getLogger("auth")
 
 PRIVATE_KEY = config.read_secret(config.env("JWT_PRIVATE_KEY_FILE", "/run/secrets/jwt_private"))
+KID = {"kid": tokens.key_id(tokens.public_key())}
 SEED_FILE = config.env("SEED_USERS_FILE", "/run/secrets/seed_users")
 REFRESH_TTL = 8 * 3600
 REVOKE_TTL = 24 * 3600
@@ -48,7 +49,8 @@ MAX_FAILURES = 5
 LOCK_MINUTES = 15
 # Admin module 11: administrators may tighten these (Redis hash zt:settings, written by the gateway).
 # Clamped again here so a bad value can only make sign-in stricter, never weaker.
-SETTING_BOUNDS = {"lockout_threshold": (3, 5, 5), "lockout_minutes": (15, 1440, 15),
+SETTING_BOUNDS = {"risky_session_idle_minutes": (1, 10, 10),
+                  "lockout_threshold": (3, 5, 5), "lockout_minutes": (15, 1440, 15),
                   "password_min_length": (10, 32, 10), "otp_ttl_seconds": (60, 300, 300),
                   "otp_max_tries": (1, 3, 3)}
 _settings_cache = {"at": 0.0, "v": {}}
@@ -184,7 +186,7 @@ def issue_access(user: dict, dfp: str, sid: str, amr: list[str] | None = None) -
         "mfa": True, "amr": amr or ["pwd", "otp"], "dfp": dfp, "sid": sid,
         "jti": uuid.uuid4().hex, "iat": now, "exp": now + tokens.ACCESS_TTL_SECONDS,
     }
-    return jwt.encode(claims, PRIVATE_KEY, algorithm="RS256"), claims
+    return jwt.encode(claims, PRIVATE_KEY, algorithm="RS256", headers=KID), claims
 
 
 async def issue_refresh(user: dict, dfp: str, family: str) -> str:
@@ -386,9 +388,16 @@ async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known
     await r.set(f"idle:{user['id']}", user["idle_timeout_minutes"], ex=sessions.SESSION_TTL)
     access, claims = issue_access(user, dfp, sid, amr)
     others = [x for x in await sessions.active(r, str(user["id"])) if x.get("dfp") != dfp]
+    # session risk: sign-in risk + device trust. Risky sessions get a shorter inactivity timeout.
+    session_risk = round(min(1.0, float(risk["score"]) + (0.3 if device["status"] != "trusted" else 0)
+                             + (0.1 if device.get("new") else 0)), 2)
+    risky = risk["level"] == "medium" or device["status"] != "trusted"
     await sessions.start(r, sid, {"sub": user["id"], "user": user["username"], "role": user["role"],
                                   "dfp": dfp, "device": device["label"], "device_status": device["status"],
-                                  "ip": ctx.ip, "method": method, "jti": claims["jti"]})
+                                  "ip": ctx.ip, "method": method, "jti": claims["jti"],
+                                  "session_risk": session_risk, "risky": int(risky)})
+    if risky:
+        await r.set(f"sesscap:{sid}", await setting("risky_session_idle_minutes"), ex=sessions.SESSION_TTL)
     if others:
         clients.audit(actor=actor, action="session.concurrent", resource="session", decision="info",
                       reason="concurrent_sessions",
@@ -700,7 +709,7 @@ async def step_up(body: StepUpIn):
         "iss": tokens.ISSUER, "aud": tokens.STEPUP_AUDIENCE, "typ": "stepup",
         "sub": body.sub, "txn": tokens.txn_binding(body.sub, body.to_account, body.amount),
         "jti": uuid.uuid4().hex, "iat": now, "exp": now + tokens.STEPUP_TTL_SECONDS,
-    }, PRIVATE_KEY, algorithm="RS256")
+    }, PRIVATE_KEY, algorithm="RS256", headers=KID)
     clients.audit(actor=user["username"], action="auth.step_up", resource=body.to_account,
                   decision="allow", reason="totp_reverified", details={"amount": body.amount})
     return {"step_up_token": token, "expires_in": tokens.STEPUP_TTL_SECONDS}
@@ -968,7 +977,44 @@ def device_view(row: dict, current_dfp: str) -> dict:
     out |= device_parts(row.get("user_agent") or row["label"])
     out["fingerprint"] = row["fingerprint"][:12]
     out["unfamiliar"] = row["status"] == "pending"
+    out |= device_trust_score(row, out)
     return out
+
+
+def device_trust_score(row: dict, parts: dict) -> dict:
+    """0-100 device trust score with the reasons (device security status assessment)."""
+    if row["status"] == "revoked":
+        return {"trust_score": 0, "trust_level": "blocked", "assessment": ["revoked by the owner or the bank"]}
+    now = datetime.now(timezone.utc)
+    score, notes = 0, []
+    if row["status"] == "trusted":
+        score += 50
+        notes.append("verified: " + (row.get("verified_by") or "trusted"))
+    else:
+        score += 15
+        notes.append("not yet approved from a trusted device")
+    age = (now - row["first_seen"]).days
+    score += min(15, age // 2)
+    notes.append(f"known for {age} day(s)")
+    if row.get("first_ip") and row.get("first_ip") == row.get("last_ip"):
+        score += 10
+        notes.append("always the same network")
+    else:
+        score += 3
+        notes.append("network changed since first use")
+    if (now - row["last_seen"]).days <= 30:
+        score += 10
+        notes.append("active in the last 30 days")
+    else:
+        notes.append("not used for over 30 days")
+    if parts.get("os") not in (None, "Unknown"):
+        score += 10
+        notes.append(f"recognised {parts['type'].lower()} ({parts['os']}, {parts['browser']})")
+    else:
+        notes.append("unrecognised client software")
+    score = min(100, score)
+    return {"trust_score": score, "trust_level": "high" if score >= 75 else "medium" if score >= 50 else "low",
+            "assessment": notes}
 
 
 async def current_device(claims: dict) -> dict | None:
@@ -1611,7 +1657,9 @@ async def my_sessions(authorization: str | None = Header(None)):
     for x in live:
         out.append({"sid": x["sid"], "device": x.get("device"), "ip": x.get("ip"), "method": x.get("method"),
                     "started_ms": x.get("started_ms"), "idle_seconds": x.get("idle_seconds"),
-                    "current": x["sid"] == claims.get("sid"), "device_status": x.get("device_status")})
+                    "current": x["sid"] == claims.get("sid"), "device_status": x.get("device_status"),
+                    "session_risk": float(x.get("session_risk") or 0), "risky": x.get("risky") == "1",
+                    "ip_changed": x.get("ip_changed"), "timeout_minutes": x.get("timeout_minutes")})
     return {"sessions": out}
 
 

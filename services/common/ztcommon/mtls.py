@@ -14,8 +14,12 @@ Client side
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import ssl
+import threading
+import time
 from typing import Iterable
 
 import httpx
@@ -85,6 +89,65 @@ def require_caller(*allowed: str):
     return dependency
 
 
+# ------------------------------------------------------------ revocation (CRL)
+# certs/crl.pem (signed by the internal CA, scripts/revoke-cert.sh) is mounted at /run/secrets/crl.
+# Every TLS context we create checks the leaf certificate against it, and a background thread
+# loads a newer CRL into all contexts within 30 s - no restart needed after a revocation.
+CRL_FILE = os.environ.get("TLS_CRL_FILE", "/run/secrets/crl")
+_contexts: list[ssl.SSLContext] = []
+_crl_state = {"digest": None, "loaded_at": None, "revoked": None}
+_log = logging.getLogger("ztcommon.mtls")
+
+
+def _crl_digest() -> str | None:
+    try:
+        with open(CRL_FILE, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def enable_crl(ctx: ssl.SSLContext) -> ssl.SSLContext:
+    """Check peers against the CRL (only when one is deployed: a missing CRL must not break TLS)."""
+    if _crl_digest() is None:
+        return ctx
+    ctx.load_verify_locations(cafile=CRL_FILE)
+    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    _contexts.append(ctx)
+    _start_crl_watch()
+    return ctx
+
+
+def _crl_watch() -> None:
+    while True:
+        time.sleep(30)
+        digest = _crl_digest()
+        if digest and digest != _crl_state["digest"]:
+            for ctx in list(_contexts):
+                try:
+                    ctx.load_verify_locations(cafile=CRL_FILE)    # newest CRL wins in the OpenSSL store
+                except ssl.SSLError as exc:
+                    _log.warning("CRL reload failed: %s", exc)
+            _crl_state.update(digest=digest, loaded_at=time.time())
+            _log.warning("certificate revocation list reloaded (%s)", digest[:12])
+
+
+_watch_started = threading.Event()
+
+
+def _start_crl_watch() -> None:
+    if not _watch_started.is_set():
+        _watch_started.set()
+        _crl_state["digest"] = _crl_digest()
+        _crl_state["loaded_at"] = time.time()
+        threading.Thread(target=_crl_watch, name="crl-watch", daemon=True).start()
+
+
+def crl_status() -> dict:
+    return {"enabled": bool(_contexts), "crl_sha256": (_crl_state["digest"] or "")[:16] or None,
+            "loaded_at": _crl_state["loaded_at"]}
+
+
 def serve(app, *, require_client_cert: bool = True, port: int | None = None) -> None:
     """Run a FastAPI app over TLS 1.3 (+ mandatory client certs by default)."""
     cfg = uvicorn.Config(
@@ -102,8 +165,30 @@ def serve(app, *, require_client_cert: bool = True, port: int | None = None) -> 
         log_level="info",
         access_log=False,
     )
+    async def _record_secret_access() -> None:
+        # secret access record: which mounted secrets this workload can read (names only, never values)
+        try:
+            names = sorted(os.listdir("/run/secrets"))
+        except OSError:
+            names = []
+        if names and os.environ.get("SERVICE_NAME") != "audit":
+            from . import clients
+            clients.audit(actor=os.environ.get("SERVICE_NAME", "unknown"), action="secret.access",
+                          resource="/run/secrets", decision="info", reason="service_started",
+                          details={"secrets": names, "env_secrets": False})
+    from contextlib import asynccontextmanager
+    original = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def _lifespan(a):
+        async with original(a) as state:
+            await _record_secret_access()
+            yield state
+    app.router.lifespan_context = _lifespan
     cfg.load()
     cfg.ssl.minimum_version = ssl.TLSVersion.TLSv1_3
+    if require_client_cert:
+        enable_crl(cfg.ssl)
     uvicorn.Server(cfg).run()
 
 
@@ -111,7 +196,7 @@ def client_ssl_context(cert: str | None = None, key: str | None = None) -> ssl.S
     ctx = ssl.create_default_context(cafile=config.CA_FILE)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.load_cert_chain(cert or config.CERT_FILE, key or config.KEY_FILE)
-    return ctx
+    return enable_crl(ctx)
 
 
 _client: httpx.AsyncClient | None = None

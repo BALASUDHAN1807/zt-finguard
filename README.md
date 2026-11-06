@@ -25,6 +25,7 @@ Runs unchanged on **Docker** or **rootless Podman**.
 | **Customer-controlled session timeout** | customer picks the inactivity timeout, admin sets the maximum, gateway expires idle sessions; re-sign-in required (auto-refresh never counts as activity) |
 | **Automatic container quarantine** | Falco alert ≥ Critical → `responder` disconnects the container from every network, alerts the admin; one-click release |
 | **Device trust verification** | first device trusted; new devices are *pending* (view only, no transfers) until approved from a trusted device + TOTP; revoke ends sessions |
+| **Backend security hardening** | cosign-format image signing + deployment gate + automatic quarantine of unsigned / modified images, CycloneDX SBOM, certificate revocation (CRL), forensic evidence on quarantine, API protection (size / CSRF / CORS / XSS, anomaly blocking), JWT replay detection, device trust score, adaptive sessions, secret rotation, WebSocket live feed, Prometheus metrics - item-by-item map in [docs/security-coverage.md](docs/security-coverage.md) |
 | **Teller portal** | 12 pages: counter deposits / withdrawals / transfers only after the customer proves identity (SMS code + authenticator), dual-control approvals (maker-checker, 2 approvers from ₹1 lakh), customer 360 with masked data, AI risk view, branch reports ([docs/teller-portal.md](docs/teller-portal.md)) |
 | **Customer portal** | 11 pages: dashboard, accounts and statements, transfers with Indian payment methods and charges, history, devices, security center, fraud alerts with reasons, notifications, self-protection (freeze / lockdown / three-factor recovery), profile, support tickets ([docs/customer-portal.md](docs/customer-portal.md)) |
 | **Admin security dashboard** | 11 modules: overview, identity & devices, banking operations (maker-checker), AI fraud intelligence, container security, threat center, incident response, network map, restrict-only policy editor, audit & compliance, security settings ([docs/admin-dashboard.md](docs/admin-dashboard.md)) |
@@ -127,7 +128,11 @@ through the same checks as any API call.
 
 ```bash
 make opa-test     # 40 policy unit tests
-make test         # 68 end-to-end tests (49 core + 7 customer + 5 teller portal + 7 container tests; stack must be running)
+make test         # 78 end-to-end tests (49 core + 7 customer + 5 teller + 8 hardening + 9 container tests)
+make sbom         # CycloneDX SBOM per image (also on every deploy)
+make guard        # supply-chain deployment gate (signatures + vulnerability policy)
+make revoke-cert CERT=<service>     make rotate-secrets SECRET=jwt|redis|metrics|signing|all
+make monitoring   # optional Prometheus scraping the gateway's /metrics
 make scan         # Trivy; fails on CRITICAL vulnerabilities or leaked secrets
 ```
 

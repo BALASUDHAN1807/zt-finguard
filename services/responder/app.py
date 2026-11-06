@@ -45,6 +45,10 @@ MIN_PRIORITY = os.environ.get("QUARANTINE_MIN_PRIORITY", "Critical")
 PAUSE = os.environ.get("QUARANTINE_PAUSE", "0") == "1"
 WEBHOOK = os.environ.get("ALERT_WEBHOOK_URL", "")
 NEVER_QUARANTINE = {"responder", "falco"}
+COSIGN_PUB = os.environ.get("COSIGN_PUB", "/run/secrets/cosign_pub")
+FORENSICS_DIR = os.environ.get("FORENSICS_DIR", "/state/forensics")
+# enforce: a running container whose image is not the signed digest is quarantined automatically
+IMAGE_POLICY = os.environ.get("IMAGE_POLICY", "enforce")
 
 # Falco priorities, lowest -> highest
 PRIORITIES = ["debug", "informational", "notice", "warning", "error", "critical", "alert", "emergency"]
@@ -125,6 +129,7 @@ async def quarantine(service_or_id: dict, reason: str, actor: str, trigger: dict
         return {"service": service, "already_quarantined": True, **state[service]}
 
     inspect = (await engine_call("GET", f"/containers/{c['Id']}/json")).json()
+    evidence = await preserve_evidence(c, service, inspect, reason)
     networks = {
         name: {"aliases": [a for a in (cfg.get("Aliases") or []) if a != c["Id"][:12]]}
         for name, cfg in (inspect.get("NetworkSettings", {}).get("Networks") or {}).items()
@@ -138,13 +143,14 @@ async def quarantine(service_or_id: dict, reason: str, actor: str, trigger: dict
         "container_id": c["Id"][:12], "container": inspect.get("Name", "").lstrip("/"),
         "networks": networks, "reason": reason, "actor": actor, "paused": PAUSE,
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "trigger": trigger or {},
+        "evidence": evidence,
     }
     state[service] = record
     save_state(state)
     msg = f"ZT-FinGuard: container '{service}' QUARANTINED ({reason}) - isolated from {len(networks)} networks"
     clients.audit(actor=actor, action="container.quarantine", resource=service, decision="alert",
                   reason=reason[:200], details={"networks": list(networks), "paused": PAUSE,
-                                                "trigger": trigger or {}})
+                                                "trigger": trigger or {}, "evidence": evidence})
     await notify(msg, record)
     log.warning(msg)
     return {"service": service, **record}
@@ -173,7 +179,9 @@ async def release(service: str, actor: str) -> dict:
 async def lifespan(_app):
     if not os.path.exists(SOCKET):
         log.warning("container API socket %s not mounted - quarantine actions will fail", SOCKET)
+    watcher = asyncio.create_task(_image_watch())
     yield
+    watcher.cancel()
 
 
 app = FastAPI(title="ZT-FinGuard responder", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -253,6 +261,8 @@ def signed_manifest() -> tuple[dict | None, str]:
         doc = json.load(open(os.path.join(REPORTS_DIR, "image-manifest.json"), encoding="utf-8"))
     except (OSError, ValueError):
         return None, "no signed manifest (deploy.sh signs one on every deployment)"
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
     try:
         key = load_pem_public_key(open(SIGNING_PUB, "rb").read())
         key.verify(base64.b64decode(doc["signature"]), doc["payload"].encode())
@@ -260,7 +270,18 @@ def signed_manifest() -> tuple[dict | None, str]:
         return None, "manifest signature INVALID - the manifest was modified"
     except (OSError, KeyError, ValueError) as exc:
         return None, f"cannot verify manifest ({exc.__class__.__name__})"
-    return json.loads(doc["payload"]), "valid Ed25519 signature"
+    status = "valid Ed25519 signature"
+    if doc.get("cosign_signature"):
+        # cosign sign-blob format: base64 DER ECDSA P-256 over SHA-256 of the payload
+        try:
+            ck = load_pem_public_key(open(COSIGN_PUB, "rb").read())
+            ck.verify(base64.b64decode(doc["cosign_signature"]), doc["payload"].encode(), ec.ECDSA(hashes.SHA256()))
+        except InvalidSignature:
+            return None, "cosign signature INVALID - the manifest was modified"
+        except (OSError, ValueError) as exc:
+            return None, f"cannot verify cosign signature ({exc.__class__.__name__})"
+        status = "valid Ed25519 + cosign (ECDSA P-256) signatures"
+    return json.loads(doc["payload"]), status
 
 
 def parse_engine_time(value: str | None) -> float | None:
@@ -455,6 +476,167 @@ async def recover(service: str, body: ActorIn, _c: str = Depends(mtls.require_ca
                   decision="info" if ok else "alert", reason=body.reason or ("recovered" if ok else "recovery_failed"),
                   details={"steps": steps})
     return {"service": service, "recovered": ok, "steps": steps}
+
+
+# ------------------------------------------------------------ forensic evidence
+def _demux(raw: bytes) -> str:
+    """Docker log stream without a TTY: 8-byte frame headers (stream, size) before each chunk."""
+    out, i = [], 0
+    while i + 8 <= len(raw):
+        size = int.from_bytes(raw[i + 4:i + 8], "big")
+        out.append(raw[i + 8:i + 8 + size])
+        i += 8 + size
+    return b"".join(out).decode("utf-8", "replace") if out else raw.decode("utf-8", "replace")
+
+
+async def preserve_evidence(c: dict, service: str, inspect: dict, reason: str) -> dict:
+    """Before isolating a container, snapshot what an investigator needs (it keeps running too):
+    configuration, processes, network attachments, resource usage and the last log lines.
+    The bundle is written once (append-only directory) with its SHA-256 recorded in the audit chain."""
+    import hashlib
+    bundle = {"service": service, "container_id": c["Id"], "collected_at": datetime.now(timezone.utc).isoformat(),
+              "reason": reason, "image": inspect.get("Image"), "config": {
+                  "user": (inspect.get("Config") or {}).get("User"), "cmd": (inspect.get("Config") or {}).get("Cmd"),
+                  "host_config": {k: (inspect.get("HostConfig") or {}).get(k) for k in (
+                      "ReadonlyRootfs", "CapDrop", "CapAdd", "SecurityOpt", "Privileged", "Memory", "PidsLimit")}},
+              "networks": {n: {"ip": v.get("IPAddress"), "aliases": v.get("Aliases")}
+                           for n, v in ((inspect.get("NetworkSettings") or {}).get("Networks") or {}).items()},
+              "state": inspect.get("State")}
+    try:
+        bundle["processes"] = (await engine_call("GET", f"/containers/{c['Id']}/top", params={"ps_args": "-ef"})).json()
+    except HTTPException as exc:
+        bundle["processes"] = {"error": str(exc.detail)}
+    try:
+        bundle["stats"] = (await engine_call("GET", f"/containers/{c['Id']}/stats", params={"stream": "false"})).json()
+    except HTTPException as exc:
+        bundle["stats"] = {"error": str(exc.detail)}
+    try:
+        logs = await engine_call("GET", f"/containers/{c['Id']}/logs",
+                                 params={"stdout": "1", "stderr": "1", "tail": "500", "timestamps": "1"})
+        bundle["logs_tail"] = _demux(logs.content)[-200_000:]
+    except HTTPException as exc:
+        bundle["logs_tail"] = f"unavailable: {exc.detail}"
+    body = json.dumps(bundle, indent=1, default=str).encode()
+    digest = hashlib.sha256(body).hexdigest()
+    name = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{service}-{digest[:12]}.json"
+    try:
+        os.makedirs(FORENSICS_DIR, exist_ok=True)
+        with open(os.path.join(FORENSICS_DIR, name), "xb") as fh:
+            fh.write(body)
+        os.chmod(os.path.join(FORENSICS_DIR, name), 0o440)
+    except OSError as exc:
+        log.warning("could not store evidence: %s", exc)
+        return {"stored": False, "sha256": digest}
+    clients.audit(actor="responder", action="container.forensics", resource=service, decision="info",
+                  reason="evidence_preserved", details={"file": name, "sha256": digest, "bytes": len(body)})
+    return {"stored": True, "file": name, "sha256": digest, "bytes": len(body)}
+
+
+@app.get("/forensics")
+async def list_forensics(_c: str = Depends(mtls.require_caller("gateway"))):
+    import hashlib
+    out = []
+    try:
+        names = sorted(os.listdir(FORENSICS_DIR), reverse=True)
+    except OSError:
+        names = []
+    for n in names[:200]:
+        p = os.path.join(FORENSICS_DIR, n)
+        data = open(p, "rb").read()
+        out.append({"file": n, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                    "service": n.split("-")[1] if n.count("-") >= 2 else "?",
+                    "collected_at": datetime.fromtimestamp(os.path.getmtime(p), timezone.utc).isoformat()})
+    return out
+
+
+@app.get("/forensics/{name}")
+async def get_forensics(name: str, _c: str = Depends(mtls.require_caller("gateway"))):
+    import re
+    if not re.fullmatch(r"[0-9TZ]+-[a-z0-9_-]+-[0-9a-f]{12}\.json", name):
+        raise HTTPException(400, "bad name")
+    try:
+        return json.load(open(os.path.join(FORENSICS_DIR, name), encoding="utf-8"))
+    except OSError:
+        raise HTTPException(404, "not found")
+
+
+# ------------------------------------------------------------ supply chain at runtime
+_mismatch_seen: dict[str, int] = {}
+
+
+async def enforce_signed_images() -> list[dict]:
+    """A container running an image that is not the signed digest is modified or unsigned:
+    quarantine it (policy 'enforce') or just alert ('warn'). Only acts on a manifest whose
+    signatures verify, and only after two consecutive checks (no race with a redeploy)."""
+    manifest, status = signed_manifest()
+    if manifest is None:
+        return []
+    signed = manifest.get("images", {})
+    actions = []
+    state = load_state()
+    for c in await project_containers():
+        svc = (c.get("Labels") or {}).get("com.docker.compose.service")
+        if not svc or svc in NEVER_QUARANTINE or svc in state or c.get("State") != "running":
+            continue
+        want = (signed.get(svc) or {}).get("id")
+        if want is None or c.get("ImageID") == want:
+            _mismatch_seen.pop(svc, None)
+            continue
+        _mismatch_seen[svc] = _mismatch_seen.get(svc, 0) + 1
+        if _mismatch_seen[svc] < 2:
+            continue
+        reason = f"image {(c.get('ImageID') or '?')[7:19]} is not the signed digest {want[7:19]} (unsigned or modified image)"
+        clients.audit(actor="responder", action="runtime.image_mismatch", resource=svc, decision="alert",
+                      reason="image_digest_mismatch", details={"running": c.get("ImageID"), "signed": want,
+                                                               "policy": IMAGE_POLICY})
+        if IMAGE_POLICY == "enforce":
+            try:
+                actions.append(await quarantine({"service": svc}, reason, "image-policy",
+                                                {"rule": "unsigned or modified image", "priority": "Critical"}))
+            except HTTPException as exc:
+                log.warning("could not quarantine %s: %s", svc, exc.detail)
+        _mismatch_seen.pop(svc, None)
+    return actions
+
+
+async def _image_watch() -> None:
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await enforce_signed_images()
+        except Exception as exc:  # noqa: BLE001 - keep watching
+            log.warning("image policy check failed: %s", exc)
+
+
+@app.get("/supply-chain")
+async def supply_chain(_c: str = Depends(mtls.require_caller("gateway"))):
+    manifest, status = signed_manifest()
+    hist = []
+    try:
+        hist = [json.loads(x) for x in open(os.path.join(REPORTS_DIR, "image-history.jsonl"), encoding="utf-8")
+                if x.strip()][-100:]
+    except OSError:
+        pass
+    sbom = None
+    try:
+        sbom = json.load(open(os.path.join(REPORTS_DIR, "sbom-summary.json"), encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    return {"manifest_status": status, "signed_at": (manifest or {}).get("signed_at"), "image_policy": IMAGE_POLICY,
+            "deploy_history": list(reversed(hist)), "sbom": sbom,
+            "verify_command": "cosign verify-blob --key secrets/cosign.pub --signature reports/image-manifest.sig "
+                              "reports/image-manifest.payload.json"}
+
+
+@app.get("/sbom/{service}")
+async def sbom_file(service: str, _c: str = Depends(mtls.require_caller("gateway"))):
+    import re
+    if not re.fullmatch(r"[a-z]{2,20}", service):
+        raise HTTPException(400, "bad service")
+    try:
+        return json.load(open(os.path.join(REPORTS_DIR, "sbom", f"{service}.cdx.json"), encoding="utf-8"))
+    except (OSError, ValueError):
+        raise HTTPException(404, "no SBOM - run make sbom")
 
 
 @app.get("/healthz")

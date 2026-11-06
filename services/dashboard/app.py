@@ -11,6 +11,7 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
 import ssl
@@ -25,6 +26,11 @@ import streamlit as st
 GATEWAY = os.environ.get("GATEWAY_URL", "https://gateway:8443")
 CA_FILE = os.environ.get("TLS_CA_FILE", "/run/secrets/ca_crt")
 INR = "₹"
+
+
+def esc(v) -> str:
+    """HTML-escape user-controlled text before it goes into unsafe_allow_html markup (XSS)."""
+    return html.escape("" if v is None else str(v))
 
 st.set_page_config(page_title="ZT-FinGuard", page_icon="🛡️", layout="wide")
 
@@ -288,7 +294,7 @@ def pill(decision: str) -> str:
 
 def show_reasons(risk: dict) -> None:
     for r in risk.get("reasons", []):
-        st.markdown(f"- {r['text']} <span class='zt-muted'>(+{r['weight']:.2f})</span>", unsafe_allow_html=True)
+        st.markdown(f"- {esc(r['text'])} <span class='zt-muted'>(+{r['weight']:.2f})</span>", unsafe_allow_html=True)
     if not risk.get("reasons"):
         st.caption("No risk factors found.")
 
@@ -471,7 +477,7 @@ def sidebar() -> str:
         info = me.json() if me is not None and me.status_code == 200 else {}
         trust = info.get("device_trust", "pending")
         icon = {"trusted": "Trusted device", "pending": "Device waiting for approval"}.get(trust, trust)
-        st.markdown(f'<div class="zt-who"><b>{ss.user}</b><span>{ss.role.title()} account</span>'
+        st.markdown(f'<div class="zt-who"><b>{esc(ss.user)}</b><span>{ss.role.title()} account</span>'
                     f'<span>Verified sign-in, {icon.lower()}</span></div>', unsafe_allow_html=True)
         if ss.role == "customer" and trust != "trusted":
             st.info("New device: you can view your account, but transfers stay blocked until you approve "
@@ -492,7 +498,7 @@ def sidebar() -> str:
                        "Teller profile & settings"],
             "operations": ["Banking & transactions", "Transaction approvals", "Security settings"],
             "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Container security",
-                      "Threat center", "Incident response", "Network visualization", "Policy management",
+                      "Threat center", "Incident response", "Network visualization", "API security", "Policy management",
                       "Audit & compliance", "Access decisions", "Session & device policy",
                       "Security settings"],
         }[ss.role]
@@ -700,7 +706,7 @@ def notifications(alerts: list[dict]) -> None:
         if not alerts:
             st.write("Nothing critical or high in the last 24 hours.")
         for a in alerts[:12]:
-            st.markdown(f"{pill(a['severity'])} **{a['action']}** by {a['actor']}  \n"
+            st.markdown(f"{pill(a['severity'])} **{esc(a['action'])}** by {esc(a['actor'])}  \n"
                         f"<span class='zt-muted'>{a['reason'] or '-'} · {local_time(pd.Series([a['ts']])).iloc[0]}</span>",
                         unsafe_allow_html=True)
 
@@ -1087,6 +1093,13 @@ def keys_and_certs(d: dict) -> None:
                                 "handshake": "ok" if v["reachable"] else "FAILED"} for s, v in svc.items()]),
                  hide_index=True, use_container_width=True)
     st.code(f"CA        sha256 {ca.get('sha256', '?')}\nJWT key   sha256 {k['jwt_signing_key_sha256']}")
+    crl = k.get("crl") or {}
+    st.markdown(f"**Certificate revocation list:** {crl.get('revoked', '?')} revoked certificate(s), next update "
+                f"{when(crl.get('next_update'))}, enforced by this service: {crl.get('enabled')}. "
+                "Revoke with `make revoke-cert CERT=<service>` - every Python service refuses the revoked "
+                "certificate within 30 s.")
+    if crl.get("serials"):
+        st.caption("Revoked serials: " + ", ".join(crl["serials"]))
     st.markdown("**Rotation**: `make rotate-certs` issues new service certificates from the CA and recreates "
                 "the containers. JWT signing key: delete `secrets/jwt_private.pem`, run `make secrets` and redeploy "
                 "(everyone signs in again). Private keys never leave `/run/secrets` inside the containers.")
@@ -1599,7 +1612,7 @@ def beneficiaries_panel() -> list[dict]:
     with st.expander(f"Saved payees ({len(bens)})"):
         for bn in bens:
             c1, c2 = st.columns([4, 1])
-            c1.markdown(f"**{bn['nickname']}**  \n<span class='zt-muted'>{bn['account_no']}</span>",
+            c1.markdown(f"**{esc(bn['nickname'])}**  \n<span class='zt-muted'>{bn['account_no']}</span>",
                         unsafe_allow_html=True)
             if c2.button("Remove", key=f"rmb{bn['id']}"):
                 api("DELETE", f"/api/beneficiaries/{bn['id']}")
@@ -1799,8 +1812,8 @@ def ops_pending() -> None:
     for x in rows:
         with st.container(border=True):
             c = st.columns([3, 2])
-            c[0].markdown(f"**#{x['id']} {money(x['amount'])}** from **{x['from_name']}** ({x['from_account']}) "
-                          f"to **{x['to_name']}** ({x['to_account']})  \n"
+            c[0].markdown(f"**#{x['id']} {money(x['amount'])}** from **{esc(x['from_name'])}** ({x['from_account']}) "
+                          f"to **{esc(x['to_name'])}** ({x['to_account']})  \n"
                           f"<span class='zt-muted'>requested {local_time(pd.Series([x['created_at']]), '%d %b %H:%M').iloc[0]}"
                           f", fraud risk {x['risk_score'] or 0:.2f}</span>", unsafe_allow_html=True)
             note = c[1].text_input("Note", key=f"note{x['id']}", placeholder="e.g. called customer, confirmed")
@@ -2116,7 +2129,11 @@ def container_security() -> None:
     k[5].metric("Engine mode", "rootless" if eng["rootless"] else "rootful",
                 help="Rootless engines map container root to an unprivileged host user (user namespaces)")
     t = st.tabs(["Containers", "Isolation & hardening", "Images & vulnerabilities", "Processes & network",
-                 "Actions & history"])
+                 "Actions & history", "Supply chain & SBOM", "Forensic evidence"])
+    with t[5]:
+        supply_chain_tab()
+    with t[6]:
+        forensics_tab()
     with t[0]:
         cont_overview(cs)
     with t[1]:
@@ -2418,9 +2435,9 @@ def cp_dashboard() -> None:
         quick_transfer(o)
         st.subheader("Latest notifications")
         for n in nt["items"][:4]:
-            st.markdown(f"{SEV_ICON.get(n['severity'], '')} **{n['title']}** "
+            st.markdown(f"{SEV_ICON.get(n['severity'], '')} **{esc(n['title'])}** "
                         f"<span class='zt-muted'>{when(n['ts'], '%d %b %H:%M')}</span><br>"
-                        f"<span class='zt-muted'>{n['body']}</span>", unsafe_allow_html=True)
+                        f"<span class='zt-muted'>{esc(n['body'])}</span>", unsafe_allow_html=True)
         if o["top_payees"]:
             st.subheader("Where your money went (90 days)")
             tp = pd.DataFrame(o["top_payees"])
@@ -2800,8 +2817,13 @@ def cp_devices() -> None:
         "": icons.get(x["status"], ""), "name": x["label"] + ("  (this device)" if x["current"] else ""),
         "type": x["type"], "operating system": x["os"], "browser": x["browser"], "status": x["status"],
         "last active": when(x["last_seen"]), "last sign-in IP": x["last_ip"], "first seen": when(x["first_seen"]),
-        "approved": x["verified_by"] or "-", "id": x["id"]} for x in devices]), hide_index=True,
+        "approved": x["verified_by"] or "-", "trust score": x.get("trust_score"), "trust": x.get("trust_level"),
+        "id": x["id"]} for x in devices]), hide_index=True,
         use_container_width=True)
+    with st.expander("Device security assessment"):
+        for x in devices:
+            st.markdown(f"**{esc(x['label'])}** · score {x.get('trust_score', '-')} ({x.get('trust_level', '-')}): "
+                        + "; ".join(esc(a) for a in x.get("assessment", [])), unsafe_allow_html=True)
     st.caption("A device is registered automatically the first time you sign in on it. Your first device is "
                "trusted; every later one stays pending - it can view but not move money - until you approve it here "
                "from a trusted device with a fresh authenticator code (extra verification for new devices).")
@@ -3002,7 +3024,12 @@ def sessions_panel(sessions_list: list[dict]) -> None:
         .dt.tz_convert("Asia/Kolkata").dt.strftime("%d %b %H:%M")
     df["idle"] = df["idle_seconds"].apply(lambda s: f"{int(s) // 60} min")
     df["this session"] = df["current"].map({True: "yes", False: ""})
-    st.dataframe(df[["device", "ip", "method", "started", "idle", "device_status", "this session"]],
+    for col in ("session_risk", "risky", "ip_changed", "timeout_minutes"):
+        if col not in df:
+            df[col] = None
+    df["risky"] = df["risky"].map({True: "yes (shorter timeout)", False: ""})
+    st.dataframe(df[["device", "ip", "method", "started", "idle", "timeout_minutes", "device_status", "session_risk",
+                     "risky", "ip_changed", "this session"]],
                  hide_index=True, use_container_width=True)
     others = [x for x in sessions_list if not x["current"]]
     c = st.columns(2)
@@ -3063,7 +3090,7 @@ def cp_fraud() -> None:
             if x["decision"] == "alert":
                 kind = "High-value transfer held for approval"
             with st.container(border=True):
-                st.markdown(f"{pill(x['decision'])} **{kind}** · {money(x['amount'] or 0)} to {x['to']} "
+                st.markdown(f"{pill(x['decision'])} **{kind}** · {money(x['amount'] or 0)} to {esc(x['to'])} "
                             f"<span class='zt-muted'>{when(x['ts'])} · risk {x['risk'] or 0:.2f}</span>",
                             unsafe_allow_html=True)
                 why = [r for r in x["reasons"] if r] + [p.replace("_", " ") for p in x["policy"]
@@ -3155,10 +3182,10 @@ def cp_notifications() -> None:
         for i in sel[:80]:
             with st.container(border=True):
                 cols = st.columns([6, 1])
-                cols[0].markdown(f"{SEV_ICON.get(i['severity'], '')} {'**' if not i['read'] else ''}{i['title']}"
+                cols[0].markdown(f"{SEV_ICON.get(i['severity'], '')} {'**' if not i['read'] else ''}{esc(i['title'])}"
                                  f"{'**' if not i['read'] else ''} <span class='zt-muted'>· "
                                  f"{CAT_LABEL.get(i['category'], i['category'])} · {when(i['ts'])} · "
-                                 f"{', '.join(i['channels'])}</span><br>{i['body']}", unsafe_allow_html=True)
+                                 f"{', '.join(i['channels'])}</span><br>{esc(i['body'])}", unsafe_allow_html=True)
                 if not i["read"] and cols[1].button("Read", key=f"rd_{i['id']}"):
                     api("POST", "/api/me/notifications/read", json={"ids": [i["id"]]})
                     st.rerun()
@@ -3168,15 +3195,15 @@ def cp_notifications() -> None:
         with c[0]:
             st.markdown("**SMS**")
             for m in sorted(ib["sms"], key=lambda x: x["at"], reverse=True)[:20]:
-                st.markdown(f"<div class='zt-card'><span class='zt-muted'>{when(m['at'])}</span><br>{m['text']}</div>",
+                st.markdown(f"<div class='zt-card'><span class='zt-muted'>{when(m['at'])}</span><br>{esc(m['text'])}</div>",
                             unsafe_allow_html=True)
         with c[1]:
             st.markdown("**E-mail**")
             if not ib["email"]:
                 st.caption("Add and verify an e-mail address in My profile to receive e-mail alerts.")
             for m in ib["email"][:20]:
-                st.markdown(f"<div class='zt-card'><span class='zt-muted'>{when(m['at'])} · {m['from']}</span><br>"
-                            f"<b>{m['subject']}</b><br>{m['text']}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='zt-card'><span class='zt-muted'>{when(m['at'])} · {esc(m['from'])}</span><br>"
+                            f"<b>{esc(m['subject'])}</b><br>{esc(m['text'])}</div>", unsafe_allow_html=True)
         st.caption("Demonstration: real SMS / e-mail need an outside provider, which the internal network "
                    "deliberately cannot reach, so delivery is simulated here.")
     with t[2]:
@@ -3415,7 +3442,7 @@ def cp_support() -> None:
                 for rsp in tk["responses"]:
                     who = "Bank" if rsp["role"] == "operations" else "You"
                     st.markdown(f"<div class='zt-card'><b>{who}</b> <span class='zt-muted'>{when(rsp['at'])}</span>"
-                                f"<br>{rsp['message']}</div>", unsafe_allow_html=True)
+                                f"<br>{esc(rsp['message'])}</div>", unsafe_allow_html=True)
                 if tk["status"] != "closed":
                     with st.form(f"tk_reply_{tk['id']}"):
                         msg = st.text_area("Reply", max_chars=2000, height=70)
@@ -3469,8 +3496,8 @@ def ops_support() -> None:
         f"#{t['id']} {t['owner']}: {t['subject']}" for t in tickets])]
     st.markdown(tk["body"])
     for rsp in tk["responses"]:
-        st.markdown(f"<div class='zt-card'><b>{rsp['by']}</b> <span class='zt-muted'>{when(rsp['at'])}</span><br>"
-                    f"{rsp['message']}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='zt-card'><b>{esc(rsp['by'])}</b> <span class='zt-muted'>{when(rsp['at'])}</span><br>"
+                    f"{esc(rsp['message'])}</div>", unsafe_allow_html=True)
     with st.form("ops_reply"):
         msg = st.text_area("Reply to the customer", max_chars=2000)
         new = st.selectbox("Set status", ["in_progress", "resolved", "closed", "open"])
@@ -3895,7 +3922,7 @@ def tl_approvals() -> None:
             ai = x.get("ai") or {}
             with st.container(border=True):
                 st.markdown(f"**#{x['id']} · {KIND_LABEL.get(x['kind'], x['kind'])} · {money(x['amount'])}** "
-                            f"{who(x['from_name'])} → {who(x['to_name'])} · {x['channel']} · "
+                            f"{esc(who(x['from_name']))} → {esc(who(x['to_name']))} · {x['channel']} · "
                             f"<span class='zt-pill zt-{'high' if x['risk_level'] == 'high' else 'medium' if x['risk_level'] == 'medium' else 'low'}'>"
                             f"risk {x['risk_score'] if x['risk_score'] is not None else '-'} {x['risk_level']}</span> · "
                             f"status **{STATUS_LABEL.get(x['status'], x['status'])}** · approvals {x['approvals']}/{x['required']}",
@@ -3958,7 +3985,7 @@ def tl_risk() -> None:
     with t[0]:
         for i in d["flagged"][:40]:
             with st.container(border=True):
-                st.markdown(f"{pill(i['decision'])} **{i['customer']}** · {money(i['amount'] or 0)} → {i['to']} · "
+                st.markdown(f"{pill(i['decision'])} **{esc(i['customer'])}** · {money(i['amount'] or 0)} → {esc(i['to'])} · "
                             f"{i['channel']} · risk **{(i['risk'] or 0):.2f}** · fraud probability "
                             f"**{(i['probability'] or 0):.2f}** <span class='zt-muted'>{when(i['ts'])}</span>",
                             unsafe_allow_html=True)
@@ -4208,8 +4235,8 @@ def tl_support() -> None:
                 st.selectbox("Ticket", [f"#{x['id']} {x['owner']}: {x['subject']}" for x in tickets])]
             st.markdown(tk["body"])
             for rsp in tk["responses"]:
-                st.markdown(f"<div class='zt-card'><b>{rsp['by']}</b> <span class='zt-muted'>{when(rsp['at'])}</span>"
-                            f"<br>{rsp['message']}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='zt-card'><b>{esc(rsp['by'])}</b> <span class='zt-muted'>{when(rsp['at'])}</span>"
+                            f"<br>{esc(rsp['message'])}</div>", unsafe_allow_html=True)
             with st.form("tl_reply"):
                 msg = st.text_area("Remark / reply to the customer (the customer is notified)", max_chars=2000)
                 new = st.selectbox("Status", ["in_progress", "resolved", "closed", "open"])
@@ -4356,6 +4383,112 @@ def tl_profile() -> None:
         end_session("Signed out. Your token was revoked on the server.")
         st.rerun()
 
+
+# ------------------------------------------- security list: supply chain, forensics, API protection
+def supply_chain_tab() -> None:
+    d = cp_json("/api/admin/supply-chain")
+    if not d:
+        return
+    ok = d["manifest_status"].startswith("valid")
+    (st.success if ok else st.error)(f"Signed image manifest: {d['manifest_status']}"
+                                     + (f" (signed {when(d['signed_at'])})" if d.get("signed_at") else ""))
+    st.markdown(f"**Runtime image policy:** `{d['image_policy']}` - a running container whose image is not the "
+                "signed digest is quarantined automatically (checked every minute). **Deployment gate:** "
+                "`scripts/deploy-guard.sh` refuses unsigned / modified images and CRITICAL vulnerabilities.")
+    st.code(d["verify_command"], language="bash")
+    st.caption("Signatures: Ed25519 and ECDSA P-256 in cosign sign-blob format (verifiable with the cosign CLI). "
+               "`make push` also signs registry images with `cosign sign` when cosign is installed.")
+    hist = pd.DataFrame(d["deploy_history"])
+    st.markdown("**Image security history (deployment gate decisions)**")
+    if hist.empty:
+        st.caption("No deployments recorded yet.")
+    else:
+        hist["at"] = local_time(hist["at"], "%d %b %Y %H:%M")
+        for c in ("signature_problems", "vulnerability_blocks"):
+            hist[c] = hist[c].apply(lambda x: "; ".join(x) if x else "-")
+        st.dataframe(hist, hide_index=True, use_container_width=True)
+    sb = d.get("sbom")
+    st.markdown("**Software Bill of Materials (CycloneDX 1.5)**")
+    if not sb:
+        st.caption("No SBOM yet - run `make sbom` (deploy.sh does it automatically).")
+        return
+    st.caption(f"Generated {when(sb['generated_at'])}")
+    st.dataframe(pd.DataFrame(sb["images"])[["service", "components", "python_packages", "os_packages", "sha256"]],
+                 hide_index=True, use_container_width=True)
+    pick = st.selectbox("Download SBOM", [r["service"] for r in sb["images"]])
+    r = api("GET", f"/api/admin/sbom/{pick}")
+    if r is not None and r.status_code == 200:
+        st.download_button(f"{pick}.cdx.json", json.dumps(r.json(), indent=1).encode(), file_name=f"{pick}.cdx.json",
+                           mime="application/json")
+
+
+def forensics_tab() -> None:
+    st.caption("When a container is quarantined, the responder first preserves evidence - configuration, process "
+               "list, network attachments, resource usage and the last 500 log lines - in a write-once file whose "
+               "SHA-256 is recorded in the audit chain. The container keeps running, isolated, for investigation.")
+    rows = cp_json("/api/admin/forensics") or []
+    if not rows:
+        st.caption("No evidence bundles yet.")
+        return
+    df = pd.DataFrame(rows)
+    df["collected"] = local_time(df["collected_at"], "%d %b %Y %H:%M:%S")
+    st.dataframe(df[["collected", "service", "file", "bytes", "sha256"]], hide_index=True, use_container_width=True)
+    pick = st.selectbox("Evidence bundle", [r["file"] for r in rows])
+    r = api("GET", f"/api/admin/forensics/{pick}")
+    if r is not None and r.status_code == 200:
+        b = r.json()
+        st.download_button("Download evidence (JSON)", json.dumps(b, indent=1).encode(), file_name=pick,
+                           mime="application/json")
+        st.markdown(f"Reason: {esc(b.get('reason'))} · image `{(b.get('image') or '')[7:19]}`")
+        procs = b.get("processes") or {}
+        if procs.get("Processes"):
+            st.dataframe(pd.DataFrame(procs["Processes"], columns=procs.get("Titles")), hide_index=True,
+                         use_container_width=True)
+        st.text_area("Last log lines", (b.get("logs_tail") or "")[-6000:], height=200)
+
+
+def api_security() -> None:
+    st.title("API security")
+    d = cp_json("/api/admin/api-security")
+    if not d:
+        return
+    p = d["protections"]
+    k = st.columns(5)
+    k[0].metric("Rate limit", f"{p['rate_limit_per_min']}/min")
+    k[1].metric("Sign-in limit", f"{p['login_rate_limit_per_min']}/min")
+    k[2].metric("Max request", f"{p['max_request_kb']} KB")
+    k[3].metric("Anomaly threshold", f"{p['anomaly_threshold_per_min']} refusals/min")
+    k[4].metric("Blocked clients", len(d["blocked_clients"]))
+    st.markdown("**Protections:** bearer-token authentication on every route and OPA authorisation · pydantic "
+                "request validation (types, lengths, patterns) · parameterised SQL only · JSON-only state changes and "
+                f"cross-origin requests refused (CSRF; allowed origins: {', '.join(p['cors_origins']) or 'none'}) · "
+                f"security headers ({', '.join(p['security_headers'])}) · output escaping in the dashboard (XSS) · "
+                f"token replay at machine speed ends the session ({p['token_uses_per_min']} uses/min).")
+    t = st.tabs(["Traffic & errors", "Anomalies & blocks", "API events"])
+    with t[0]:
+        st.dataframe(pd.DataFrame(d["routes"]), hide_index=True, use_container_width=True, height=420)
+        st.caption("Prometheus: `make monitoring` scrapes the gateway's /metrics (bearer token in secrets/metrics_token).")
+    with t[1]:
+        if d["blocked_clients"]:
+            st.dataframe(pd.DataFrame(d["blocked_clients"]), hide_index=True, use_container_width=True)
+            c = st.selectbox("Unblock client", [b["client"] for b in d["blocked_clients"]])
+            if st.button("Unblock"):
+                result(api("POST", "/api/admin/api-security/unblock", json={"client": c}), "Unblocked.", rerun=True)
+        else:
+            st.success("No client is blocked.")
+        an = pd.DataFrame(d["anomalies"])
+        if not an.empty:
+            an["at"] = pd.to_datetime(an["at"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.strftime("%d %b %H:%M:%S")
+            st.dataframe(an, hide_index=True, use_container_width=True)
+    with t[2]:
+        ev = pd.DataFrame(d["events"])
+        if ev.empty:
+            st.caption("No API security events.")
+        else:
+            ev["time"] = local_time(ev["ts"], "%d %b %H:%M:%S")
+            st.dataframe(ev[["time", "actor", "action", "resource", "decision", "reason"]], hide_index=True,
+                         use_container_width=True)
+
 # ------------------------------------------- admin module 10: incident response
 def fmt_min(m) -> str:
     if m is None:
@@ -4461,8 +4594,8 @@ def ir_respond(iid: str, analysts: list[str]) -> None:
     for x in inc["playbook"]:
         cols = st.columns([5, 2, 2])
         mark = "done" if x["done"] else ("not applicable" if not x["applicable"] else "to do")
-        cols[0].markdown(f"{'~~' if not x['applicable'] else ''}{x['title']}{'~~' if not x['applicable'] else ''}"
-                         + (f"  \n<small>{x['help']}</small>" if x["help"] else ""), unsafe_allow_html=True)
+        cols[0].markdown(f"{'~~' if not x['applicable'] else ''}{esc(x['title'])}{'~~' if not x['applicable'] else ''}"
+                         + (f"  \n<small>{esc(x['help'])}</small>" if x["help"] else ""), unsafe_allow_html=True)
         cols[1].caption(mark + (f" by {x['done']['actor']}: {x['done']['result']}" if x["done"] else ""))
         if not resolved and x["applicable"] and not x["done"]:
             label = "Run" if x["kind"] == "action" else "Mark done"
@@ -4884,7 +5017,8 @@ CATEGORY_SHORT = {"suspicious_process": "Suspicious process", "unauthorized_shel
                   "file_modification": "File modification", "credential_access": "Secret access",
                   "jwt_theft": "JWT theft / forgery", "suspicious_login": "Suspicious sign-in",
                   "container_compromise": "Container compromise", "account_takeover": "Account takeover",
-                  "customer_report": "Customer report"}
+                  "customer_report": "Customer report", "image_tampering": "Image tampering",
+                  "api_abuse": "API abuse", "audit_tampering": "Audit tampering"}
 STATUS_ORDER = ["new", "acknowledged", "investigating", "contained", "resolved"]
 
 
@@ -5236,6 +5370,7 @@ else:
         "Container security": container_security,
         "Threat center": threat_center,
         "Network visualization": network_view,
+        "API security": api_security,
         "Policy management": policy_management,
         "Dashboard": cp_dashboard,
         "Teller dashboard": tl_dashboard,

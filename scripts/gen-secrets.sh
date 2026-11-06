@@ -4,7 +4,8 @@
 # /run/secrets/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-OUT=secrets
+# Development and production keep separate secrets: SECRETS_DIR=secrets-prod ./deploy.sh --env prod
+OUT="${SECRETS_DIR:-secrets}"
 mkdir -p "$OUT"
 chmod 700 "$OUT"
 
@@ -13,7 +14,19 @@ if [[ ! -f "$OUT/jwt_private.pem" ]]; then
   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$OUT/jwt_private.pem" 2>/dev/null
   openssl rsa -in "$OUT/jwt_private.pem" -pubout -out "$OUT/jwt_public.pem" 2>/dev/null
 fi
+# previous JWT verification key (rotation grace period); a copy of the current one until the first rotation
+[[ -f "$OUT/jwt_public_prev.pem" ]] || cp "$OUT/jwt_public.pem" "$OUT/jwt_public_prev.pem"
+# bearer token Prometheus uses to scrape the gateway's /metrics
+[[ -f "$OUT/metrics_token" ]] || { openssl rand -hex 24 > "$OUT/metrics_token"; echo "[secrets] metrics token"; }
 
+# Cosign-compatible image signing key (ECDSA P-256). `cosign verify-blob --key secrets/cosign.pub` checks
+# signatures made with it; if the cosign CLI is installed, scripts/sign-images.sh uses it directly.
+if [[ ! -f "$OUT/cosign.key" ]]; then
+  echo "[secrets] cosign (ECDSA P-256) image signing key"
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$OUT/cosign.key" 2>/dev/null
+  openssl pkey -in "$OUT/cosign.key" -pubout -out "$OUT/cosign.pub" 2>/dev/null
+  chmod 600 "$OUT/cosign.key"; chmod 644 "$OUT/cosign.pub"
+fi
 if [[ ! -f "$OUT/image_signing.key" ]]; then
   echo "[secrets] Ed25519 key that signs the deployed image digests (admin module 5)"
   openssl genpkey -algorithm ed25519 -out "$OUT/image_signing.key" 2>/dev/null

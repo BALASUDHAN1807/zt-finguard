@@ -1,6 +1,7 @@
 """F19 - customer-controlled inactivity timeout, shared by gateway and auth.
 
 Redis keys
+    sesscap:<sid>           shorter timeout for a risky session (new device / medium sign-in risk)
     sess:<sid>              last activity of a session (epoch ms). sid = refresh-token family,
                             so it survives access-token refreshes. Deleted on logout/expiry.
     sessinfo:<sid>          who/where/how the session started (admin session monitoring)
@@ -71,6 +72,9 @@ async def active(r, sub: str | None = None) -> list[dict]:
             await end(r, sid)
             continue
         _, _, effective = await limits(r, info["sub"])
+        cap = await r.get(f"sesscap:{sid}")
+        if cap:
+            effective = max(1, min(effective, int(cap)))
         idle_s = (now_ms() - int(last)) // 1000
         if idle_s > effective * 60:
             await end(r, sid)
@@ -89,10 +93,12 @@ async def check(r, sid: str | None, sub: str, touch: bool) -> tuple[str | None, 
     """
     if not sid:
         return "session_unknown", 0
-    last = await r.get(f"sess:{sid}")
+    last, risky_cap = await r.mget(f"sess:{sid}", f"sesscap:{sid}")
     if last is None:
         return "session_expired", 0
     _, _, effective = await limits(r, sub)
+    if risky_cap:          # adaptive: a risky session (new device / medium login risk) gets a shorter timeout
+        effective = max(1, min(effective, int(risky_cap)))
     idle_ms = now_ms() - int(last)
     if idle_ms > effective * 60_000:
         await r.delete(f"sess:{sid}")

@@ -40,6 +40,7 @@ x-svc-env: &svc-env
   TLS_KEY_FILE: /run/secrets/tls_key
   TLS_CA_FILE: /run/secrets/ca_crt
   JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public
+  JWT_PUBLIC_PREV_KEY_FILE: /run/secrets/jwt_public_prev
   REDIS_PASSWORD_FILE: /run/secrets/redis_password
 
 services:
@@ -146,6 +147,7 @@ services:
       SERVICE_NAME: risk
     secrets:
       - {source: ca_crt, target: ca_crt}
+      - {source: crl, target: crl}
       - {source: risk_crt, target: tls_crt}
       - {source: risk_key, target: tls_key}
 
@@ -159,6 +161,7 @@ services:
       SERVICE_NAME: audit
     secrets:
       - {source: ca_crt, target: ca_crt}
+      - {source: crl, target: crl}
       - {source: audit_crt, target: tls_crt}
       - {source: audit_key, target: tls_key}
     depends_on:
@@ -176,10 +179,12 @@ services:
       SEED_USERS_FILE: /run/secrets/seed_users
     secrets:
       - {source: ca_crt, target: ca_crt}
+      - {source: crl, target: crl}
       - {source: auth_crt, target: tls_crt}
       - {source: auth_key, target: tls_key}
       - jwt_private        # only the auth service can sign tokens
       - jwt_public
+      - jwt_public_prev
       - redis_password
       - seed_users
     depends_on:
@@ -200,9 +205,11 @@ services:
       OPENING_BALANCE: "50000"
     secrets:
       - {source: ca_crt, target: ca_crt}
+      - {source: crl, target: crl}
       - {source: account_crt, target: tls_crt}
       - {source: account_key, target: tls_key}
       - jwt_public
+      - jwt_public_prev
     depends_on:
       postgres: {condition: service_healthy}
       opa: {condition: service_started}
@@ -218,9 +225,11 @@ services:
       SERVICE_NAME: transaction
     secrets:
       - {source: ca_crt, target: ca_crt}
+      - {source: crl, target: crl}
       - {source: transaction_crt, target: tls_crt}
       - {source: transaction_key, target: tls_key}
       - jwt_public
+      - jwt_public_prev
     depends_on:
       postgres: {condition: service_healthy}
       opa: {condition: service_started}
@@ -248,9 +257,11 @@ services:
       ALERT_WEBHOOK_URL: "${ALERT_WEBHOOK_URL:-}"
     secrets:
       - {source: ca_crt, target: ca_crt}
+      - {source: crl, target: crl}
       - {source: responder_crt, target: tls_crt}
       - {source: responder_key, target: tls_key}
       - {source: image_signing_pub, target: image_signing_pub}
+      - {source: cosign_pub, target: cosign_pub}
     volumes:
       - ${CONTAINER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
       - responder_state:/state
@@ -273,10 +284,13 @@ services:
       LOGIN_RATE_LIMIT_PER_MIN: "${LOGIN_RATE_LIMIT_PER_MIN:-10}"
     secrets:
       - {source: ca_crt, target: ca_crt}
+      - {source: crl, target: crl}
       - {source: gateway_crt, target: tls_crt}
       - {source: gateway_key, target: tls_key}
       - jwt_public
+      - jwt_public_prev
       - redis_password
+      - metrics_token
     volumes:
       - ./reports:/reports:ro
     depends_on:
@@ -315,6 +329,28 @@ services:
       gateway: {condition: service_healthy}
 
   # ------------------------------------------- runtime security (optional)
+  # Optional metrics (make monitoring): Prometheus scrapes the gateway's /metrics with a bearer token.
+  prometheus:
+    profiles: [monitoring]
+    image: docker.io/prom/prometheus:v2.55.1
+    networks: [edge-net]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    cpus: 0.5
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus",
+              "--storage.tsdb.retention.time=7d"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    secrets:
+      - {source: ca_crt, target: ca_crt}
+      - metrics_token
+    ports: ["127.0.0.1:9090:9090"]
+    depends_on: [gateway]
+
   # Falco needs kernel access (eBPF), so it is the ONE privileged container.
   # It is not started by default:  make falco   (rootful Docker/Podman only)
   falco:
@@ -361,10 +397,12 @@ networks:
 volumes:
   pgdata: {}
   responder_state: {}
+  prometheus-data: {}
 
 secrets:
   ca_crt: {file: ./certs/ca.crt}
-  image_signing_pub: {file: ./secrets/image_signing.pub}
+  image_signing_pub: {file: "${SECRETS_DIR:-./secrets}/image_signing.pub"}
+  cosign_pub: {file: "${SECRETS_DIR:-./secrets}/cosign.pub"}
   gateway_crt: {file: ./certs/gateway.crt}
   gateway_key: {file: ./certs/gateway.key}
   dashboard_crt: {file: ./certs/dashboard.crt}
@@ -389,8 +427,11 @@ secrets:
   redis_key: {file: ./certs/redis.key}
   falco_crt: {file: ./certs/falco.crt}
   falco_key: {file: ./certs/falco.key}
-  jwt_private: {file: ./secrets/jwt_private.pem}
-  jwt_public: {file: ./secrets/jwt_public.pem}
-  redis_password: {file: ./secrets/redis_password}
-  postgres_password: {file: ./secrets/postgres_password}
-  seed_users: {file: ./secrets/seed_users.json}
+  jwt_private: {file: "${SECRETS_DIR:-./secrets}/jwt_private.pem"}
+  jwt_public: {file: "${SECRETS_DIR:-./secrets}/jwt_public.pem"}
+  jwt_public_prev: {file: "${SECRETS_DIR:-./secrets}/jwt_public_prev.pem"}
+  metrics_token: {file: "${SECRETS_DIR:-./secrets}/metrics_token"}
+  redis_password: {file: "${SECRETS_DIR:-./secrets}/redis_password"}
+  crl: {file: ./certs/crl.pem}
+  postgres_password: {file: "${SECRETS_DIR:-./secrets}/postgres_password"}
+  seed_users: {file: "${SECRETS_DIR:-./secrets}/seed_users.json"}

@@ -78,7 +78,8 @@ users:
 
 # The suite signs in ~25 times: run it with a relaxed sign-in limit, then restore the real one.
 test:
-	@[ -x .venv/bin/pytest ] || (python3 -m venv .venv && .venv/bin/pip install -q pytest==8.3.4 httpx==0.28.1 pyotp==2.9.0)
+	@[ -x .venv/bin/pytest ] || python3 -m venv .venv
+	@.venv/bin/pip install -q pytest==8.3.4 httpx==0.28.1 pyotp==2.9.0 PyJWT==2.10.1 cryptography==44.0.0 websockets==13.1
 	LOGIN_RATE_LIMIT_PER_MIN=1000 $(COMPOSE) up -d --no-deps gateway
 	@until python3 -c "import ssl,urllib.request as u; u.urlopen('https://localhost:8443/healthz', context=ssl.create_default_context(cafile='certs/ca.crt'), timeout=2)" 2>/dev/null; do sleep 2; done
 	ZT_DOCKER=1 IMAGE_PREFIX=$(IMAGE_PREFIX) .venv/bin/pytest -v tests/; rc=$$?; $(COMPOSE) up -d --no-deps gateway; exit $$rc
@@ -92,6 +93,26 @@ opa-test:
 
 scan:
 	ENGINE=$(ENGINE) ./scripts/scan-images.sh
+	./scripts/sbom.sh $(ENGINE)
+
+sbom:
+	./scripts/sbom.sh $(ENGINE)
+
+guard:
+	./scripts/deploy-guard.sh $(ENGINE)
+
+monitoring:
+	$(COMPOSE) --profile monitoring up -d prometheus
+	@echo "Prometheus: http://127.0.0.1:9090 (target zt-gateway, alerts in monitoring/alerts.yml)"
+
+rotate-secrets:
+	ENGINE=$(ENGINE) ./scripts/rotate-secrets.sh $(SECRET)
+
+scan-secrets:
+	./scripts/scan-secrets.sh
+
+revoke-cert:
+	ENGINE=$(ENGINE) ./scripts/revoke-cert.sh $(CERT)
 
 falco:
 	$(COMPOSE) --profile runtime up -d falco
