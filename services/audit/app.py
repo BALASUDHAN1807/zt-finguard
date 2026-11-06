@@ -521,6 +521,125 @@ async def container_history(service: str | None = Query(None, max_length=40), li
         return [row_out(r) for r in await cur.fetchall()]
 
 
+# ---------------------------------------------- admin module 8: policy versions
+@app.get("/policy-versions")
+async def policy_versions(limit: int = Query(100, ge=1, le=500),
+                          _caller: str = Depends(mtls.require_caller("gateway"))):
+    """Every published policy version, newest first. Only the gateway's certificate can write them."""
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            "SELECT id, ts, service, actor, action, resource, decision, reason, risk, details FROM audit_log "
+            "WHERE action = 'policy.version' AND service = 'gateway' ORDER BY id DESC LIMIT %s", (limit,))
+        return [row_out(r) for r in await cur.fetchall()]
+
+
+# ---------------------------------------------- admin module 9: audit & compliance
+COLS = "id, ts, service, actor, action, resource, decision, reason, risk, details, prev_hash, hash"
+
+
+@app.get("/explore")
+async def explore(q: str | None = Query(None, max_length=80), service: str | None = Query(None, max_length=40),
+                  actor: str | None = Query(None, max_length=80), action: str | None = Query(None, max_length=60),
+                  decision: str | None = Query(None, pattern=r"^(allow|deny|step_up|alert|info)$"),
+                  severity: str | None = Query(None, pattern=r"^(info|low|medium|high|critical)$"),
+                  since: str | None = Query(None, max_length=40), until: str | None = Query(None, max_length=40),
+                  actors: str | None = Query(None, max_length=4000),
+                  before_id: int | None = Query(None, ge=1), limit: int = Query(200, ge=1, le=2000),
+                  _caller: str = Depends(mtls.require_caller("gateway"))):
+    """Filterable, paged view of the chain, including each entry's hash links."""
+    where, args = [], []
+    if q:
+        where.append("(actor ILIKE %s OR action ILIKE %s OR reason ILIKE %s OR resource ILIKE %s)")
+        args += [f"%{q}%"] * 4
+    for col, val in (("service", service), ("actor", actor), ("decision", decision)):
+        if val:
+            where.append(f"{col} = %s")
+            args.append(val)
+    if action:
+        where.append("action LIKE %s")
+        args.append(action.replace("%", "") + "%")
+    if actors is not None:
+        where.append("actor = ANY(%s)")
+        args.append([a for a in actors.split(",") if a])
+    for op, val in ((">=", since), ("<=", until)):
+        if val:
+            try:
+                where.append(f"ts {op} %s")
+                args.append(datetime.fromisoformat(val.replace("Z", "+00:00")))
+            except ValueError:
+                raise HTTPException(422, "since/until must be ISO-8601")
+    if before_id:
+        where.append("id < %s")
+        args.append(before_id)
+    sql = f"SELECT {COLS} FROM audit_log" + (" WHERE " + " AND ".join(where) if where else "")
+    fetch = limit * 4 if severity else limit
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(sql + " ORDER BY id DESC LIMIT %s", (*args, fetch))
+        rows = [row_out(r) for r in await cur.fetchall()]
+    if severity:
+        rows = [r for r in rows if r["severity"] == severity][:limit]
+    return {"rows": rows, "next_before_id": rows[-1]["id"] if len(rows) == limit else None}
+
+
+@app.get("/entry/{entry_id}")
+async def entry_proof(entry_id: int, _caller: str = Depends(mtls.require_caller("gateway"))):
+    """One entry with its proof: recomputed hash, link to the previous and the next entry."""
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(f"SELECT {COLS} FROM audit_log WHERE id BETWEEN %s AND %s ORDER BY id",
+                                 (entry_id - 1, entry_id + 1))
+        rows = {r["id"]: r for r in await cur.fetchall()}
+    row = rows.get(entry_id)
+    if not row:
+        raise HTTPException(404, "no such entry")
+    prev, nxt = rows.get(entry_id - 1), rows.get(entry_id + 1)
+    recomputed = chain.link(row["prev_hash"], row)
+    return {"entry": row_out(row), "recomputed_hash": recomputed, "hash_matches": recomputed == row["hash"],
+            "previous_hash": prev["hash"] if prev else chain.GENESIS,
+            "links_to_previous": row["prev_hash"] == (prev["hash"] if prev else chain.GENESIS),
+            "next_links_here": (nxt["prev_hash"] == row["hash"]) if nxt else None}
+
+
+@app.get("/compliance-facts")
+async def compliance_facts(days: int = Query(30, ge=1, le=365), actors: str = Query("", max_length=4000),
+                           _caller: str = Depends(mtls.require_caller("gateway"))):
+    """Evidence for the compliance report, computed from the chain itself."""
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            "SELECT count(*) AS total, min(ts) AS first, max(ts) AS last FROM audit_log")
+        tot = await cur.fetchone()
+        cur = await conn.execute(
+            "SELECT decision, count(*) AS n FROM audit_log WHERE ts > now() - make_interval(days => %s) "
+            "GROUP BY decision", (days,))
+        decisions = {r["decision"]: r["n"] for r in await cur.fetchall()}
+        cur = await conn.execute(
+            "SELECT action, count(*) AS n, max(ts) AS last FROM audit_log WHERE ts > now() - make_interval(days => %s) "
+            "AND action IN ('auth.login', 'admin.audit_verify', 'audit.export', 'compliance.report', 'policy.version', "
+            "'mtls.blocked', 'gateway.ip_blocked', 'auth.revoke_sessions') GROUP BY action", (days,))
+        actions = {r["action"]: {"count": r["n"], "last": chain.norm_ts(r["last"])} for r in await cur.fetchall()}
+        cur = await conn.execute(
+            "SELECT count(*) AS n FROM audit_log WHERE ts > now() - make_interval(days => %s) AND actor = ANY(%s)",
+            (days, [a for a in actors.split(",") if a]))
+        privileged = (await cur.fetchone())["n"]
+        cur = await conn.execute(
+            "SELECT count(*) FILTER (WHERE decision = 'allow') AS ok, count(*) FILTER (WHERE decision = 'deny') AS denied, "
+            "count(*) FILTER (WHERE decision = 'allow' AND (reason ILIKE '%%totp%%' OR reason ILIKE '%%otp%%' "
+            "OR reason ILIKE '%%sms%%')) AS multi_factor "
+            "FROM audit_log WHERE action = 'auth.login' AND ts > now() - make_interval(days => %s)", (days,))
+        logins = await cur.fetchone()
+        cur = await conn.execute(
+            "SELECT has_table_privilege(current_user, 'audit_log', 'UPDATE') AS can_update, "
+            "has_table_privilege(current_user, 'audit_log', 'DELETE') AS can_delete, "
+            "has_table_privilege(current_user, 'audit_log', 'TRUNCATE') AS can_truncate, current_user AS role")
+        priv = await cur.fetchone()
+    return {"days": days, "total": tot["total"], "first": chain.norm_ts(tot["first"]) if tot["first"] else None,
+            "last": chain.norm_ts(tot["last"]) if tot["last"] else None, "decisions": decisions, "actions": actions,
+            "privileged_events": privileged, "logins": dict(logins), "db_privileges": dict(priv)}
+
+
 # ---------------------------------------------- admin module 6: threat detection
 CATEGORY_TITLE = {
     "unauthorized_shell": "Shell or tool started in a service container",
@@ -630,6 +749,17 @@ def build_incidents(events: list[dict]) -> tuple[dict, list[dict]]:
             if not inc:
                 continue
             op, dd = e["action"].split(".", 1)[1], e["details"] or {}
+            inc["acknowledged_at"] = inc["acknowledged_at"] or e["ts"]    # first analyst touch = acknowledged
+            if op == "action":                                           # module 10: playbook step executed
+                inc["steps_done"][dd.get("step")] = {"ts": e["ts"], "actor": e["actor"], "result": dd.get("result")}
+                if dd.get("containment"):
+                    inc["contained_at"] = inc["contained_at"] or e["ts"]
+            elif op == "report":
+                inc["reported_at"], inc["report_ref"] = e["ts"], dd.get("reference")
+            elif op == "postmortem":
+                inc["postmortem"] = {k: dd.get(k) for k in ("root_cause", "impact", "lessons", "follow_up")}
+            if op == "status" and dd.get("status") == "contained":
+                inc["contained_at"] = inc["contained_at"] or e["ts"]
             if op == "ack":
                 inc["status"] = "acknowledged" if inc["status"] == "new" else inc["status"]
                 inc["acknowledged_by"] = e["actor"]
@@ -643,8 +773,10 @@ def build_incidents(events: list[dict]) -> tuple[dict, list[dict]]:
                 inc["resolved_at"] = e["ts"]
                 inc["resolved_by"] = e["actor"]
                 open_by_key.pop(inc["_key"], None)
-            inc["timeline"].append({"ts": e["ts"], "kind": "analyst", "actor": e["actor"], "what": op,
-                                    "detail": dd.get("note") or dd.get("assignee") or dd.get("status") or ""})
+            inc["timeline"].append({"ts": e["ts"], "kind": "response" if op == "action" else "analyst",
+                                    "actor": e["actor"], "what": dd.get("step") if op == "action" else op,
+                                    "detail": dd.get("note") or dd.get("assignee") or dd.get("status")
+                                    or dd.get("result") or dd.get("reference") or dd.get("root_cause") or ""})
             inc["updated"] = e["ts"]
             continue
         if e["action"] in RESPONSE_ACTIONS:
@@ -671,9 +803,13 @@ def build_incidents(events: list[dict]) -> tuple[dict, list[dict]]:
                               "assignee": None, "first_seen": e["ts"], "last_seen": e["ts"], "updated": e["ts"],
                               "detections": 0, "sources": set(), "summary": det["summary"], "timeline": [],
                               "acknowledged_by": None, "resolution": None, "resolved_at": None, "resolved_by": None,
+                              "acknowledged_at": None, "contained_at": None, "steps_done": {}, "reported_at": None,
+                              "report_ref": None, "postmortem": None,
                               "categories": set()}
         inc = incidents[iid]
         inc["categories"].add(det["category"])
+        if det["category"] in ("container_compromise", "account_takeover"):   # automatic quarantine / session kill
+            inc["contained_at"] = inc["contained_at"] or e["ts"]
         inc["detections"] += 1
         inc["last_seen"] = inc["updated"] = e["ts"]
         inc["sources"].add(det["source"])

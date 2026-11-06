@@ -14,6 +14,7 @@ Client side
 """
 from __future__ import annotations
 
+import os
 import ssl
 from typing import Iterable
 
@@ -66,9 +67,15 @@ def require_caller(*allowed: str):
     """FastAPI dependency: only the listed workload identities may call."""
     allowed_set = set(allowed)
 
-    def dependency(request: Request) -> str:
+    async def dependency(request: Request) -> str:  # async: the audit call needs the event loop
         cn = caller_identity(request)
         if cn not in allowed_set:
+            # admin module 7: every refused workload call is evidence for "blocked connections"
+            if os.environ.get("SERVICE_NAME") != "audit":
+                from . import clients  # lazy: clients imports this module
+                clients.audit(actor=cn or "unknown", action="mtls.blocked", resource=request.url.path,
+                              decision="deny", reason="untrusted_workload_identity",
+                              details={"allowed": sorted(allowed_set)})
             raise HTTPException(
                 status_code=403,
                 detail=f"workload identity '{cn}' is not allowed to call this endpoint",

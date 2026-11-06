@@ -1,7 +1,8 @@
 # Protects OPA's own API. OPA runs with --authentication=tls, so the caller's
 # identity is the subject of its client certificate. Only the services that
-# make authorization decisions may query policy; nobody may change policy or
-# data at runtime through the API.
+# make authorization decisions may query policy. Rego code can never be changed
+# at runtime; the only writable document is data.zt_policy (the restrict-only
+# tunables of the module-8 policy editor), and only the gateway may write it.
 package system.authz
 
 default allow := false
@@ -25,4 +26,17 @@ allow if {
 	input.method == "GET"
 	input.path == ["health"]
 	caller_cn
+}
+
+# module 8: the gateway publishes the active tunables and runs simulations
+allow if {
+	input.method in {"PUT", "GET"}
+	input.path == ["v1", "data", "zt_policy"]
+	caller_cn == "gateway"
+}
+
+allow if {
+	input.method == "POST"
+	input.path == ["v1", "data", "finguard", "authz", "simulate"]
+	caller_cn == "gateway"
 }

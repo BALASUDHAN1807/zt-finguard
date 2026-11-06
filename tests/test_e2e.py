@@ -828,3 +828,161 @@ def test_incident_lifecycle_is_recorded_in_the_audit_chain():
     assert any(x["kind"] == "detection" for x in d["timeline"])
     assert admin.req("POST", f"{base}/ack", json={}).status_code == 409                       # closed
     assert admin.req("GET", "/api/admin/threats/incidents/INC-0").status_code == 404
+
+
+# ------------------------------------------- admin module 7: network visualization
+def test_network_map_proves_segmentation_and_mtls():
+    assert logged_in("alice").req("GET", "/api/admin/network").status_code == 403
+    d = logged_in("admin").req("GET", "/api/admin/network").json()
+    seg = d["segmentation"][0]
+    assert seg["reachable"] is False                       # gateway cannot even open TCP to postgres
+    up = {k: v for k, v in d["tls"].items() if v.get("reachable")}
+    assert len(up) >= 6 and all(v["tls"] == "TLSv1.3" for v in up.values())
+    assert all(v["server_cn"] == k for k, v in up.items())  # every service proves its identity
+    edges = {(e["from"], e["to"]): e for e in d["edges"]}
+    assert edges[("gateway", "auth")]["status"] == "ok"
+    assert {"blocked", "suspicious"} <= d.keys()
+
+
+# ------------------------------------------- admin module 8: policy management
+def test_policy_editor_is_restrict_only_and_versioned():
+    assert logged_in("alice").req("GET", "/api/admin/policy").status_code == 403
+    admin = logged_in("admin")
+    p = admin.req("GET", "/api/admin/policy").json()
+    assert p["invariants_ok"] and p["opa_in_sync"]
+    for bad in ({"transfer_limit_customer": 500000},                                       # above baseline
+                {"custom_denies": [{"id": "x", "role": "*", "action": "admin.policy"}]},   # self lock-out
+                {"blocked_cidrs": ["0.0.0.0/0"]},                                          # too broad
+                {"medium_risk_action": "allow"}):
+        s = admin.req("POST", "/api/admin/policy/simulate", json={"config": bad}).json()
+        assert s["valid"] is False and s["errors"], bad
+    cand = {**p["config"], "transfer_limit_customer": 1000, "high_value_threshold": 1000,
+            "custom_denies": [{"id": "no-teller-reads", "role": "teller", "action": "account.read"}]}
+    s = admin.req("POST", "/api/admin/policy/simulate", json={"config": cand}).json()
+    assert s["valid"] and s["invariants_ok"]
+    assert next(x for x in s["preview"] if x["scenario"] == "₹15,000, low risk")["candidate"] == "deny"
+    assert next(x for x in s["preview"] if x["scenario"] == "Teller reads an account")["changed"]
+    assert admin.req("POST", "/api/admin/policy/apply",
+                     json={"config": cand, "comment": "e2e", "totp": "000000"}).status_code == 401
+    r = admin.req("POST", "/api/admin/policy/apply", json={"config": cand, "comment": "e2e", "totp": fresh_code("admin")})
+    assert r.status_code == 200, r.text
+    try:
+        t = logged_in("teller").req("GET", f"/api/accounts/{account_of('bob')}")
+        assert t.status_code == 403 and "custom_rule:no-teller-reads" in t.text
+        tx = logged_in("alice").req("POST", "/api/transfer", json={"to_account": account_of("bob"), "amount": 1500})
+        assert tx.status_code == 403 and "amount_over_limit" in tx.text
+    finally:
+        rb = admin.req("POST", "/api/admin/policy/rollback", json={"version": 0, "totp": fresh_code("admin")})
+        assert rb.status_code == 200, rb.text
+    p = admin.req("GET", "/api/admin/policy").json()
+    assert p["config"] == p["baseline"] and p["opa_in_sync"]
+    assert p["versions"][0]["rollback_of"] == 0 and p["versions"][1]["comment"] == "e2e"
+    assert logged_in("teller").req("GET", f"/api/accounts/{account_of('bob')}").status_code == 200
+
+
+# ------------------------------------------- admin module 9: audit & compliance
+def test_compliance_controls_are_measured_live():
+    assert logged_in("alice").req("GET", "/api/admin/compliance").status_code == 403
+    c = logged_in("admin").req("GET", "/api/admin/compliance").json()
+    status = {x["id"]: x["status"] for x in c["controls"]}
+    assert c["total"] == len(c["controls"]) >= 14
+    for must in ("ZT-1", "ZT-2", "ZT-4", "ZT-5", "SEG-1", "SOD-1", "LOG-1", "POL-1"):
+        assert status[must] == "pass", (must, c["controls"])
+    assert c["audit"]["db_privileges"]["can_update"] is False and c["audit"]["db_privileges"]["can_delete"] is False
+    roles = {u["role"] for u in c["access_review"]}
+    assert {"admin", "operations", "teller"} <= roles and "customer" not in roles
+
+
+def test_audit_explorer_filters_exports_and_proves_entries():
+    import hashlib
+    admin = logged_in("admin")
+    deny = admin.req("GET", "/api/admin/audit/explore", params={"decision": "deny", "limit": 50}).json()["rows"]
+    assert deny and all(r["decision"] == "deny" for r in deny)
+    priv = admin.req("GET", "/api/admin/audit/explore", params={"privileged": "1", "limit": 100}).json()["rows"]
+    names = {u["username"] for u in admin.req("GET", "/api/admin/compliance").json()["access_review"]}
+    assert priv and all(r["actor"] in names for r in priv)
+    x = admin.req("GET", "/api/admin/audit/explore", params={"action": "auth.login", "format": "csv", "limit": 20})
+    assert x.status_code == 200 and x.text.startswith("id,ts,service,actor,action")
+    assert hashlib.sha256(x.content).hexdigest() == x.headers["x-export-sha256"]
+    proof = admin.req("GET", f"/api/admin/audit/entry/{deny[0]['id']}").json()
+    assert proof["hash_matches"] and proof["links_to_previous"]
+    time.sleep(1)
+    exports = admin.req("GET", "/api/admin/audit/explore", params={"action": "audit.export", "limit": 5}).json()["rows"]
+    assert exports[0]["details"]["sha256"] == x.headers["x-export-sha256"]
+    assert logged_in("alice").req("GET", "/api/admin/audit/explore").status_code == 403
+
+
+def test_compliance_report_is_anchored_in_the_chain():
+    import hashlib
+    admin = logged_in("admin")
+    g = admin.req("POST", "/api/admin/compliance/report", params={"days": 7}).json()
+    body = json.dumps(g["report"], sort_keys=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(body).hexdigest() == g["sha256"]
+    proof = admin.req("GET", f"/api/admin/audit/entry/{g['audit_id']}").json()
+    assert proof["entry"]["action"] == "compliance.report" and proof["entry"]["details"]["sha256"] == g["sha256"]
+    assert proof["hash_matches"]
+
+
+# ------------------------------------------- admin module 10: incident response
+def test_incident_playbook_reporting_and_sla_are_audited():
+    name, _ = _drain_attempt()                              # account takeover -> critical, auto-contained
+    time.sleep(1)
+    admin = logged_in("admin")
+    lst = admin.req("GET", "/api/admin/incidents", params={"days": 1}).json()
+    inc = next(i for i in lst["incidents"] if i["category"] == "account_takeover" and i["subject"] == name)
+    iid = inc["id"]
+    assert inc["regulatory"]["reportable"] and inc["sla"]["ack_target_min"] == 15
+    assert inc["sla"]["time_to_contain_min"] is not None                  # sessions were ended automatically
+    d = admin.req("GET", f"/api/admin/incidents/{iid}").json()
+    steps = {x["id"]: x for x in d["playbook"]}
+    assert {"force_logout", "lock_user", "contact", "ops_freeze"} <= steps.keys()
+    url = f"/api/admin/incidents/{iid}/steps/lock_user"
+    assert admin.req("POST", url, json={"totp": "000000"}).status_code == 401
+    r = admin.req("POST", url, json={"totp": fresh_code("admin"), "note": "e2e"})
+    assert r.status_code == 200, r.text
+    users = {u["username"]: u for u in admin.req("GET", "/api/admin/users").json()}
+    assert users[name]["locked"]
+    assert admin.req("POST", f"/api/admin/incidents/{iid}/steps/contact", json={"note": "called"}).status_code == 200
+    assert admin.req("POST", f"/api/admin/incidents/{iid}/steps/nope", json={}).status_code == 404
+    assert admin.req("POST", f"/api/admin/incidents/{iid}/report",
+                     json={"reference": "CERTIN-2026-0001"}).status_code == 200
+    assert admin.req("POST", f"/api/admin/incidents/{iid}/postmortem",
+                     json={"root_cause": "credential stuffing test", "lessons": "keep risk engine on"}).status_code == 200
+    assert admin.req("POST", f"/api/admin/threats/incidents/{iid}/resolve", json={"note": "e2e"}).status_code == 200
+    d = admin.req("GET", f"/api/admin/incidents/{iid}").json()
+    done = {x["id"] for x in d["playbook"] if x["done"]}
+    assert {"lock_user", "contact"} <= done and d["status"] == "resolved"
+    assert d["regulatory"]["reference"] == "CERTIN-2026-0001" and not d["regulatory"]["overdue"]
+    assert d["postmortem"]["root_cause"] == "credential stuffing test"
+    assert d["sla"]["time_to_ack_min"] is not None and d["sla"]["time_to_resolve_min"] is not None
+    assert admin.req("POST", f"/api/admin/incidents/{iid}/steps/force_logout", json={}).status_code == 409
+    assert logged_in("bob").req("GET", "/api/admin/incidents").status_code == 403
+
+
+# ------------------------------------------- admin module 11: security settings
+def test_security_settings_are_restrict_only_audited_and_enforced():
+    assert logged_in("alice").req("GET", "/api/admin/settings").status_code == 403
+    admin = logged_in("admin")
+    d = admin.req("GET", "/api/admin/settings").json()
+    assert {x["key"]: x["value"] for x in d["settings"]}["password_min_length"] == 10
+    assert d["keys"]["ca"]["days_left"] > 0 and len(d["keys"]["jwt_signing_key_sha256"]) == 64
+    bad = admin.req("PUT", "/api/admin/settings", json={"values": {"lockout_threshold": 10}, "totp": "x",
+                                                        "comment": "weaker"})
+    assert bad.status_code == 422                                            # weaker than baseline: refused
+    assert admin.req("PUT", "/api/admin/settings", json={"values": {"password_min_length": 16}, "totp": "000000",
+                                                          "comment": "e2e"}).status_code == 401
+    r = admin.req("PUT", "/api/admin/settings", json={"values": {"password_min_length": 16},
+                                                      "totp": fresh_code("admin"), "comment": "e2e"})
+    assert r.status_code == 200, r.text
+    try:
+        time.sleep(6)                                                        # auth re-reads settings every 5 s
+        reg = Client().req("POST", "/api/auth/register", json={"username": "pw_" + uuid.uuid4().hex[:8],
+                                                               "password": "Short-pw-123", "mobile": new_mobile()})
+        assert reg.status_code == 400 and "16" in reg.text
+    finally:
+        rb = admin.req("PUT", "/api/admin/settings", json={"values": {"password_min_length": 10},
+                                                           "totp": fresh_code("admin"), "comment": "e2e restore"})
+        assert rb.status_code == 200, rb.text
+    hist = admin.req("GET", "/api/admin/settings").json()["history"]
+    assert hist[0]["reason"] == "e2e restore" and hist[1]["details"]["changes"][0]["to"] == 16
+    time.sleep(6)

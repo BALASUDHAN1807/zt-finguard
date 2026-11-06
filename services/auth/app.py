@@ -45,6 +45,27 @@ REFRESH_TTL = 8 * 3600
 REVOKE_TTL = 24 * 3600
 MAX_FAILURES = 5
 LOCK_MINUTES = 15
+# Admin module 11: administrators may tighten these (Redis hash zt:settings, written by the gateway).
+# Clamped again here so a bad value can only make sign-in stricter, never weaker.
+SETTING_BOUNDS = {"lockout_threshold": (3, 5, 5), "lockout_minutes": (15, 1440, 15),
+                  "password_min_length": (10, 32, 10), "otp_ttl_seconds": (60, 300, 300),
+                  "otp_max_tries": (1, 3, 3)}
+_settings_cache = {"at": 0.0, "v": {}}
+
+
+async def setting(name: str) -> int:
+    lo, hi, default = SETTING_BOUNDS[name]
+    if time.time() - _settings_cache["at"] > 5:
+        try:
+            _settings_cache["v"] = await clients.redis().hgetall("zt:settings")
+        except Exception:  # noqa: BLE001 - keep the last values we saw
+            pass
+        _settings_cache["at"] = time.time()
+    try:
+        v = int(_settings_cache["v"].get(name, default))
+    except (TypeError, ValueError):
+        v = default
+    return max(lo, min(hi, v))
 USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
 MOBILE_RE = re.compile(r"^[6-9][0-9]{9}$")          # Indian mobile numbers
 # Demo mobile numbers when seed_users.json predates F22 (same as scripts/gen-secrets.sh)
@@ -215,7 +236,7 @@ async def record_failure(user: dict) -> None:
                    locked_until = CASE WHEN failed_attempts + 1 >= %s
                                        THEN now() + make_interval(mins => %s) ELSE locked_until END
                WHERE id = %s""",
-            (MAX_FAILURES, LOCK_MINUTES, user["id"]))
+            (await setting("lockout_threshold"), await setting("lockout_minutes"), user["id"]))
         await conn.commit()
 
 
@@ -443,7 +464,7 @@ async def otp_request(body: OtpRequestIn):
     salt = secrets.token_hex(8)
     await r.delete(f"otp:{user['id']}")
     await r.hset(f"otp:{user['id']}", mapping={"h": otp_digest(user["id"], code, salt), "salt": salt, "tries": 0})
-    await r.expire(f"otp:{user['id']}", OTP_TTL)
+    await r.expire(f"otp:{user['id']}", await setting("otp_ttl_seconds"))
     try:
         await sms.send(r, mobile, f"{code} is your ZT-FinGuard sign-in code. Valid 5 minutes. "
                                   "Never share it - the bank will never ask for it.")
@@ -488,13 +509,14 @@ async def login_otp(body: OtpLoginIn):
         raise bad
     if not hmac.compare_digest(rec["h"], otp_digest(user["id"], body.otp.strip(), rec["salt"])):
         tries = await r.hincrby(key, "tries", 1)
-        if tries >= OTP_MAX_TRIES:
+        max_tries = await setting("otp_max_tries")
+        if tries >= max_tries:
             await r.delete(key)
         await record_failure(user)
         clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
                       reason="bad_sms_otp", details={"ip": ctx.ip, "tries": tries})
-        raise HTTPException(401, "wrong code - request a new one" if tries >= OTP_MAX_TRIES
-                            else f"wrong code ({OTP_MAX_TRIES - tries} tries left)")
+        raise HTTPException(401, "wrong code - request a new one" if tries >= max_tries
+                            else f"wrong code ({max_tries - tries} tries left)")
 
     dfp = tokens.device_fingerprint(ctx.device_id, ctx.user_agent)
     known, status, risk = await assess_login(user, ctx, dfp, actor)
@@ -664,6 +686,8 @@ class RegisterIn(BaseModel):
 async def register(body: RegisterIn):
     if not USERNAME_RE.fullmatch(body.username):
         raise HTTPException(400, "username must be 3-20 chars: a-z, 0-9, _")
+    if len(body.password) < (n := await setting("password_min_length")):
+        raise HTTPException(400, f"password must be at least {n} characters")
     mobile = normalize_mobile(body.mobile)
     if mobile is None:
         raise HTTPException(400, "enter a valid 10-digit Indian mobile number")
