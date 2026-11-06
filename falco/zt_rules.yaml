@@ -67,3 +67,18 @@
     Privilege escalation attempt (container=%container.name proc=%proc.cmdline)
   priority: CRITICAL
   tags: [zt, privilege_escalation]
+
+- rule: ZT unexpected internet connection from internal service
+  desc: >
+    Internal services sit on internal-only networks and never call the internet; an outbound
+    connection to a public address means data exfiltration or command-and-control. The responder
+    is excluded (it may call the optional alert webhook).
+  condition: >
+    outbound and zt_container and
+    not container.label[com.docker.compose.service] in (responder, dashboard) and
+    not fd.snet in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8")
+  output: >
+    Internet connection from ZT-FinGuard service (container=%container.name proc=%proc.cmdline
+    connection=%fd.name)
+  priority: ERROR
+  tags: [zt, exfiltration, command_and_control, T1041]

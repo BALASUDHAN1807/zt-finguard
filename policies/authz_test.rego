@@ -9,8 +9,13 @@ transfer(subject, ctx) := {
 	"subject": subject,
 	"action": "transaction.transfer",
 	"resource": {"owner": "alice", "account": "ZT1"},
-	"context": object.union({"caller": "transaction", "amount": 1000, "risk_level": "low", "device_trust": "trusted",
-		"sender_status": "active", "receiver_status": "active", "daily_used": 0, "daily_limit": 100000}, ctx),
+	"context": object.union(
+		{
+			"caller": "transaction", "amount": 1000, "risk_level": "low", "device_trust": "trusted",
+			"sender_status": "active", "receiver_status": "active", "daily_used": 0, "daily_limit": 100000,
+		},
+		ctx,
+	),
 }
 
 test_low_risk_own_transfer_allowed if {
@@ -146,7 +151,7 @@ test_only_admin_sets_session_policy_or_quarantines if {
 }
 
 test_only_admin_searches_and_controls_users if {
-	every a in ["admin.search", "admin.user_control", "admin.fraud", "admin.containers"] {
+	every a in ["admin.search", "admin.user_control", "admin.fraud", "admin.containers", "admin.threats", "admin.network", "admin.policy", "admin.settings"] {
 		authz.decision.allow with input as {
 			"subject": {"user": "admin", "role": "admin", "mfa": true},
 			"action": a, "resource": {}, "context": {"caller": "gateway"},
@@ -204,8 +209,58 @@ test_operations_cannot_transfer_or_use_admin_tools if {
 }
 
 test_customer_cancels_only_own if {
-	authz.decision.allow with input as {"subject": customer, "action": "transaction.cancel",
-		"resource": {"owner": "alice"}, "context": {"caller": "transaction"}}
-	not authz.decision.allow with input as {"subject": customer, "action": "transaction.cancel",
-		"resource": {"owner": "bob"}, "context": {"caller": "transaction"}}
+	authz.decision.allow with input as {
+		"subject": customer, "action": "transaction.cancel",
+		"resource": {"owner": "alice"}, "context": {"caller": "transaction"},
+	}
+	not authz.decision.allow with input as {
+		"subject": customer, "action": "transaction.cancel",
+		"resource": {"owner": "bob"}, "context": {"caller": "transaction"},
+	}
+}
+
+# ------------------------------------------------ module 8: safe policy editor
+test_policy_data_can_lower_but_never_raise_limits if {
+	low := {"transfer_limit_customer": 10000, "high_value_threshold": 5000}
+	"amount_over_limit" in authz.decision.reasons with input as transfer(customer, {"amount": 20000})
+		with data.zt_policy as low
+	authz.decision.needs_approval with input as transfer(customer, {"amount": 6000}) with data.zt_policy as low
+	high := {"transfer_limit_customer": 9999999, "high_value_threshold": 9999999}
+	"amount_over_limit" in authz.decision.reasons with input as transfer(customer, {"amount": 250000})
+		with data.zt_policy as high
+	authz.decision.needs_approval with input as transfer(customer, {"amount": 60000}) with data.zt_policy as high
+}
+
+test_medium_risk_can_be_made_to_deny if {
+	d := authz.decision with input as transfer(customer, {"risk_level": "medium", "step_up": true})
+		with data.zt_policy as {"medium_risk_action": "deny"}
+	not d.allow
+	"medium_risk_denied_by_policy" in d.reasons
+}
+
+test_custom_deny_rules_add_denials_only if {
+	rules := {"custom_denies": [{"id": "r1", "role": "teller", "action": "account.read"}]}
+	teller := {"user": "t", "role": "teller", "mfa": true}
+	inp := {"subject": teller, "action": "account.read", "resource": {"owner": "alice"}, "context": {"caller": "account"}}
+	authz.decision.allow with input as inp
+	"custom_rule:r1" in authz.decision.reasons with input as inp with data.zt_policy as rules
+}
+
+test_custom_rules_cannot_lock_the_policy_editor if {
+	admin := {"user": "admin", "role": "admin", "mfa": true}
+	rules := {"custom_denies": [{"id": "x", "role": "*", "action": "admin.policy"}]}
+	authz.decision.allow with input as {"subject": admin, "action": "admin.policy", "resource": {}, "context": {"caller": "gateway"}}
+		with data.zt_policy as rules
+}
+
+test_corrupt_policy_data_stops_transfers if {
+	d := authz.decision with input as transfer(customer, {}) with data.zt_policy as {"transfer_limit_customer": "lots"}
+	not d.allow
+	"policy_config_invalid" in d.reasons
+}
+
+test_simulation_uses_candidate_without_changing_live if {
+	inp := object.union(transfer(customer, {"amount": 20000}), {"policy": {"transfer_limit_customer": 10000}})
+	"amount_over_limit" in authz.simulate.reasons with input as inp
+	authz.decision.allow with input as inp
 }

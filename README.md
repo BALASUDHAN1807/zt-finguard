@@ -25,6 +25,7 @@ Runs unchanged on **Docker** or **rootless Podman**.
 | **Customer-controlled session timeout** | customer picks the inactivity timeout, admin sets the maximum, gateway expires idle sessions; re-sign-in required (auto-refresh never counts as activity) |
 | **Automatic container quarantine** | Falco alert ≥ Critical → `responder` disconnects the container from every network, alerts the admin; one-click release |
 | **Device trust verification** | first device trusted; new devices are *pending* (view only, no transfers) until approved from a trusted device + TOTP; revoke ends sessions |
+| **Admin security dashboard** | 11 modules: overview, identity & devices, banking operations (maker-checker), AI fraud intelligence, container security, threat center, incident response, network map, restrict-only policy editor, audit & compliance, security settings ([docs/admin-dashboard.md](docs/admin-dashboard.md)) |
 | **Mobile + SMS OTP sign-in** | mobile number at sign-up; sign in with a one-time SMS code (5 min, single use, 3 tries); new device / unusual sign-in also needs the authenticator code. Simulated SMS inbox for the demo ([docs/mobile-otp.md](docs/mobile-otp.md)) |
 
 ## Architecture
@@ -110,8 +111,9 @@ through the same checks as any API call.
 |---|---|
 | customer | **My account** (balance, history with risk scores) · **Send money** (live risk score, reasons, step-up MFA, decision time) |
 | teller | **Account lookup** (read any account, cannot transfer) |
+| operations | **Banking & transactions** (accounts, pending approvals, freeze, daily limits, receipts) |
 | every role | **Security settings** (inactivity timeout, my devices: approve / revoke) |
-| admin | **Security overview** (posture score, incidents, fraud statistics, live feed, global search, quick actions - see [docs/admin-dashboard.md](docs/admin-dashboard.md)) · **Session & device policy** (maximum timeout, device inventory) · **Containers & quarantine** (live status, isolate / release) · **Security overview** (decisions, denials by reason, risk mix, ZT overhead vs 100 ms budget, service health, Trivy results; auto-refresh 5 s) · **Access decisions** (filterable audit stream) · **Risk model** (metrics, leaky vs leak-free, model card) · **Audit integrity** (verify hash chain) |
+| admin | **Security overview** · **Identity & devices** · **AI fraud intelligence** · **Container security** · **Threat center** · **Incident response** · **Network visualization** · **Policy management** (restrict-only editor, simulation, versions, rollback) · **Audit & compliance** (explorer, export, compliance report) · **Access decisions** · **Session & device policy** · **Security settings** (platform settings, keys & certificates) - see [docs/admin-dashboard.md](docs/admin-dashboard.md) |
 
 | | |
 |---|---|
@@ -122,8 +124,8 @@ through the same checks as any API call.
 ## Tests
 
 ```bash
-make opa-test     # 27 policy unit tests
-make test         # 44 end-to-end tests through the gateway (stack must be running)
+make opa-test     # 33 policy unit tests
+make test         # 56 end-to-end tests (49 through the gateway + 7 container tests; stack must be running)
 make scan         # Trivy; fails on CRITICAL vulnerabilities or leaked secrets
 ```
 
@@ -131,7 +133,7 @@ The end-to-end suite checks, against the live system: TLS 1.3 only, MFA, TOTP re
 enumeration, device binding, logout revocation, `alg:none` forgery, refresh-token reuse detection,
 broken object-level authorisation, teller/admin separation of duties, low/medium/high-risk transfer
 paths, step-up token binding, session revocation after a high-risk transfer, audit chain integrity
-account lockout, SMS OTP sign-in (single use, 3 tries, step-up on new devices, no enumeration).
+account lockout, SMS OTP sign-in (single use, 3 tries, step-up on new devices, no enumeration), and every admin dashboard module (policy editor restrict-only, compliance evidence, incident playbooks, settings).
 
 ## Linux & container features used
 

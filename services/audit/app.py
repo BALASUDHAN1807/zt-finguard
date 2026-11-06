@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
@@ -132,7 +132,7 @@ async def stats(_caller: str = Depends(mtls.require_caller("gateway"))):
             "WHERE created_at > now() - interval '24 hours' GROUP BY level")
         risk_levels = {r["level"]: r["n"] for r in await cur.fetchall()}
         cur = await conn.execute(
-            "SELECT count(*) AS n FROM audit_log WHERE service = 'falco' "
+            "SELECT count(*) AS n FROM audit_log WHERE (service = 'falco' OR action LIKE 'runtime.%%') "
             "AND ts > now() - interval '24 hours'")
         falco = (await cur.fetchone())["n"]
     return {
@@ -157,7 +157,7 @@ FALCO_LEVELS = {"emergency": "critical", "alert": "critical", "critical": "criti
 def severity(ev: dict) -> str:
     """One severity scale for every event source (Falco, policy, risk, auth)."""
     reason = ev.get("reason") or ""
-    if ev.get("service") == "falco":
+    if ev.get("service") == "falco" or str(ev.get("action", "")).startswith("runtime."):
         prio = str((ev.get("details") or {}).get("priority", "")).lower()
         return FALCO_LEVELS.get(prio, "medium")
     if ev.get("action", "").startswith("container.quarantine") or any(r in reason for r in CRITICAL_REASONS):
@@ -239,7 +239,7 @@ async def overview(_caller: str = Depends(mtls.require_caller("gateway"))):
         "alerts": alerts[:20],
         "feed": day[:25],
         "logins": logins,
-        "falco_alerts": sum(1 for e in day if e["service"] == "falco"),
+        "falco_alerts": sum(1 for e in day if e["service"] == "falco" or e["action"].startswith("runtime.")),
     }
 
 
@@ -510,7 +510,7 @@ async def container_history(service: str | None = Query(None, max_length=40), li
                             _caller: str = Depends(mtls.require_caller("gateway"))):
     """Quarantine, release, restart, recovery and Falco runtime alerts, newest first."""
     sql = ("SELECT id, ts, service, actor, action, resource, decision, reason, risk, details FROM audit_log "
-           "WHERE (action LIKE 'container.%%' OR service = 'falco')")
+           "WHERE (action LIKE 'container.%%' OR action LIKE 'runtime.%%' OR service = 'falco')")
     args: list = []
     if service:
         sql += " AND (resource = %s OR details->'fields'->>'container.name' LIKE %s)"
@@ -519,6 +519,347 @@ async def container_history(service: str | None = Query(None, max_length=40), li
     async with p.connection() as conn:
         cur = await conn.execute(sql + " ORDER BY id DESC LIMIT %s", (*args, limit))
         return [row_out(r) for r in await cur.fetchall()]
+
+
+# ---------------------------------------------- admin module 8: policy versions
+@app.get("/policy-versions")
+async def policy_versions(limit: int = Query(100, ge=1, le=500),
+                          _caller: str = Depends(mtls.require_caller("gateway"))):
+    """Every published policy version, newest first. Only the gateway's certificate can write them."""
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            "SELECT id, ts, service, actor, action, resource, decision, reason, risk, details FROM audit_log "
+            "WHERE action = 'policy.version' AND service = 'gateway' ORDER BY id DESC LIMIT %s", (limit,))
+        return [row_out(r) for r in await cur.fetchall()]
+
+
+# ---------------------------------------------- admin module 9: audit & compliance
+COLS = "id, ts, service, actor, action, resource, decision, reason, risk, details, prev_hash, hash"
+
+
+@app.get("/explore")
+async def explore(q: str | None = Query(None, max_length=80), service: str | None = Query(None, max_length=40),
+                  actor: str | None = Query(None, max_length=80), action: str | None = Query(None, max_length=60),
+                  decision: str | None = Query(None, pattern=r"^(allow|deny|step_up|alert|info)$"),
+                  severity: str | None = Query(None, pattern=r"^(info|low|medium|high|critical)$"),
+                  since: str | None = Query(None, max_length=40), until: str | None = Query(None, max_length=40),
+                  actors: str | None = Query(None, max_length=4000),
+                  before_id: int | None = Query(None, ge=1), limit: int = Query(200, ge=1, le=2000),
+                  _caller: str = Depends(mtls.require_caller("gateway"))):
+    """Filterable, paged view of the chain, including each entry's hash links."""
+    where, args = [], []
+    if q:
+        where.append("(actor ILIKE %s OR action ILIKE %s OR reason ILIKE %s OR resource ILIKE %s)")
+        args += [f"%{q}%"] * 4
+    for col, val in (("service", service), ("actor", actor), ("decision", decision)):
+        if val:
+            where.append(f"{col} = %s")
+            args.append(val)
+    if action:
+        where.append("action LIKE %s")
+        args.append(action.replace("%", "") + "%")
+    if actors is not None:
+        where.append("actor = ANY(%s)")
+        args.append([a for a in actors.split(",") if a])
+    for op, val in ((">=", since), ("<=", until)):
+        if val:
+            try:
+                where.append(f"ts {op} %s")
+                args.append(datetime.fromisoformat(val.replace("Z", "+00:00")))
+            except ValueError:
+                raise HTTPException(422, "since/until must be ISO-8601")
+    if before_id:
+        where.append("id < %s")
+        args.append(before_id)
+    sql = f"SELECT {COLS} FROM audit_log" + (" WHERE " + " AND ".join(where) if where else "")
+    fetch = limit * 4 if severity else limit
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(sql + " ORDER BY id DESC LIMIT %s", (*args, fetch))
+        rows = [row_out(r) for r in await cur.fetchall()]
+    if severity:
+        rows = [r for r in rows if r["severity"] == severity][:limit]
+    return {"rows": rows, "next_before_id": rows[-1]["id"] if len(rows) == limit else None}
+
+
+@app.get("/entry/{entry_id}")
+async def entry_proof(entry_id: int, _caller: str = Depends(mtls.require_caller("gateway"))):
+    """One entry with its proof: recomputed hash, link to the previous and the next entry."""
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(f"SELECT {COLS} FROM audit_log WHERE id BETWEEN %s AND %s ORDER BY id",
+                                 (entry_id - 1, entry_id + 1))
+        rows = {r["id"]: r for r in await cur.fetchall()}
+    row = rows.get(entry_id)
+    if not row:
+        raise HTTPException(404, "no such entry")
+    prev, nxt = rows.get(entry_id - 1), rows.get(entry_id + 1)
+    recomputed = chain.link(row["prev_hash"], row)
+    return {"entry": row_out(row), "recomputed_hash": recomputed, "hash_matches": recomputed == row["hash"],
+            "previous_hash": prev["hash"] if prev else chain.GENESIS,
+            "links_to_previous": row["prev_hash"] == (prev["hash"] if prev else chain.GENESIS),
+            "next_links_here": (nxt["prev_hash"] == row["hash"]) if nxt else None}
+
+
+@app.get("/compliance-facts")
+async def compliance_facts(days: int = Query(30, ge=1, le=365), actors: str = Query("", max_length=4000),
+                           _caller: str = Depends(mtls.require_caller("gateway"))):
+    """Evidence for the compliance report, computed from the chain itself."""
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            "SELECT count(*) AS total, min(ts) AS first, max(ts) AS last FROM audit_log")
+        tot = await cur.fetchone()
+        cur = await conn.execute(
+            "SELECT decision, count(*) AS n FROM audit_log WHERE ts > now() - make_interval(days => %s) "
+            "GROUP BY decision", (days,))
+        decisions = {r["decision"]: r["n"] for r in await cur.fetchall()}
+        cur = await conn.execute(
+            "SELECT action, count(*) AS n, max(ts) AS last FROM audit_log WHERE ts > now() - make_interval(days => %s) "
+            "AND action IN ('auth.login', 'admin.audit_verify', 'audit.export', 'compliance.report', 'policy.version', "
+            "'mtls.blocked', 'gateway.ip_blocked', 'auth.revoke_sessions') GROUP BY action", (days,))
+        actions = {r["action"]: {"count": r["n"], "last": chain.norm_ts(r["last"])} for r in await cur.fetchall()}
+        cur = await conn.execute(
+            "SELECT count(*) AS n FROM audit_log WHERE ts > now() - make_interval(days => %s) AND actor = ANY(%s)",
+            (days, [a for a in actors.split(",") if a]))
+        privileged = (await cur.fetchone())["n"]
+        cur = await conn.execute(
+            "SELECT count(*) FILTER (WHERE decision = 'allow') AS ok, count(*) FILTER (WHERE decision = 'deny') AS denied, "
+            "count(*) FILTER (WHERE decision = 'allow' AND (reason ILIKE '%%totp%%' OR reason ILIKE '%%otp%%' "
+            "OR reason ILIKE '%%sms%%')) AS multi_factor "
+            "FROM audit_log WHERE action = 'auth.login' AND ts > now() - make_interval(days => %s)", (days,))
+        logins = await cur.fetchone()
+        cur = await conn.execute(
+            "SELECT has_table_privilege(current_user, 'audit_log', 'UPDATE') AS can_update, "
+            "has_table_privilege(current_user, 'audit_log', 'DELETE') AS can_delete, "
+            "has_table_privilege(current_user, 'audit_log', 'TRUNCATE') AS can_truncate, current_user AS role")
+        priv = await cur.fetchone()
+    return {"days": days, "total": tot["total"], "first": chain.norm_ts(tot["first"]) if tot["first"] else None,
+            "last": chain.norm_ts(tot["last"]) if tot["last"] else None, "decisions": decisions, "actions": actions,
+            "privileged_events": privileged, "logins": dict(logins), "db_privileges": dict(priv)}
+
+
+# ---------------------------------------------- admin module 6: threat detection
+CATEGORY_TITLE = {
+    "unauthorized_shell": "Shell or tool started in a service container",
+    "privilege_escalation": "Privilege escalation attempt",
+    "file_modification": "Write attempt on a read-only container filesystem",
+    "credential_access": "Secret read by an unexpected process",
+    "network_connection": "Unexpected network connection",
+    "suspicious_process": "Suspicious process activity",
+    "container_compromise": "Container compromised and quarantined",
+    "jwt_theft": "Token theft or forgery",
+    "suspicious_login": "Suspicious sign-in activity",
+    "account_takeover": "Possible account takeover (high-risk transfer blocked)",
+}
+SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+RESPONSE_ACTIONS = {"container.release", "container.restart", "container.recover", "auth.revoke_sessions",
+                    "admin.force_logout", "admin.lock", "admin.unlock", "admin.session_revoke",
+                    "admin.device_revoke", "ops.freeze"}
+
+
+def service_of(container_name: str | None) -> str:
+    """'zt-finguard-account-1' / 'zt-finguard_account_1' -> 'account' (compose service name)."""
+    import re
+    m = re.match(r"^zt-finguard[-_](.+?)[-_]\d+$", container_name or "")
+    return m.group(1) if m else (container_name or "unknown")
+
+
+CONTAINER_CATEGORIES = {"unauthorized_shell", "privilege_escalation", "file_modification", "credential_access",
+                        "network_connection", "suspicious_process", "container_compromise"}
+
+
+def falco_category(rule: str) -> str:
+    r = rule.lower()
+    if "shell" in r or "tool spawned" in r:
+        return "unauthorized_shell"
+    if "privilege" in r:
+        return "privilege_escalation"
+    if "write" in r:
+        return "file_modification"
+    if "secret" in r:
+        return "credential_access"
+    if "connection" in r or "outbound" in r or "internet" in r:
+        return "network_connection"
+    return "suspicious_process"
+
+
+def detect(e: dict) -> dict | None:
+    """Turn one audit event into a categorised detection (or None)."""
+    reason, d = e.get("reason") or "", e.get("details") or {}
+    if e["service"] == "falco" or e["action"].startswith("runtime."):
+        fields = d.get("fields") or {}
+        return {"category": falco_category(d.get("rule") or e["action"]),
+                "subject": service_of(fields.get("container.name") or e["actor"] or e["resource"]),
+                "severity": severity(e), "summary": reason[:200], "source": "falco"}
+    if e["action"] == "container.quarantine":
+        return {"category": "container_compromise", "subject": e["resource"], "severity": "critical",
+                "summary": reason[:200], "source": "responder"}
+    if e["action"] == "gateway.verify" and e["decision"] == "deny":
+        if reason == "token_used_from_different_device":
+            return {"category": "jwt_theft", "subject": e["actor"], "severity": "high",
+                    "summary": "access token presented from a device it was not issued to", "source": "gateway"}
+        if reason.startswith("invalid_access_token") or reason == "wrong_token_type":
+            return {"category": "jwt_theft", "subject": (d.get("ip") or "unknown"), "severity": "high",
+                    "summary": f"forged or tampered token rejected ({reason})", "source": "gateway"}
+        if reason == "token_revoked_logout":
+            return {"category": "jwt_theft", "subject": e["actor"], "severity": "medium",
+                    "summary": "token replayed after sign-out", "source": "gateway"}
+    if e["action"] == "auth.refresh" and e["decision"] == "deny" and "refresh_token" in reason:
+        return {"category": "jwt_theft", "subject": e["actor"], "severity": "critical",
+                "summary": "refresh token reused or used from another device - every session ended",
+                "source": "auth"}
+    if e["action"] == "auth.login" and e["decision"] == "deny":
+        sev = {"login_risk_high": "high", "account_locked": "high", "device_revoked": "high"}.get(reason)
+        if sev:
+            return {"category": "suspicious_login", "subject": e["actor"], "severity": sev,
+                    "summary": reason.replace("_", " "), "source": "auth"}
+        if reason in ("bad_password", "bad_or_replayed_totp", "bad_sms_otp"):
+            return {"category": "suspicious_login", "subject": e["actor"], "severity": "low",
+                    "summary": reason.replace("_", " "), "source": "auth"}
+    if e["action"] == "transaction.transfer" and e["decision"] == "deny" and "risk_too_high" in reason:
+        return {"category": "account_takeover", "subject": e["actor"], "severity": "critical",
+                "summary": "high-risk transfer blocked, sessions ended", "source": "transaction"}
+    return None
+
+
+async def threat_events(days: int) -> list[dict]:
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """SELECT id, ts, service, actor, action, resource, decision, reason, risk, details FROM audit_log
+               WHERE ts > now() - make_interval(days => %s)
+                 AND (service = 'falco' OR action LIKE 'runtime.%%' OR action LIKE 'incident.%%' OR action = ANY(%s)
+                      OR (decision = 'deny' AND action IN ('gateway.verify', 'auth.refresh', 'auth.login',
+                                                           'transaction.transfer')))
+               ORDER BY id ASC LIMIT 100000""",
+            (days, ["container.quarantine", *RESPONSE_ACTIONS]))
+        return [row_out(r) for r in await cur.fetchall()]
+
+
+def build_incidents(events: list[dict]) -> tuple[dict, list[dict]]:
+    """Event-sourced incidents: detections open / grow incidents, analyst events change their state."""
+    incidents: dict[str, dict] = {}
+    open_by_key: dict[tuple, str] = {}
+    detections = []
+    for e in events:
+        if e["action"].startswith("incident."):
+            inc = incidents.get((e["details"] or {}).get("incident_id") or e["resource"])
+            if not inc:
+                continue
+            op, dd = e["action"].split(".", 1)[1], e["details"] or {}
+            inc["acknowledged_at"] = inc["acknowledged_at"] or e["ts"]    # first analyst touch = acknowledged
+            if op == "action":                                           # module 10: playbook step executed
+                inc["steps_done"][dd.get("step")] = {"ts": e["ts"], "actor": e["actor"], "result": dd.get("result")}
+                if dd.get("containment"):
+                    inc["contained_at"] = inc["contained_at"] or e["ts"]
+            elif op == "report":
+                inc["reported_at"], inc["report_ref"] = e["ts"], dd.get("reference")
+            elif op == "postmortem":
+                inc["postmortem"] = {k: dd.get(k) for k in ("root_cause", "impact", "lessons", "follow_up")}
+            if op == "status" and dd.get("status") == "contained":
+                inc["contained_at"] = inc["contained_at"] or e["ts"]
+            if op == "ack":
+                inc["status"] = "acknowledged" if inc["status"] == "new" else inc["status"]
+                inc["acknowledged_by"] = e["actor"]
+            elif op == "assign":
+                inc["assignee"] = dd.get("assignee")
+            elif op == "status":
+                inc["status"] = dd.get("status", inc["status"])
+            elif op == "resolve":
+                inc["status"] = "resolved"
+                inc["resolution"] = dd.get("note")
+                inc["resolved_at"] = e["ts"]
+                inc["resolved_by"] = e["actor"]
+                open_by_key.pop(inc["_key"], None)
+            inc["timeline"].append({"ts": e["ts"], "kind": "response" if op == "action" else "analyst",
+                                    "actor": e["actor"], "what": dd.get("step") if op == "action" else op,
+                                    "detail": dd.get("note") or dd.get("assignee") or dd.get("status")
+                                    or dd.get("result") or dd.get("reference") or dd.get("root_cause") or ""})
+            inc["updated"] = e["ts"]
+            continue
+        if e["action"] in RESPONSE_ACTIONS:
+            for inc in incidents.values():
+                if inc["status"] != "resolved" and inc["subject"] in (e["resource"], e["actor"]) \
+                        or (inc["status"] != "resolved" and (e["details"] or {}).get("customer") == inc["subject"]):
+                    inc["timeline"].append({"ts": e["ts"], "kind": "response", "actor": e["actor"],
+                                            "what": e["action"], "detail": e["reason"] or ""})
+            continue
+        det = detect(e)
+        if det is None:
+            continue
+        det |= {"audit_id": e["id"], "ts": e["ts"], "actor": e["actor"], "title": CATEGORY_TITLE[det["category"]]}
+        detections.append(det)
+        # a container's runtime alerts and its quarantine are one incident; others group by category + subject
+        key = ("container", det["subject"]) if det["category"] in CONTAINER_CATEGORIES else (det["category"],
+                                                                                               det["subject"])
+        iid = open_by_key.get(key)
+        if iid is None:
+            iid = f"INC-{e['id']}"
+            open_by_key[key] = iid
+            incidents[iid] = {"id": iid, "_key": key, "category": det["category"], "title": det["title"],
+                              "subject": det["subject"], "severity": det["severity"], "status": "new",
+                              "assignee": None, "first_seen": e["ts"], "last_seen": e["ts"], "updated": e["ts"],
+                              "detections": 0, "sources": set(), "summary": det["summary"], "timeline": [],
+                              "acknowledged_by": None, "resolution": None, "resolved_at": None, "resolved_by": None,
+                              "acknowledged_at": None, "contained_at": None, "steps_done": {}, "reported_at": None,
+                              "report_ref": None, "postmortem": None,
+                              "categories": set()}
+        inc = incidents[iid]
+        inc["categories"].add(det["category"])
+        if det["category"] in ("container_compromise", "account_takeover"):   # automatic quarantine / session kill
+            inc["contained_at"] = inc["contained_at"] or e["ts"]
+        inc["detections"] += 1
+        inc["last_seen"] = inc["updated"] = e["ts"]
+        inc["sources"].add(det["source"])
+        if SEV_RANK[det["severity"]] > SEV_RANK[inc["severity"]]:
+            inc["severity"] = det["severity"]
+        # repeated low-severity failures escalate (a burst of bad codes is an attack, one is a typo)
+        if inc["category"] == "suspicious_login" and inc["detections"] >= 5 and SEV_RANK[inc["severity"]] < 2:
+            inc["severity"] = "medium"
+        inc["timeline"].append({"ts": e["ts"], "kind": "detection", "actor": det["source"], "what": det["title"],
+                                "detail": det["summary"]})
+    for inc in incidents.values():
+        inc["sources"] = sorted(inc["sources"])
+        inc["categories"] = sorted(inc["categories"])
+        inc.pop("_key", None)
+    return incidents, detections
+
+
+@app.get("/threats")
+async def threats(days: int = Query(7, ge=1, le=90), _caller: str = Depends(mtls.require_caller("gateway"))):
+    incidents, detections = build_incidents(await threat_events(days))
+    visible = [i for i in incidents.values() if SEV_RANK[i["severity"]] >= 2 or i["status"] != "new"]
+    by_cat = {c: 0 for c in CATEGORY_TITLE}
+    for d in detections:
+        by_cat[d["category"]] += 1
+    sev = {k: 0 for k in SEV_RANK}
+    for d in detections:
+        sev[d["severity"]] += 1
+    # open first, then most severe, then most recent
+    out = sorted(visible, key=lambda i: i["last_seen"], reverse=True)
+    out = sorted(out, key=lambda i: (i["status"] == "resolved", -SEV_RANK[i["severity"]]))
+    return {
+        "days": days,
+        "detections_by_category": by_cat,
+        "detections_by_severity": sev,
+        "falco": [d for d in reversed(detections) if d["source"] == "falco"][:50],
+        "recent": list(reversed(detections))[:60],
+        "incidents": [{k: v for k, v in i.items() if k != "timeline"} for i in out],
+        "open": sum(1 for i in visible if i["status"] != "resolved"),
+        "low_noise_hidden": len(incidents) - len(visible),
+    }
+
+
+@app.get("/threats/incidents/{incident_id}")
+async def incident(incident_id: str, days: int = Query(30, ge=1, le=90),
+                   _caller: str = Depends(mtls.require_caller("gateway"))):
+    incidents, _ = build_incidents(await threat_events(days))
+    inc = incidents.get(incident_id)
+    if inc is None:
+        raise HTTPException(404, "incident not found")
+    return inc
 
 
 @app.get("/verify")

@@ -1,6 +1,6 @@
 # Admin Security Dashboard
 
-Eleven modules, built one at a time in this order. The administrator is a **security**
+Eleven modules, built one at a time in this order (all done). The administrator is a **security**
 role: it never sees balances or moves money (separation of duties). Banking operations
 belong to a separate **Operations** role (module 3).
 
@@ -11,12 +11,12 @@ belong to a separate **Operations** role (module 3).
 | 3 | Banking & Transactions (Operations role) | done |
 | 4 | AI Fraud Intelligence | done |
 | 5 | Container Security | done |
-| 6 | Threat Center | planned |
-| 7 | Network Visualization | planned |
-| 8 | Policy Management (safe editor) | planned |
-| 9 | Audit & Compliance | planned |
-| 10 | Incident Response | planned |
-| 11 | Security Settings | planned |
+| 6 | Threat Center | done |
+| 7 | Network Visualization | done |
+| 8 | Policy Management (safe editor) | done |
+| 9 | Audit & Compliance | done |
+| 10 | Incident Response | done |
+| 11 | Security Settings | done |
 
 ## Module 1 - Security Overview
 
@@ -173,3 +173,132 @@ container socket.
 OPA permission `admin.containers`. Tests: `test_container_inventory_hardening_and_signatures`,
 `test_container_restart_needs_admin_code_and_is_audited`, `test_tampered_image_manifest_is_detected`
 (edits the manifest and checks the signature fails).
+
+## Module 6 - Threat Center
+
+Page **Threat center** (admin), tabs **Incidents / Live runtime alerts / Detections**. The audit
+service turns the hash-chained log into detections and groups them into incidents.
+
+| Item | How |
+|---|---|
+| Detection categories | unauthorized shell, privilege escalation, file modification on a read-only rootfs, secret access, unexpected network connection (new Falco rule *ZT unexpected internet connection from internal service*), suspicious process, container compromise (quarantine), JWT theft / forgery, suspicious sign-in, account takeover (high-risk transfer blocked) |
+| Sources | Falco runtime alerts (`runtime.*` from the responder), gateway token checks, auth sign-in events, transaction risk denials, quarantine actions |
+| Incidents | related detections grouped (per container for runtime alerts, per actor + category otherwise); id `INC-<first audit id>`; severity = the worst detection |
+| Lifecycle | acknowledge, assign (to an administrator), status new / acknowledged / investigating / contained / resolved, notes; resolving needs a resolution note; a resolved incident cannot be changed (409). Every step is an `incident.*` audit event, so the history is tamper-evident |
+| Live runtime alerts | Falco stream with rule, priority, container and command line |
+
+OPA permission `admin.threats`. Tests: `test_token_theft_and_forgery_become_incidents`,
+`test_incident_lifecycle_is_recorded_in_the_audit_chain`, `test_runtime_alert_and_quarantine_form_one_incident`.
+
+## Module 7 - Network Visualization
+
+Page **Network visualization** (admin), tabs **Topology / Segmentation / Connections & mTLS /
+Blocked & suspicious / Service details**.
+
+| Item | How |
+|---|---|
+| Interactive topology | every service and allowed connection (vis-network graph): green = up and allowed, dashed red = blocked by quarantine, amber = one side down; click for protocol, networks, TLS version, certificate expiry |
+| Segmentation matrix | which container networks each service is on, live from the engine (edge-net is the only one reachable from the host) |
+| Live segmentation probe | the gateway tries a plain TCP connection to `postgres:5432`; it must fail because they share no network - proved, not assumed |
+| mTLS handshakes | the gateway does a real TLS handshake with each service using its client certificate: protocol (TLS 1.3), cipher, the server's certificate name, days until expiry |
+| Blocked connections | every mTLS call refused because the caller's certificate is not on the endpoint's allow-list is now audited as `mtls.blocked` (`untrusted_workload_identity`) and listed |
+| Suspicious connections | Falco network / secret-access detections from the Threat center |
+
+OPA permission `admin.network`. Tests: `test_network_map_proves_segmentation_and_mtls`,
+`test_refused_workload_identity_shows_on_the_network_map`.
+
+## Module 8 - Policy Management (safe editor)
+
+Page **Policy management** (admin), tabs **Active policy / Edit & simulate / What-if /
+Versions & rollback / Invariants**.
+
+**Design: restrict-only, code stays in git.** The Rego code is read-only (mounted from the
+repository). Administrators can only change bounded *tunables*, stored in OPA as
+`data.zt_policy`:
+
+| Setting | Allowed values |
+|---|---|
+| Per-transfer limit (customer) | ₹1,000 - ₹2,00,000 (baseline is the maximum) |
+| Operations approval from | ₹1,000 - ₹50,000, not above the transfer limit |
+| Medium risk | ask for a code (step-up) or deny |
+| Custom deny rules | role (or `*`) + action; `admin.policy`, `admin.audit`, `self.manage` are protected so nobody can lock the editor or hide the audit trail |
+| Blocked address ranges | CIDRs enforced at the gateway edge; at most /16, never covering the dashboard or loopback |
+
+The guarantees are enforced twice: the gateway validates every candidate, and the Rego itself
+takes `min(baseline, data)` so even a tampered data document cannot raise a limit, and a corrupt
+document stops transfers (`policy_config_invalid`) instead of opening them. OPA's own API lets
+**only the gateway** write `data.zt_policy`, and nobody can upload Rego.
+
+| Item | How |
+|---|---|
+| Simulation | candidate evaluated in OPA with `simulate := decision with data.zt_policy as input.policy` - nothing live changes |
+| Impact preview | 10 sample requests decided by the active policy and the candidate, with changes highlighted |
+| What-if | any role / action / amount / risk / device / MFA, against active and candidate |
+| Invariants | 14 scenarios no version may change (admins and operations never move money, high risk blocked, unknown risk denies, untrusted device denied, MFA required, frozen accounts, daily limit, over ₹2,00,000 refused, at the approval threshold a transfer waits for Operations, BOLA, unknown workloads refused, admins keep the editor and audit); a candidate that breaks one is refused (409) |
+| Publish | change comment + the administrator's authenticator code; stored as a `policy.version` audit event (hash-chained, only the gateway's certificate can write it) and pushed to OPA |
+| Versions & rollback | full history with who, when, why and what changed; rollback publishes a new version with the old settings, so history is never rewritten; v0 = baseline |
+| Recovery | the gateway re-reads the newest version from the audit log and re-publishes it to OPA at start-up and every 30 s (an OPA restart cannot silently drop a stricter policy for long) |
+
+OPA permission `admin.policy`. Policy tests: 33. Tests:
+`test_policy_editor_is_restrict_only_and_versioned`, `test_only_the_gateway_can_write_policy_data`.
+
+## Module 9 - Audit & Compliance
+
+Page **Audit & compliance** (admin), tabs **Compliance / Audit explorer / Chain integrity /
+Access review / Reports**.
+
+| Item | How |
+|---|---|
+| Compliance dashboard | 15 controls, each measured live and mapped to NIST SP 800-207, 800-190, 800-53, 800-63B, CISA ZTMM, PCI DSS v4 and RBI / CERT-In requirements: pass / warn / fail with the evidence |
+| Evidence sources | TLS 1.3 handshakes with certificate-name check, TCP probe gateway -> database, OPA invariant scenarios, container inspection, image signatures, Trivy, the database's own privilege table (`has_table_privilege`), sign-in methods, incidents, policy versions |
+| Audit explorer | filter by text, service, decision, severity, action prefix, date range, privileged users only; shows each entry's hash |
+| Export | CSV or JSON of the filtered rows with its SHA-256 (`X-Export-SHA256`); every export is itself an `audit.export` event |
+| Entry proof | recompute one entry's hash, check it links to the previous entry and that the next entry links to it |
+| Chain integrity | full verification (unchanged) |
+| Access review | every privileged account (admin, operations, teller): lock state, trusted devices, sessions, last seen, created; their actions in the period |
+| Retention | append-only, no delete path; the audit service's database role has only INSERT and SELECT (shown as evidence) |
+| Compliance report | frozen JSON + PDF; the report's SHA-256 is written into the chain (`compliance.report`), so a later edit is detectable (`sha256sum` must match) |
+
+This is a self-assessment for the course project, not a certification. Tests:
+`test_compliance_controls_are_measured_live`, `test_audit_explorer_filters_exports_and_proves_entries`,
+`test_compliance_report_is_anchored_in_the_chain`.
+
+## Module 10 - Incident Response
+
+Page **Incident response** (admin), tabs **Queue & SLA / Respond / Regulatory reporting /
+Post-incident review / Metrics**. Builds on the Module 6 incidents; everything is still
+event-sourced from the hash-chained audit log.
+
+| Item | How |
+|---|---|
+| Playbooks | per category. Account incidents (token theft, suspicious sign-in, takeover): end sessions, lock (code), call the customer, review devices, block the address range, ask Operations to freeze (admins cannot - separation of duties), label the transfer. Container incidents: quarantine (code), collect evidence, rotate secrets (secret access), recover from the signed image (code), verify |
+| Running a step | the gateway performs it with the same permission it needs elsewhere (`admin.user_control`, `admin.quarantine`, `admin.containers`) and writes `incident.action` with the result; manual steps are marked done with a note; nothing runs on a resolved incident |
+| SLA | acknowledge / resolve targets: critical 15 min / 4 h, high 1 h / 24 h, medium 4 h / 3 d, low 1 d / 7 d; breaches escalate to the team lead (missed acknowledgement) and CISO (missed resolution) |
+| Metrics | MTTA, MTTC (containment: quarantine, sessions ended, or status contained) and MTTR per severity, SLA breaches |
+| Regulatory reporting | high and critical incidents are reportable to CERT-In within 6 hours of first detection; deadline, overdue flag, and the recorded reference number (`incident.report`) |
+| Post-incident review | root cause, impact, lessons, follow-up (`incident.postmortem`) and a PDF incident report with the timeline |
+
+Tests: `test_incident_playbook_reporting_and_sla_are_audited`.
+
+## Module 11 - Security Settings
+
+Page **Security settings** (admin), tabs **Platform settings / Keys & certificates / Change
+history / My session & devices**.
+
+| Setting | Allowed (baseline = weakest) |
+|---|---|
+| Failed sign-ins before lock | 3 - 5 (baseline 5) |
+| Lockout duration | 15 - 1440 min (baseline 15) |
+| Minimum password length (new accounts) | 10 - 32 (baseline 10) |
+| SMS code validity | 60 - 300 s (baseline 300) |
+| Wrong SMS codes before the code is destroyed | 1 - 3 (baseline 3) |
+
+Restrict-only like the policy editor: the gateway validates, the **auth service clamps again**
+when it reads `zt:settings` from Redis (so a tampered value can only make sign-in stricter) and
+applies changes within 5 seconds. A change needs a comment and the administrator's
+authenticator code, and is a `settings.change` audit event with from / to values. Fixed
+controls (MFA always, 15-minute device-bound tokens, refresh rotation, rate limits, TLS 1.3) are
+listed read-only. **Keys & certificates**: CA and gateway certificate expiry and fingerprint, each
+service's certificate (live handshake), JWT signing-key fingerprint, rotation commands.
+
+OPA permission `admin.settings`. Tests: `test_security_settings_are_restrict_only_audited_and_enforced`.

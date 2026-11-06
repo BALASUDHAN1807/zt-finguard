@@ -60,6 +60,10 @@ permissions := {
 		"admin.user_control",
 		"admin.fraud",
 		"admin.containers",
+		"admin.threats",
+		"admin.network",
+		"admin.policy",
+		"admin.settings",
 		"self.manage",
 	},
 }
@@ -78,6 +82,10 @@ trusted_callers := {
 	"admin.user_control": {"gateway"},
 	"admin.fraud": {"gateway"},
 	"admin.containers": {"gateway"},
+	"admin.threats": {"gateway"},
+	"admin.network": {"gateway"},
+	"admin.policy": {"gateway"},
+	"admin.settings": {"gateway"},
 	"self.manage": {"gateway"},
 	"ops.accounts": {"account"},
 	"ops.transactions": {"account"},
@@ -88,11 +96,42 @@ trusted_callers := {
 	"beneficiary.manage": {"account"},
 }
 
+# ------------------------------------------------ tunable policy (module 8)
+# Administrators tune these through the gateway's safe editor, which writes
+# data.zt_policy. The editor is RESTRICT-ONLY and this file enforces that again:
+# data can lower a limit but never raise it above the baseline below, can make
+# medium risk deny instead of step-up, and can add deny rules - never allow rules.
+baseline := {
+	"transfer_limit_customer": 200000,
+	"high_value_threshold": 50000,
+	"medium_risk_action": "step_up",
+	"custom_denies": [],
+}
+
+default policy_data := {}
+
+policy_data := p if {
+	p := data.zt_policy
+	is_object(p)
+}
+
+cfg := object.union(baseline, policy_data)
+
+cfg_valid if {
+	is_number(cfg.transfer_limit_customer)
+	is_number(cfg.high_value_threshold)
+	cfg.medium_risk_action in {"step_up", "deny"}
+	is_array(cfg.custom_denies)
+}
+
 # Per-transfer ceiling by role (INR).
-transfer_limit := {"customer": 200000}
+transfer_limit := {"customer": min([baseline.transfer_limit_customer, cfg.transfer_limit_customer])}
 
 # Transfers at or above this amount wait for an operations officer (maker-checker).
-high_value_threshold := 50000
+high_value_threshold := min([baseline.high_value_threshold, cfg.high_value_threshold])
+
+# Custom rules can never block the policy editor itself, the audit trail or a user's own security settings.
+protected_actions := {"admin.policy", "admin.audit", "self.manage"}
 
 # ------------------------------------------------------------------- helpers
 role := input.subject.role
@@ -161,6 +200,26 @@ deny contains "daily_limit_exceeded" if {
 	not within_daily_limit
 }
 
+# A corrupt policy document must stop money, not open the gates.
+deny contains "policy_config_invalid" if {
+	is_transfer
+	not cfg_valid
+}
+
+deny contains "medium_risk_denied_by_policy" if {
+	is_transfer
+	input.context.risk_level == "medium"
+	cfg.medium_risk_action == "deny"
+}
+
+deny contains reason if {
+	some rule in cfg.custom_denies
+	rule.action == input.action
+	rule.role in {role, "*"}
+	not input.action in protected_actions
+	reason := concat(":", ["custom_rule", rule.id])
+}
+
 # ---------------------------------------------------------- maker-checker
 needs_approval if {
 	is_transfer
@@ -194,6 +253,12 @@ decision := {
 	"step_up": step_up,
 	"needs_approval": needs_approval,
 	"reasons": reasons,
+}
+
+# Policy simulation: the same decision evaluated against a candidate policy
+# document (input.policy) without changing what is live.
+simulate := d if {
+	d := decision with data.zt_policy as object.get(input, "policy", {})
 }
 
 default allow := false

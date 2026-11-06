@@ -11,6 +11,7 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import ssl
 import time
@@ -279,7 +280,8 @@ def pill(decision: str) -> str:
     cls = {"allow": "zt-allow", "deny": "zt-deny", "step_up": "zt-step", "alert": "zt-deny",
            "pending_approval": "zt-step",
            "critical": "zt-critical", "high": "zt-high", "medium": "zt-medium", "low": "zt-low",
-           "info": "zt-info"}.get(decision, "")
+           "info": "zt-info", "new": "zt-high", "acknowledged": "zt-step", "investigating": "zt-step",
+           "contained": "zt-low", "resolved": "zt-allow"}.get(decision, "")
     return f'<span class="zt-pill {cls}">{decision.upper()}</span>'
 
 
@@ -470,8 +472,10 @@ def sidebar() -> str:
             "customer": ["My account", "Send money", "Security settings"],
             "teller": ["Account lookup", "Security settings"],
             "operations": ["Banking & transactions", "Security settings"],
-            "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Access decisions", "Audit integrity",
-                      "Session & device policy", "Container security", "Security settings"],
+            "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Container security",
+                      "Threat center", "Incident response", "Network visualization", "Policy management",
+                      "Audit & compliance", "Access decisions", "Session & device policy",
+                      "Security settings"],
         }[ss.role]
         page = st.radio("Navigate", pages, label_visibility="collapsed")
         st.divider()
@@ -999,6 +1003,77 @@ def audit_integrity() -> None:
 # ------------------------------------------------- F19 / F21: self-service
 def security_settings() -> None:
     st.title("Security settings")
+    if S().role == "admin":
+        t = st.tabs(["Platform settings", "Keys & certificates", "Change history", "My session & devices"])
+        r = api("GET", "/api/admin/settings")
+        if r is None or r.status_code != 200:
+            t[0].error(detail(r) if r is not None else "unavailable")
+        else:
+            d = r.json()
+            with t[0]:
+                platform_settings(d)
+            with t[1]:
+                keys_and_certs(d)
+            with t[2]:
+                h = pd.DataFrame(d["history"])
+                if h.empty:
+                    st.caption("No changes yet - baseline settings are active.")
+                else:
+                    h["time"] = local_time(h["ts"], "%d %b %Y %H:%M")
+                    h["changes"] = h["details"].apply(lambda x: "; ".join(
+                        f"{c['setting']}: {c['from']} -> {c['to']}" for c in (x or {}).get("changes", [])))
+                    st.dataframe(h[["time", "actor", "reason", "changes", "id"]], hide_index=True,
+                                 use_container_width=True, column_config={"reason": "comment", "id": "audit #"})
+        with t[3]:
+            personal_security_settings()
+        return
+    personal_security_settings()
+
+
+def platform_settings(d: dict) -> None:
+    st.caption("Restrict-only: each setting can be made stricter than the baseline, never weaker. The auth "
+               "service clamps the values again, applies them within 5 seconds, and every change needs your "
+               "authenticator code and is written to the audit chain.")
+    with st.form("plat_settings"):
+        vals = {}
+        cols = st.columns(2)
+        for i, x in enumerate(d["settings"]):
+            vals[x["key"]] = cols[i % 2].number_input(
+                f"{x['label']} ({x['min']}-{x['max']}, {x['stricter']} is stricter)", min_value=x["min"],
+                max_value=x["max"], value=x["value"], step=1, key=f"ps_{x['key']}")
+        comment = st.text_input("Change comment (required)", max_chars=200)
+        code = st.text_input("Your authenticator code", max_chars=6)
+        c1, c2 = st.columns(2)
+        save = c1.form_submit_button("Save", type="primary", use_container_width=True)
+        reset = c2.form_submit_button("Reset all to baseline", use_container_width=True)
+        if save or reset:
+            body = {x["key"]: (x["baseline"] if reset else int(vals[x["key"]])) for x in d["settings"]}
+            ok_or_error(api("PUT", "/api/admin/settings", json={"values": body, "totp": code.strip(),
+                                                               "comment": comment or ("reset" if reset else "")}),
+                        "Saved.")
+    st.markdown("**Fixed controls** (code, not configurable)")
+    st.dataframe(pd.DataFrame(d["fixed"]), hide_index=True, use_container_width=True)
+
+
+def keys_and_certs(d: dict) -> None:
+    k = d["keys"]
+    ca, gw = k["ca"], k["gateway_certificate"]
+    c = st.columns(3)
+    c[0].metric("Root CA valid for", f"{ca.get('days_left', '?')} days")
+    c[1].metric("Gateway certificate", f"{gw.get('days_left', '?')} days")
+    svc = k["services"]
+    soon = [s for s, v in svc.items() if (v.get("days_left") or 999) < 30]
+    c[2].metric("Service certificates expiring < 30 days", len(soon))
+    st.dataframe(pd.DataFrame([{"service": s, "certificate name": v["server_cn"], "days left": v["days_left"],
+                                "handshake": "ok" if v["reachable"] else "FAILED"} for s, v in svc.items()]),
+                 hide_index=True, use_container_width=True)
+    st.code(f"CA        sha256 {ca.get('sha256', '?')}\nJWT key   sha256 {k['jwt_signing_key_sha256']}")
+    st.markdown("**Rotation**: `make rotate-certs` issues new service certificates from the CA and recreates "
+                "the containers. JWT signing key: delete `secrets/jwt_private.pem`, run `make secrets` and redeploy "
+                "(everyone signs in again). Private keys never leave `/run/secrets` inside the containers.")
+
+
+def personal_security_settings() -> None:
     tab_s, tab_d = st.tabs(["Session timeout", "My devices"])
 
     with tab_s:
@@ -1391,25 +1466,45 @@ def pdf_escape(t: str) -> str:
 
 
 def simple_pdf(title: str, rows: list[tuple[str, str]], footer: str) -> bytes:
-    """One-page A4 PDF built by hand (Helvetica, no extra libraries in the image)."""
-    ops = ["BT /F2 18 Tf 56 770 Td (" + pdf_escape(title) + ") Tj ET",
-           "0.72 0.54 0.17 RG 2 w 56 756 m 539 756 l S"]
-    y = 726
+    """A4 PDF built by hand (Helvetica, no extra libraries in the image); long values wrap, pages break."""
+    import textwrap
+    pages, ops, y = [], None, 0
+
+    def new_page(first: bool):
+        nonlocal ops, y
+        ops = ["BT /F2 18 Tf 56 770 Td (" + pdf_escape(title + ("" if first else " (continued)")) + ") Tj ET",
+               "0.72 0.54 0.17 RG 2 w 56 756 m 539 756 l S"]
+        pages.append(ops)
+        y = 726
+
+    new_page(True)
     for k, v in rows:
+        v = str(v)
+        lines = [v] if len(v) <= 55 else textwrap.wrap(v, 72) or [""]
+        need = 24 if len(lines) == 1 else 12 * len(lines) + 10
+        if y - need < 80:
+            new_page(False)
         ops.append(f"BT /F1 10 Tf 0.35 0.42 0.44 rg 56 {y} Td ({pdf_escape(k)}) Tj ET")
-        ops.append(f"BT /F2 11 Tf 0.08 0.15 0.17 rg 220 {y} Td ({pdf_escape(v)}) Tj ET")
-        y -= 24
+        if len(lines) == 1:
+            ops.append(f"BT /F2 11 Tf 0.08 0.15 0.17 rg 220 {y} Td ({pdf_escape(v)}) Tj ET")
+        else:
+            for i, line in enumerate(lines):
+                ops.append(f"BT /F1 9 Tf 0.08 0.15 0.17 rg 220 {y - 12 * i} Td ({pdf_escape(line)}) Tj ET")
+        y -= need
     ops.append(f"0.85 0.88 0.89 RG 1 w 56 {y + 8} m 539 {y + 8} l S")
     for i, line in enumerate(footer.split("\n")):
         ops.append(f"BT /F1 8 Tf 0.35 0.42 0.44 rg 56 {y - 12 - 12 * i} Td ({pdf_escape(line)}) Tj ET")
-    content = "\n".join(ops).encode("latin-1")
+    n = len(pages)
     objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R "
-            b"/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> >>",
-            b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream",
+            b"<< /Type /Pages /Kids [" + " ".join(f"{5 + 2 * i} 0 R" for i in range(n)).encode()
+            + b"] /Count " + str(n).encode() + b" >>",
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"]
+    for i, pg in enumerate(pages):
+        content = "\n".join(pg).encode("latin-1", "replace")
+        objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents " + str(6 + 2 * i).encode()
+                    + b" 0 R /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> >>")
+        objs.append(b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream")
     out, offsets = bytearray(b"%PDF-1.4\n"), []
     for i, o in enumerate(objs, 1):
         offsets.append(len(out))
@@ -2144,6 +2239,859 @@ def cont_actions(cs: list[dict]) -> None:
         st.caption("No quarantines, restarts, recoveries or runtime alerts yet.")
 
 
+# ------------------------------------------- admin module 10: incident response
+def fmt_min(m) -> str:
+    if m is None:
+        return "-"
+    return f"{m:.0f} min" if m < 120 else f"{m / 60:.1f} h" if m < 2880 else f"{m / 1440:.1f} d"
+
+
+def incident_response() -> None:
+    st.title("Incident response")
+    days = st.selectbox("Period", [7, 30, 90], index=1, format_func=lambda d: f"last {d} days", key="ir_days")
+    r = api("GET", "/api/admin/incidents", params={"days": days})
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    d = r.json()
+    incs = d["incidents"]
+    k = st.columns(5)
+    k[0].metric("Open incidents", d["open"])
+    k[1].metric("Escalated (SLA breached)", d["escalated"])
+    k[2].metric("CERT-In report overdue", d["report_overdue"], help=f"High and critical incidents must be "
+                f"reported within {d['report_window_h']} hours")
+    crit = d["metrics"]["critical"]
+    k[3].metric("MTTA (critical)", fmt_min(crit["mtta_min"]), help="mean time to acknowledge")
+    k[4].metric("MTTR (critical)", fmt_min(crit["mttr_min"]), help="mean time to resolve")
+    t = st.tabs(["Queue & SLA", "Respond", "Regulatory reporting", "Post-incident review", "Metrics"])
+    with t[0]:
+        if not incs:
+            st.success("No incidents in this period.")
+        else:
+            df = pd.DataFrame([{"id": i["id"], "severity": i["severity"], "status": i["status"], "title": i["title"],
+                                "subject": i["subject"], "age": fmt_min(i["sla"]["age_min"]),
+                                "acknowledged in": fmt_min(i["sla"]["time_to_ack_min"]),
+                                "contained in": fmt_min(i["sla"]["time_to_contain_min"]),
+                                "resolved in": fmt_min(i["sla"]["time_to_resolve_min"]),
+                                "SLA": "BREACHED" if i["sla"]["ack_breached"] or i["sla"]["resolve_breached"]
+                                else "ok", "escalated to": i["sla"]["escalation"],
+                                "playbook": i["playbook_progress"], "assignee": i.get("assignee") or ""}
+                               for i in incs])
+            st.dataframe(df, hide_index=True, use_container_width=True, height=420)
+        st.caption("SLA targets (acknowledge / resolve): " + ", ".join(
+            f"{sev} {fmt_min(a)} / {fmt_min(b)}" for sev, (a, b) in d["sla"].items() if sev != "info")
+            + ". Escalation: team lead after a missed acknowledgement, CISO after a missed resolution.")
+    open_ids = [i["id"] for i in incs]
+    with t[1]:
+        if not open_ids:
+            st.caption("Nothing to respond to.")
+        else:
+            labels = {i["id"]: f"{i['id']} - {i['severity']} - {i['title']} ({i['subject']}) - {i['status']}"
+                      for i in incs}
+            iid = st.selectbox("Incident", open_ids, format_func=labels.get, key="ir_pick")
+            ir_respond(iid, d["analysts"])
+    with t[2]:
+        rep = [i for i in incs if i["regulatory"]["reportable"]]
+        if not rep:
+            st.caption("No reportable (high / critical) incidents in this period.")
+        else:
+            st.dataframe(pd.DataFrame([{"id": i["id"], "severity": i["severity"], "title": i["title"],
+                                        "report by": local_time(pd.Series([i["regulatory"]["deadline"]]),
+                                                                "%d %b %H:%M").iloc[0],
+                                        "reported": i["regulatory"]["reference"] or
+                                        ("OVERDUE" if i["regulatory"]["overdue"] else "not yet")} for i in rep]),
+                         hide_index=True, use_container_width=True)
+            with st.form("ir_rep"):
+                rid = st.selectbox("Incident", [i["id"] for i in rep if not i["regulatory"]["reference"]] or ["-"])
+                ref = st.text_input("Regulator acknowledgement / reference number", max_chars=60)
+                if st.form_submit_button("Record report"):
+                    ok_or_error(api("POST", f"/api/admin/incidents/{rid}/report", json={"reference": ref.strip()}),
+                                "Report recorded in the audit chain.")
+            st.caption("Indian banks report cyber incidents to CERT-In within 6 hours (CERT-In directions, "
+                       "April 2022) and to the RBI. The clock starts at first detection.")
+    with t[3]:
+        done = [i for i in incs if i["status"] == "resolved"] or incs
+        if not done:
+            st.caption("No incidents to review.")
+        else:
+            pid = st.selectbox("Incident", [i["id"] for i in done], key="ir_pm_pick",
+                               format_func=lambda x: next(f"{i['id']} - {i['title']} ({i['status']})"
+                                                          for i in done if i["id"] == x))
+            ir_postmortem(pid)
+    with t[4]:
+        m = pd.DataFrame([{"severity": sev, "incidents": v["count"], "MTTA": fmt_min(v["mtta_min"]),
+                           "MTTC": fmt_min(v["mttc_min"]), "MTTR": fmt_min(v["mttr_min"]),
+                           "SLA breaches": v["breached"]} for sev, v in d["metrics"].items()])
+        st.dataframe(m, hide_index=True, use_container_width=True)
+        st.caption("MTTA = first detection to first analyst action; MTTC = to containment (quarantine, sessions "
+                   "ended or status contained); MTTR = to resolution. All from the hash-chained audit log.")
+
+
+def ir_respond(iid: str, analysts: list[str]) -> None:
+    r = api("GET", f"/api/admin/incidents/{iid}")
+    if r is None or r.status_code != 200:
+        ok_or_error(r, "")
+        return
+    inc = r.json()
+    c = st.columns(4)
+    c[0].metric("Severity", inc["severity"])
+    c[1].metric("Status", inc["status"])
+    c[2].metric("Age", fmt_min(inc["sla"]["age_min"]))
+    c[3].metric("Escalation", inc["sla"]["escalation"])
+    st.markdown(f"**{inc['title']}** - subject `{inc['subject']}` - {inc['summary']}")
+    st.markdown("**Playbook**")
+    resolved = inc["status"] == "resolved"
+    for x in inc["playbook"]:
+        cols = st.columns([5, 2, 2])
+        mark = "done" if x["done"] else ("not applicable" if not x["applicable"] else "to do")
+        cols[0].markdown(f"{'~~' if not x['applicable'] else ''}{x['title']}{'~~' if not x['applicable'] else ''}"
+                         + (f"  \n<small>{x['help']}</small>" if x["help"] else ""), unsafe_allow_html=True)
+        cols[1].caption(mark + (f" by {x['done']['actor']}: {x['done']['result']}" if x["done"] else ""))
+        if not resolved and x["applicable"] and not x["done"]:
+            label = "Run" if x["kind"] == "action" else "Mark done"
+            if cols[2].button(label, key=f"ir_{iid}_{x['id']}", use_container_width=True):
+                st.session_state["ir_step"] = (iid, x)
+    pend = st.session_state.get("ir_step")
+    if pend and pend[0] == iid:
+        x = pend[1]
+        with st.form("ir_step_form"):
+            st.markdown(f"**{x['title']}**")
+            note = st.text_input("Note", max_chars=300)
+            code = st.text_input("Your authenticator code", max_chars=6) if x["needs_code"] else ""
+            if st.form_submit_button("Confirm", type="primary"):
+                res = api("POST", f"/api/admin/incidents/{iid}/steps/{x['id']}", json={"note": note, "totp": code})
+                if res is not None and res.status_code == 200:
+                    st.session_state.pop("ir_step", None)
+                    st.success(f"Done: {res.json()['result']}")
+                else:
+                    ok_or_error(res, "")
+    if not resolved:
+        with st.form("ir_triage"):
+            c = st.columns(3)
+            who = c[0].selectbox("Assign to", [""] + analysts)
+            status = c[1].selectbox("Status", ["", "acknowledged", "investigating", "contained"])
+            note = c[2].text_input("Note / resolution", max_chars=500)
+            b = st.columns(3)
+            if b[0].form_submit_button("Update"):
+                if who:
+                    api("POST", f"/api/admin/threats/incidents/{iid}/assign", json={"assignee": who})
+                if status:
+                    api("POST", f"/api/admin/threats/incidents/{iid}/status", json={"status": status})
+                if note:
+                    api("POST", f"/api/admin/threats/incidents/{iid}/note", json={"note": note})
+                st.success("Updated.")
+            if b[2].form_submit_button("Resolve"):
+                ok_or_error(api("POST", f"/api/admin/threats/incidents/{iid}/resolve", json={"note": note}),
+                            "Resolved.")
+    st.markdown("**Timeline**")
+    tl = pd.DataFrame(inc.get("timeline", []))
+    if not tl.empty:
+        tl["time"] = local_time(tl["ts"], "%d %b %H:%M:%S")
+        st.dataframe(tl[["time", "kind", "actor", "what", "detail"]], hide_index=True, use_container_width=True)
+
+
+def ir_postmortem(iid: str) -> None:
+    r = api("GET", f"/api/admin/incidents/{iid}")
+    if r is None or r.status_code != 200:
+        ok_or_error(r, "")
+        return
+    inc = r.json()
+    pm = inc.get("postmortem") or {}
+    with st.form("ir_pm"):
+        rc = st.text_area("Root cause", value=pm.get("root_cause") or "", max_chars=1000)
+        im = st.text_area("Impact", value=pm.get("impact") or "", max_chars=1000)
+        le = st.text_area("Lessons learned", value=pm.get("lessons") or "", max_chars=1000)
+        fu = st.text_area("Follow-up actions", value=pm.get("follow_up") or "", max_chars=1000)
+        if st.form_submit_button("Save review", type="primary"):
+            ok_or_error(api("POST", f"/api/admin/incidents/{iid}/postmortem",
+                            json={"root_cause": rc, "impact": im, "lessons": le, "follow_up": fu}),
+                        "Saved in the audit chain.")
+    s = inc["sla"]
+    rows = [("Incident", f"{inc['id']} - {inc['title']}"), ("Severity / status", f"{inc['severity']} / {inc['status']}"),
+            ("Subject", str(inc["subject"])), ("First seen", inc["first_seen"][:19].replace("T", " ") + " UTC"),
+            ("Acknowledged in", fmt_min(s["time_to_ack_min"])), ("Contained in", fmt_min(s["time_to_contain_min"])),
+            ("Resolved in", fmt_min(s["time_to_resolve_min"])),
+            ("SLA", "breached" if s["ack_breached"] or s["resolve_breached"] else "met"),
+            ("Regulator reference", inc["regulatory"]["reference"] or "-"),
+            ("Resolution", (inc.get("resolution") or "-")[:110]),
+            ("Root cause", (pm.get("root_cause") or "-")[:110]), ("Impact", (pm.get("impact") or "-")[:110]),
+            ("Lessons", (pm.get("lessons") or "-")[:110]), ("Follow-up", (pm.get("follow_up") or "-")[:110])]
+    rows += [(x["ts"][11:19], f"{x['kind']}: {x['what']} {x.get('detail') or ''}"[:110])
+             for x in inc.get("timeline", [])[:25]]
+    st.download_button("Download incident report (PDF)", simple_pdf(f"Incident report {inc['id']}", rows,
+                                                                     "Source: ZT-FinGuard hash-chained audit log"),
+                       file_name=f"{inc['id']}.pdf", mime="application/pdf")
+
+
+# ------------------------------------------- admin module 9: audit & compliance
+STATUS_ICON = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}
+
+
+def audit_compliance() -> None:
+    st.title("Audit & compliance")
+    t = st.tabs(["Compliance", "Audit explorer", "Chain integrity", "Access review", "Reports"])
+    with t[1]:
+        audit_explorer()
+    with t[2]:
+        audit_integrity_tab()
+    days = t[0].selectbox("Period", [7, 30, 90, 365], index=1, format_func=lambda d: f"last {d} days", key="cp_days")
+    r = api("GET", "/api/admin/compliance", params={"days": days})
+    if r is None or r.status_code != 200:
+        t[0].error(detail(r) if r is not None else "unavailable")
+        return
+    c = r.json()
+    with t[0]:
+        k = st.columns(4)
+        k[0].metric("Controls passing", f"{c['passed']} / {c['total']}", help="Each control is checked live")
+        k[1].metric("Compliance score", f"{c['score']} %")
+        k[2].metric("Audit entries", f"{c['audit']['entries'] or 0:,}")
+        k[3].metric("Hash chain", "intact" if c["audit"]["chain_ok"] else "BROKEN")
+        df = pd.DataFrame(c["controls"])
+        df["status"] = df["status"].map(STATUS_ICON)
+        df["frameworks"] = df["frameworks"].apply(lambda x: "; ".join(x))
+        st.dataframe(df[["id", "status", "title", "evidence", "frameworks"]], hide_index=True,
+                     use_container_width=True, height=560)
+        st.caption("Evidence is measured, not declared: TLS handshakes, a TCP probe to the database, OPA invariant "
+                   "scenarios, container inspection, image signatures, database privileges and the audit chain. "
+                   "Framework references show which requirement each control supports; this is a self-assessment "
+                   "for the course project, not a certification.")
+    with t[3]:
+        st.markdown(f"**{len(c['access_review'])} privileged accounts** of {c['users_total']} "
+                    f"({c['audit']['privileged_events'] or 0:,} actions by them in {days} days)")
+        ar = pd.DataFrame(c["access_review"])
+        if not ar.empty:
+            ar["last_seen"] = local_time(ar["last_seen"], "%d %b %Y %H:%M").where(ar["last_seen"].notna(), "never")
+            ar["created_at"] = local_time(ar["created_at"], "%d %b %Y")
+            st.dataframe(ar, hide_index=True, use_container_width=True)
+        st.caption("Review every privileged account each quarter: still needed, right role, trusted device. "
+                   "Change roles or lock accounts under Identity & devices (needs your authenticator code).")
+        st.caption("Their actions: Audit explorer tab, tick 'Privileged users only'.")
+    with t[4]:
+        st.markdown("A report freezes the current evidence. Its SHA-256 fingerprint is written into the audit "
+                    "chain, so anyone can later prove the PDF or JSON was not edited.")
+        if st.button("Generate compliance report", type="primary", key="cp_gen"):
+            g = api("POST", "/api/admin/compliance/report", params={"days": days})
+            if g is None or g.status_code != 200:
+                ok_or_error(g, "")
+            else:
+                st.session_state["cp_report"] = g.json()
+        rep = st.session_state.get("cp_report")
+        if rep:
+            st.success(f"Anchored as audit entry #{rep['audit_id']}.")
+            st.code(f"report sha256 = {rep['sha256']}\naudit hash    = {rep['audit_hash']}")
+            rr = rep["report"]
+            rows = [("Generated", rr["generated_at"][:19].replace("T", " ") + " UTC by " + rr["generated_by"]),
+                    ("Period", f"last {rr['period_days']} days"),
+                    ("Result", f"{rr['passed']} of {rr['total']} controls pass ({rr['score']} %)"),
+                    ("Audit chain", f"{rr['audit']['entries']} entries, " +
+                     ("intact" if rr["audit"]["chain_ok"] else "BROKEN")),
+                    ("Chain head", (rr["audit"]["chain_head"] or "")[:32] + "...")]
+            rows += [(f"{x['id']} {STATUS_ICON[x['status']]}", f"{x['title']} - {x['evidence']}"[:110])
+                     for x in rr["controls"]]
+            rows += [("Access review", f"{len(rr['access_review'])} privileged accounts")]
+            c1, c2 = st.columns(2)
+            c1.download_button("Download PDF", simple_pdf("ZT-FinGuard compliance report", rows,
+                                                          f"SHA-256 of the JSON report: {rep['sha256']}"),
+                               file_name="zt-compliance-report.pdf", mime="application/pdf",
+                               use_container_width=True)
+            c2.download_button("Download JSON (verifiable)",
+                               json.dumps(rr, sort_keys=True, separators=(",", ":")).encode(),
+                               file_name="zt-compliance-report.json", mime="application/json",
+                               use_container_width=True)
+            st.caption("Verify: `sha256sum zt-compliance-report.json` must equal the fingerprint stored in the "
+                       "audit entry above.")
+
+
+def audit_explorer() -> None:
+    c = st.columns(4)
+    q = c[0].text_input("Search", key="ae_q", placeholder="actor, action, reason, resource")
+    service = c[1].selectbox("Service", ["", "gateway", "auth", "account", "transaction", "risk", "audit",
+                                         "responder", "falco"], key="ae_svc")
+    decision = c[2].selectbox("Decision", ["", "allow", "deny", "step_up", "alert", "info"], key="ae_dec")
+    severity = c[3].selectbox("Severity", ["", "critical", "high", "medium", "low", "info"], key="ae_sev")
+    c = st.columns(4)
+    action = c[0].text_input("Action starts with", key="ae_act", placeholder="e.g. policy. or auth.login")
+    since = c[1].date_input("From", value=None, key="ae_from")
+    until = c[2].date_input("To", value=None, key="ae_to")
+    priv = c[3].checkbox("Privileged users only", key="ae_priv")
+    params = {"q": q, "service": service, "decision": decision, "severity": severity, "action": action,
+              "since": f"{since}T00:00:00+05:30" if since else "", "until": f"{until}T23:59:59+05:30" if until else "",
+              "privileged": "1" if priv else "", "limit": 300}
+    params = {k: v for k, v in params.items() if v not in ("", None)}
+    r = api("GET", "/api/admin/audit/explore", params=params)
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    rows = r.json()["rows"]
+    st.caption(f"{len(rows)} entries (newest first, at most 300 shown)")
+    if rows:
+        df = pd.DataFrame(rows)
+        df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+        df["hash"] = df["hash"].str[:12]
+        st.dataframe(df[["id", "time", "severity", "service", "actor", "action", "resource", "decision", "reason",
+                         "hash"]], hide_index=True, use_container_width=True, height=420)
+    c = st.columns([1, 1, 2])
+    for col, fmt in ((c[0], "csv"), (c[1], "json")):
+        if col.button(f"Export {fmt.upper()}", key=f"ae_x_{fmt}", use_container_width=True):
+            x = api("GET", "/api/admin/audit/explore", params={**params, "format": fmt, "limit": 2000})
+            if x is not None and x.status_code == 200:
+                st.session_state["ae_export"] = (fmt, x.content, x.headers.get("x-export-sha256"))
+    exp = st.session_state.get("ae_export")
+    if exp:
+        c[2].download_button(f"Save {exp[0].upper()} (sha256 {exp[2][:12]}...)", exp[1],
+                             file_name=f"zt-audit.{exp[0]}", use_container_width=True)
+    st.markdown("**Entry proof**")
+    eid = st.number_input("Audit entry #", min_value=1, value=int(rows[0]["id"]) if rows else 1, key="ae_eid")
+    if st.button("Prove this entry", key="ae_prove"):
+        p = api("GET", f"/api/admin/audit/entry/{int(eid)}")
+        if p is None or p.status_code != 200:
+            ok_or_error(p, "")
+        else:
+            d = p.json()
+            (st.success if d["hash_matches"] and d["links_to_previous"] else st.error)(
+                f"Recomputed hash {'matches' if d['hash_matches'] else 'DOES NOT MATCH'}; links to the previous "
+                f"entry: {'yes' if d['links_to_previous'] else 'NO'}; next entry links here: "
+                f"{'yes' if d['next_links_here'] else ('n/a (newest)' if d['next_links_here'] is None else 'NO')}")
+            st.code(f"prev_hash  = {d['entry']['prev_hash']}\nhash       = {d['entry']['hash']}\n"
+                    f"recomputed = {d['recomputed_hash']}")
+            st.json(d["entry"], expanded=False)
+
+
+def audit_integrity_tab() -> None:
+    st.markdown("Each entry stores `SHA-256(previous hash ‖ entry)`. Editing, deleting or re-ordering any past "
+                "entry breaks the chain, even if done by the database superuser. The audit service's own "
+                "database role can only INSERT and SELECT.")
+    if st.button("Verify the whole chain now", type="primary", key="ai_verify"):
+        r = api("GET", "/api/admin/audit/verify")
+        if r is None:
+            return
+        v = r.json()
+        if v.get("ok"):
+            st.success(f"Chain intact: {v['checked']:,} entries verified.")
+            st.code(f"head = {v['head']}")
+        else:
+            st.error(f"Tampering detected at entry #{v['broken_at']}: {v['problem']} "
+                     f"(checked {v['checked']:,} entries)")
+
+
+# ------------------------------------------- admin module 8: policy management
+OUTCOME_LABEL = {"allow": "allowed", "deny": "denied", "step_up": "extra code", "approval": "allowed, waits for approval",
+                 "error": "error"}
+
+
+def policy_management() -> None:
+    st.title("Policy management")
+    r = api("GET", "/api/admin/policy")
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    p = r.json()
+    cfg, base = p["config"], p["baseline"]
+    k = st.columns(5)
+    k[0].metric("Active version", f"v{p['version']}" if p["version"] else "baseline")
+    k[1].metric("Published to OPA", "in sync" if p["opa_in_sync"] else "OUT OF SYNC")
+    k[2].metric("Invariants", f"{sum(i['ok'] for i in p['invariants'])} / {len(p['invariants'])}")
+    k[3].metric("Custom deny rules", len(cfg["custom_denies"]))
+    k[4].metric("Blocked ranges", len(cfg["blocked_cidrs"]))
+    st.caption("Restrict-only editor: the Rego code is read-only (from git); only bounded settings can change, "
+               "never above the baseline, and deny rules can be added but allow rules cannot. Every version is a "
+               "hash-chained audit event and needs your authenticator code.")
+    t = st.tabs(["Active policy", "Edit & simulate", "What-if", "Versions & rollback", "Invariants"])
+    with t[0]:
+        rows = [{"setting": "Per-transfer limit (customer)", "active": inr(cfg["transfer_limit_customer"]),
+                 "baseline (maximum)": inr(base["transfer_limit_customer"])},
+                {"setting": "Operations approval from", "active": inr(cfg["high_value_threshold"]),
+                 "baseline (maximum)": inr(base["high_value_threshold"])},
+                {"setting": "Medium risk", "active": "deny" if cfg["medium_risk_action"] == "deny" else "ask for a code",
+                 "baseline (maximum)": "ask for a code"},
+                {"setting": "Blocked address ranges", "active": ", ".join(cfg["blocked_cidrs"]) or "none",
+                 "baseline (maximum)": "none"}]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.markdown("**Fixed rules (code, cannot be edited here)**: MFA always, high risk blocked and sessions "
+                    "ended, unknown risk denies, trusted device required for transfers, frozen accounts, daily "
+                    "limit, workload identity per action, separation of duties.")
+        if cfg["custom_denies"]:
+            st.markdown("**Custom deny rules**")
+            st.dataframe(pd.DataFrame(cfg["custom_denies"]), hide_index=True, use_container_width=True)
+    with t[1]:
+        policy_editor(p)
+    with t[2]:
+        policy_whatif(p)
+    with t[3]:
+        policy_versions_tab(p)
+    with t[4]:
+        st.dataframe(pd.DataFrame([{"invariant": i["name"], "expected": OUTCOME_LABEL[i["expect"]],
+                                    "active policy": OUTCOME_LABEL.get(i["got"], i["got"]),
+                                    "holds": "yes" if i["ok"] else "NO"} for i in p["invariants"]]),
+                     hide_index=True, use_container_width=True)
+        st.caption("Every candidate is evaluated against these scenarios in OPA before it can be published; "
+                   "a version that breaks any of them is refused.")
+
+
+def inr(v) -> str:
+    return f"₹{int(v):,}"
+
+
+def editor_candidate(p: dict) -> dict:
+    cfg = p["config"]
+    b = p["bounds"]
+    c1, c2, c3 = st.columns(3)
+    lim = c1.number_input("Per-transfer limit (₹)", min_value=b["transfer_limit_customer"][0],
+                          max_value=b["transfer_limit_customer"][1], value=cfg["transfer_limit_customer"], step=1000)
+    thr = c2.number_input("Operations approval from (₹)", min_value=b["high_value_threshold"][0],
+                          max_value=b["high_value_threshold"][1], value=cfg["high_value_threshold"], step=1000)
+    mra = c3.selectbox("Medium risk", ["step_up", "deny"], index=0 if cfg["medium_risk_action"] == "step_up" else 1,
+                       format_func=lambda x: "ask for a code (step-up)" if x == "step_up" else "deny")
+    cidrs = st.text_area("Blocked address ranges (one per line, e.g. 203.0.113.0/24)",
+                         value="\n".join(cfg["blocked_cidrs"]), height=80)
+    st.markdown("**Custom deny rules** (add rows; a role of `*` means everyone)")
+    actions = sorted({a for v in p["roles"].values() for a in v})
+    rules = pd.DataFrame(cfg["custom_denies"] or [], columns=["id", "role", "action", "note"])
+    rules = st.data_editor(rules, num_rows="dynamic", use_container_width=True, key="pol_rules",
+                           column_config={"role": st.column_config.SelectboxColumn(
+                               options=["customer", "teller", "operations", "admin", "*"]),
+                               "action": st.column_config.SelectboxColumn(options=actions)})
+    rule_list = [{k: ("" if pd.isna(v) else v) for k, v in row.items()} for row in rules.to_dict("records")
+                 if not (pd.isna(row.get("role")) and pd.isna(row.get("action")))]
+    return {"transfer_limit_customer": int(lim), "high_value_threshold": int(thr), "medium_risk_action": mra,
+            "blocked_cidrs": [c.strip() for c in cidrs.splitlines() if c.strip()], "custom_denies": rule_list}
+
+
+def policy_editor(p: dict) -> None:
+    cand = editor_candidate(p)
+    if st.button("Simulate", type="primary"):
+        st.session_state["pol_sim"] = (cand, api("POST", "/api/admin/policy/simulate", json={"config": cand}))
+    sim = st.session_state.get("pol_sim")
+    if not sim or sim[0] != cand:
+        st.caption("Simulate first: the candidate is checked against the invariants and compared with the "
+                   "active policy on sample requests. Nothing changes until you publish.")
+        return
+    res = sim[1]
+    if res is None or res.status_code != 200:
+        ok_or_error(res, "")
+        return
+    s = res.json()
+    if not s["valid"]:
+        for e in s["errors"]:
+            st.error(e)
+        return
+    if not s["changes"]:
+        st.info("No changes from the active policy.")
+        return
+    st.markdown("**Changes**")
+    st.dataframe(pd.DataFrame([{**c, "from": str(c["from"]), "to": str(c["to"])} for c in s["changes"]]),
+                 hide_index=True, use_container_width=True)
+    st.markdown("**Impact on sample requests**")
+    pv = pd.DataFrame(s["preview"])
+    pv["now"] = pv["now"].map(OUTCOME_LABEL)
+    pv["candidate"] = pv["candidate"].map(OUTCOME_LABEL)
+    pv["reasons"] = pv["reasons"].apply(lambda x: ", ".join(x))
+    st.dataframe(pv, hide_index=True, use_container_width=True)
+    if not s["invariants_ok"]:
+        st.error("Refused: breaks " + ", ".join(i["name"] for i in s["invariants"] if not i["ok"]))
+        return
+    st.success(f"All {len(s['invariants'])} invariants hold.")
+    with st.form("pol_apply"):
+        comment = st.text_input("Change comment (required)", max_chars=200)
+        code = st.text_input("Your authenticator code", max_chars=6)
+        if st.form_submit_button("Publish new version", type="primary"):
+            out = api("POST", "/api/admin/policy/apply", json={"config": cand, "comment": comment, "totp": code.strip()})
+            if out is not None and out.status_code == 200:
+                st.success(f"Published v{out.json()['version']}.")
+                st.session_state.pop("pol_sim", None)
+            else:
+                ok_or_error(out, "")
+
+
+def policy_whatif(p: dict) -> None:
+    st.caption("Ask OPA how one request would be decided under the active policy and under the candidate "
+               "from the Edit tab.")
+    actions = sorted({a for v in p["roles"].values() for a in v})
+    c = st.columns(4)
+    role = c[0].selectbox("Role", ["customer", "teller", "operations", "admin"], key="wi_role")
+    action = c[1].selectbox("Action", actions, index=actions.index("transaction.transfer"), key="wi_act")
+    amount = c[2].number_input("Amount (₹)", min_value=0, value=20000, step=1000, key="wi_amt")
+    risk = c[3].selectbox("Risk", ["low", "medium", "high", "unknown"], key="wi_risk")
+    c = st.columns(4)
+    dev = c[0].selectbox("Device", ["trusted", "pending"], key="wi_dev")
+    mfa = c[1].checkbox("MFA done", value=True, key="wi_mfa")
+    step = c[2].checkbox("Step-up code given", key="wi_step")
+    own = c[3].checkbox("Own resource", value=True, key="wi_own")
+    sim = st.session_state.get("pol_sim")
+    body = {"role": role, "action": action, "amount": amount, "risk_level": risk, "device_trust": dev, "mfa": mfa,
+            "step_up": step, "owner_is_self": own, "config": sim[0] if sim else None}
+    if st.button("Evaluate", key="wi_go"):
+        res = api("POST", "/api/admin/policy/scenario", json=body)
+        if res is None or res.status_code != 200:
+            ok_or_error(res, "")
+            return
+        d = res.json()
+        cols = st.columns(2)
+        for col, key, title in ((cols[0], "now", "Active policy"), (cols[1], "candidate", "Candidate")):
+            if key in d:
+                o = d[key]
+                col.metric(title, OUTCOME_LABEL.get(o["outcome"], o["outcome"]))
+                col.caption(", ".join(o.get("reasons", [])) or "no deny reasons")
+        if "candidate_errors" in d:
+            cols[1].error("; ".join(d["candidate_errors"]))
+
+
+def policy_versions_tab(p: dict) -> None:
+    vs = p["versions"]
+    if not vs:
+        st.caption("No versions published yet; the baseline policy is active.")
+    else:
+        df = pd.DataFrame(vs)
+        df["time"] = local_time(df["ts"], "%d %b %H:%M")
+        df["changes"] = df["changes"].apply(lambda cs: "; ".join(f"{c['setting']}: {c['from']} -> {c['to']}" for c in cs))
+        df["active"] = df["version"].apply(lambda v: "active" if v == p["version"] else "")
+        st.dataframe(df[["version", "active", "time", "actor", "comment", "changes", "rollback_of", "audit_id"]],
+                     hide_index=True, use_container_width=True)
+    with st.form("pol_rb"):
+        opts = [0] + [v["version"] for v in vs if v["version"] != p["version"]]
+        ver = st.selectbox("Roll back to", opts, format_func=lambda v: "baseline (v0)" if v == 0 else f"v{v}")
+        code = st.text_input("Your authenticator code", max_chars=6, key="pol_rb_code")
+        if st.form_submit_button("Roll back"):
+            out = api("POST", "/api/admin/policy/rollback", json={"version": ver, "totp": code.strip()})
+            if out is not None and out.status_code == 200:
+                st.success(f"Rolled back: now v{out.json()['version']} (same settings as "
+                           f"{'baseline' if ver == 0 else f'v{ver}'}).")
+            else:
+                ok_or_error(out, "")
+    st.caption("A rollback publishes a new version with the old settings, so history is never rewritten.")
+
+
+# ------------------------------------------- admin module 6: threat detection center
+CATEGORY_SHORT = {"suspicious_process": "Suspicious process", "unauthorized_shell": "Unauthorized shell",
+                  "privilege_escalation": "Privilege escalation", "network_connection": "Unexpected connection",
+                  "file_modification": "File modification", "credential_access": "Secret access",
+                  "jwt_theft": "JWT theft / forgery", "suspicious_login": "Suspicious sign-in",
+                  "container_compromise": "Container compromise", "account_takeover": "Account takeover"}
+STATUS_ORDER = ["new", "acknowledged", "investigating", "contained", "resolved"]
+
+
+def threat_center() -> None:
+    st.title("Threat center")
+    top = st.columns([3, 1])
+    top[0].caption("Detections from Falco (runtime), the gateway (tokens), auth (sign-ins), the risk engine and the "
+                   "responder, grouped into incidents. Every analyst action is written to the hash-chained audit "
+                   "log, so an incident's history cannot be quietly rewritten.")
+    days = top[1].selectbox("Window", [1, 7, 30, 90], index=1, key="thr_days",
+                            format_func=lambda d: f"Last {d} day{'s' * (d > 1)}")
+    r = api("GET", "/api/admin/threats", params={"days": days})
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    t = r.json()
+    incs = t["incidents"]
+    k = st.columns(5)
+    k[0].metric("Open incidents", t["open"])
+    k[1].metric("Critical open", sum(1 for i in incs if i["severity"] == "critical" and i["status"] != "resolved"))
+    k[2].metric("Unassigned", sum(1 for i in incs if not i["assignee"] and i["status"] != "resolved"))
+    k[3].metric("Detections", sum(t["detections_by_severity"].values()))
+    k[4].metric("Falco runtime alerts", len(t["falco"]))
+    tabs = st.tabs(["Incidents", "Live runtime alerts", "Detections"])
+    with tabs[0]:
+        threat_incidents(t)
+    with tabs[1]:
+        threat_falco(t)
+    with tabs[2]:
+        threat_detections(t)
+
+
+def threat_falco(t: dict) -> None:
+    by = t["detections_by_category"]
+    st.subheader("Runtime detections (Falco)")
+    k = st.columns(6)
+    for i, c in enumerate(["suspicious_process", "unauthorized_shell", "privilege_escalation", "network_connection",
+                           "file_modification", "credential_access"]):
+        k[i].metric(CATEGORY_SHORT[c], by.get(c, 0))
+    if t["falco"]:
+        df = pd.DataFrame(t["falco"])
+        df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+        df["category"] = df["category"].map(CATEGORY_SHORT)
+        st.dataframe(df[["time", "severity", "category", "subject", "summary"]], hide_index=True,
+                     use_container_width=True, column_config={"subject": "container", "summary": "Falco output"})
+    else:
+        st.info("No Falco alerts in this window. Falco needs direct access to the host kernel (eBPF), so it runs "
+                "with `make falco` on a Linux host or VM, not inside Codespaces or Docker Desktop. The test suite "
+                "sends Falco-format alerts through the same mTLS path to prove the pipeline works.")
+    st.caption("Rules (falco/zt_rules.yaml): shell or download tool in a service container, write to the read-only "
+               "filesystem, secret read by an unexpected process, database connection from a non-database "
+               "service, privilege escalation, internet connection from an internal service. Critical alerts "
+               "quarantine the container automatically.")
+
+
+def threat_detections(t: dict) -> None:
+    by = t["detections_by_category"]
+    k = st.columns(4)
+    for i, c in enumerate(["jwt_theft", "suspicious_login", "container_compromise", "account_takeover"]):
+        k[i].metric(CATEGORY_SHORT[c], by.get(c, 0))
+    a, b = st.columns([1, 1.5])
+    with a:
+        sev = pd.DataFrame({"severity": SEV_ORDER, "detections": [t["detections_by_severity"].get(s, 0)
+                                                                  for s in SEV_ORDER]})
+        st.altair_chart(alt.Chart(sev).mark_bar(cornerRadiusEnd=2).encode(
+            y=alt.Y("severity:N", sort=SEV_ORDER, title=None),
+            x=alt.X("detections:Q", axis=alt.Axis(tickMinStep=1, format="d")),
+            color=alt.Color("severity:N", legend=None, scale=alt.Scale(domain=SEV_ORDER, range=SEV_COLORS)),
+            tooltip=["severity", "detections"]).properties(height=220, title="Severity classification"),
+            use_container_width=True)
+    with b:
+        cat = pd.DataFrame([{"category": CATEGORY_SHORT[c], "detections": n} for c, n in by.items() if n])
+        if not cat.empty:
+            st.altair_chart(alt.Chart(cat).mark_bar(color="#0B3D4A", cornerRadiusEnd=2).encode(
+                y=alt.Y("category:N", sort="-x", title=None),
+                x=alt.X("detections:Q", axis=alt.Axis(tickMinStep=1, format="d")),
+                tooltip=["category", "detections"]).properties(height=220, title="By category"),
+                use_container_width=True)
+    if t["recent"]:
+        df = pd.DataFrame(t["recent"])
+        df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+        df["category"] = df["category"].map(CATEGORY_SHORT)
+        st.dataframe(df[["time", "severity", "category", "subject", "source", "summary"]], hide_index=True,
+                     use_container_width=True, height=380)
+    st.caption("JWT theft: a token presented from another device, replayed after sign-out, forged/tampered, or a "
+               "refresh token reused. Suspicious sign-in: high login risk, lockout, revoked device, failed codes "
+               "(single failures are low severity; five or more in one incident raise it to medium).")
+
+
+def threat_incidents(t: dict) -> None:
+    incs = t["incidents"]
+    if not incs:
+        st.success("No incidents in this window.")
+        return
+    f = st.columns(3)
+    sf = f[0].multiselect("Status", STATUS_ORDER, default=[s for s in STATUS_ORDER if s != "resolved"])
+    vf = f[1].multiselect("Severity", ["critical", "high", "medium", "low"], placeholder="All severities")
+    cf = f[2].multiselect("Category", list(CATEGORY_SHORT), format_func=CATEGORY_SHORT.get, placeholder="All")
+    df = pd.DataFrame(incs)
+    view = df[df["status"].isin(sf or STATUS_ORDER)]
+    if vf:
+        view = view[view["severity"].isin(vf)]
+    if cf:
+        view = view[view["category"].isin(cf)]
+    if view.empty:
+        st.info("No incidents match these filters.")
+        return
+    show = view.assign(first=local_time(view["first_seen"], "%d %b %H:%M"), last=local_time(view["last_seen"], "%d %b %H:%M"),
+                       category=view["category"].map(CATEGORY_SHORT), assignee=view["assignee"].fillna("-"))
+    st.dataframe(show[["id", "severity", "status", "category", "subject", "detections", "assignee", "first", "last"]],
+                 hide_index=True, use_container_width=True, height=300)
+    pick = st.selectbox("Investigate", list(view["id"]),
+                        format_func=lambda i: f"{i} - {CATEGORY_SHORT[df.set_index('id').loc[i, 'category']]} - "
+                                              f"{df.set_index('id').loc[i, 'subject']}")
+    r = api("GET", f"/api/admin/threats/incidents/{pick}")
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    inc = r.json()
+    st.markdown(f"### {inc['id']} {pill(inc['severity'])} {pill(inc['status'])}", unsafe_allow_html=True)
+    st.markdown(f"**{inc['title']}** - subject **{inc['subject']}**")
+    k = st.columns(4)
+    k[0].metric("Detections", inc["detections"])
+    k[1].metric("First seen", local_time(pd.Series([inc["first_seen"]]), "%H:%M").iloc[0],
+                help=local_time(pd.Series([inc["first_seen"]]), "%d %b %Y %H:%M:%S IST").iloc[0])
+    k[2].metric("Last seen", local_time(pd.Series([inc["last_seen"]]), "%H:%M").iloc[0],
+                help=local_time(pd.Series([inc["last_seen"]]), "%d %b %Y %H:%M:%S IST").iloc[0])
+    k[3].metric("Assigned to", inc["assignee"] or "-")
+    st.caption(f"Sources: {', '.join(inc['sources'])}. Categories: "
+               f"{', '.join(CATEGORY_SHORT.get(c, c) for c in inc.get('categories', []))}.")
+    a, b = st.columns([1.5, 1])
+    with a:
+        st.markdown("**Timeline**")
+        tl = pd.DataFrame(inc["timeline"])
+        tl["time"] = local_time(tl["ts"], "%d %b %H:%M:%S")
+        tl["kind"] = tl["kind"].map({"detection": "detected", "analyst": "analyst", "response": "response"})
+        st.dataframe(tl[["time", "kind", "actor", "what", "detail"]], hide_index=True, use_container_width=True,
+                     height=min(420, 38 + 35 * len(tl)))
+        if inc.get("resolution"):
+            st.success(f"Resolved by {inc['resolved_by']}: {inc['resolution']}")
+    with b:
+        if inc["status"] == "resolved":
+            st.info("This incident is resolved. New detections for the same subject open a new incident.")
+        with st.form(f"inc_{inc['id']}"):
+            st.markdown("**Respond**")
+            assignee = st.selectbox("Assign to", ["-"] + t["analysts"],
+                                    index=(t["analysts"].index(inc["assignee"]) + 1)
+                                    if inc["assignee"] in t["analysts"] else 0)
+            status = st.selectbox("Status", ["acknowledged", "investigating", "contained"],
+                                  index=["acknowledged", "investigating", "contained"].index(inc["status"])
+                                  if inc["status"] in ("acknowledged", "investigating", "contained") else 0)
+            note = st.text_area("Note or resolution", placeholder="What you found or did", height=90)
+            c1, c2 = st.columns(2)
+            ack = c1.form_submit_button("Acknowledge", use_container_width=True, disabled=inc["status"] != "new")
+            upd = c2.form_submit_button("Update", type="primary", use_container_width=True)
+            c3, c4 = st.columns(2)
+            add = c3.form_submit_button("Add note", use_container_width=True)
+            res = c4.form_submit_button("Resolve", use_container_width=True)
+        base = f"/api/admin/threats/incidents/{inc['id']}"
+        if ack:
+            ok_or_error(api("POST", f"{base}/ack", json={}), "Acknowledged.")
+        if upd:
+            if assignee != "-" and assignee != inc["assignee"]:
+                ok_or_error(api("POST", f"{base}/assign", json={"assignee": assignee}), f"Assigned to {assignee}.")
+            if status != inc["status"]:
+                ok_or_error(api("POST", f"{base}/status", json={"status": status}), f"Status: {status}.")
+        if add:
+            ok_or_error(api("POST", f"{base}/note", json={"note": note}), "Note added.")
+        if res:
+            ok_or_error(api("POST", f"{base}/resolve", json={"note": note}), "Incident resolved.")
+        st.caption("Response actions on the subject (quarantine, release, restart, force sign-out, lock, device "
+                   "revoke, account freeze) appear in the timeline automatically.")
+
+
+# ------------------------------------------- admin module 7: network visualization
+NET_COLORS = {"edge-net": "#B8892B", "app-net": "#0B3D4A", "auth-net": "#5A8A9A", "db-net": "#6B4E8A"}
+
+
+def topology_html(d: dict) -> str:
+    import json as _json
+    nodes = [{"id": "browser", "label": "Browser", "shape": "box", "color": {"background": "#EEF1F2",
+              "border": "#A7B4B9"}, "title": "Customers and staff (internet)"}]
+    for n in d["nodes"]:
+        ok = n["state"] == "running" and n["health"] in ("healthy", "no healthcheck")
+        bg = "#F6DCD8" if n["quarantined"] else ("#E3F2EA" if ok else "#FBF0D9")
+        border = "#B42318" if n["quarantined"] else ("#1F7A4D" if ok else "#B8892B")
+        tls = n.get("tls") or {}
+        tip = (f"{n['service']}\\nstate: {n['state']} / {n['health']}\\nnetworks: {', '.join(n['networks']) or 'none'}"
+               f"\\nuser: {n['user']}" + (f"\\nTLS: {tls.get('tls')} {tls.get('cipher')}\\ncert: CN={tls.get('server_cn')},"
+                                          f" {tls.get('cert_days_left')} days left" if tls.get("reachable") else "")
+               + ("\\nQUARANTINED: cut off from every network" if n["quarantined"] else ""))
+        nodes.append({"id": n["service"], "label": n["service"] + ("\\n(isolated)" if n["quarantined"] else ""),
+                      "shape": "database" if n["service"] in ("postgres", "redis") else "box",
+                      "color": {"background": bg, "border": border}, "borderWidth": 2,
+                      "shapeProperties": {"borderDashes": [6, 4] if n["quarantined"] else False}, "title": tip})
+    known = {x["id"] for x in nodes}
+    edges = []
+    for e in d["edges"]:
+        if e["from"] not in known or e["to"] not in known:
+            continue
+        color = {"ok": "#1F7A4D", "down": "#B8892B"}.get(e["status"], "#B42318")
+        edges.append({"from": e["from"], "to": e["to"], "arrows": "to", "color": {"color": color},
+                      "dashes": e["status"] != "ok", "width": 2 if e["protocol"].startswith("mTLS") else 1.4,
+                      "title": f"{e['from']} -> {e['to']}\\n{e['protocol']}: {e['purpose']}\\nstatus: {e['status']}"
+                               + (f"\\nvia {', '.join(e['networks'])}" if e["networks"] else "")})
+    levels = {"browser": 0, "dashboard": 1, "gateway": 2, "auth": 3, "account": 3, "transaction": 3, "responder": 3,
+              "risk": 4, "opa": 4, "audit": 4, "redis": 5, "postgres": 5, "falco": 2}
+    for n in nodes:
+        n["level"] = levels.get(n["id"], 4)
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<style>body{{margin:0;font-family:'Public Sans',system-ui,sans-serif}}#g{{height:520px;border:1px solid #D9E0E3;
+border-radius:6px;background:#fff}}#info{{font-size:13px;color:#15262C;padding:8px 2px;min-height:20px;white-space:pre-line}}</style>
+</head><body><div id="g"></div><div id="info">Click a service or a connection for details. Drag to rearrange.</div>
+<script>
+const nodes = new vis.DataSet({_json.dumps(nodes)});
+const edges = new vis.DataSet({_json.dumps(edges)});
+const net = new vis.Network(document.getElementById('g'), {{nodes, edges}}, {{
+  layout: {{hierarchical: {{direction: 'LR', sortMethod: 'directed', levelSeparation: 170, nodeSpacing: 70}}}},
+  physics: false, interaction: {{hover: true, tooltipDelay: 120}},
+  nodes: {{font: {{size: 14, face: 'Public Sans'}}, margin: 10}}, edges: {{smooth: {{type: 'cubicBezier'}}}}
+}});
+net.on('click', p => {{
+  const info = document.getElementById('info');
+  if (p.nodes.length) info.textContent = nodes.get(p.nodes[0]).title;
+  else if (p.edges.length) info.textContent = edges.get(p.edges[0]).title;
+}});
+</script></body></html>"""
+
+
+def network_view() -> None:
+    import streamlit.components.v1 as components
+    st.title("Network visualization")
+    r = api("GET", "/api/admin/network")
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+        return
+    d = r.json()
+    if not d["engine_connected"]:
+        st.warning("The responder cannot reach the container engine, so the live topology is incomplete.")
+    edges = d["edges"]
+    tls_ok = [k for k, v in d["tls"].items() if v.get("reachable")]
+    seg = d["segmentation"][0]
+    k = st.columns(5)
+    k[0].metric("Services", len(d["nodes"]))
+    k[1].metric("Connections up", f"{sum(1 for e in edges if e['status'] == 'ok')} / {len(edges)}")
+    k[2].metric("mTLS handshakes verified", f"{len(tls_ok)} / {len(d['tls'])}")
+    k[3].metric("Isolated services", sum(1 for n in d["nodes"] if n["quarantined"]))
+    k[4].metric("Gateway to database", "blocked" if not seg["reachable"] else "REACHABLE",
+                help="Live probe: the gateway shares no network with PostgreSQL, so it cannot even open a TCP "
+                     "connection. This proves the segmentation instead of assuming it.")
+    t = st.tabs(["Topology", "Segmentation", "Connections & mTLS", "Blocked & suspicious", "Service details"])
+    with t[0]:
+        components.html(topology_html(d), height=580)
+        st.caption("Green: healthy and allowed. Dashed red: blocked (quarantine). Dashed amber: a side is down. "
+                   "Red dashed border: isolated service. Hover or click for protocol, networks, TLS version and "
+                   "certificate expiry.")
+    with t[1]:
+        nets = sorted({n for x in d["nodes"] for n in x["networks"]})
+        rows = [{"service": n["service"], **{net: ("yes" if net in n["networks"] else "") for net in nets}}
+                for n in d["nodes"]]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=440)
+        st.caption("edge-net is the only network reachable from the host; app-net, auth-net and db-net are "
+                   "Docker 'internal' networks with no route out. Two services can only talk if they share a row "
+                   "mark, and then only if the callee lists the caller's certificate identity.")
+        st.markdown(f"**Live segmentation probe:** gateway to postgres:5432 is "
+                    f"**{'blocked' if not seg['reachable'] else 'REACHABLE - check the networks!'}**"
+                    + (f" ({seg.get('error')})" if seg.get("error") else ""))
+    with t[2]:
+        df = pd.DataFrame(edges)
+        df["networks"] = df["networks"].apply(lambda x: ", ".join(x))
+        st.dataframe(df[["from", "to", "protocol", "purpose", "status", "networks"]], hide_index=True,
+                     use_container_width=True, height=420)
+        tl = pd.DataFrame([{"service": k, **v} for k, v in d["tls"].items()])
+        st.subheader("Live TLS handshakes from the gateway")
+        st.dataframe(tl, hide_index=True, use_container_width=True,
+                     column_config={"cert_days_left": st.column_config.NumberColumn("certificate days left",
+                                                                                     format="%.1f"),
+                                    "server_cn": "server identity (CN)"})
+        st.caption("Service certificates live 7 days and are re-issued on every deployment (./deploy.sh). "
+                   "PostgreSQL is not probed from the gateway because the gateway cannot reach it.")
+    with t[3]:
+        st.subheader("Blocked connections")
+        if d["blocked"]:
+            df = pd.DataFrame(d["blocked"])
+            df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+            st.dataframe(df[["time", "service", "actor", "action", "resource", "reason"]], hide_index=True,
+                         use_container_width=True,
+                         column_config={"service": "refused by", "actor": "caller identity", "resource": "endpoint"})
+        else:
+            st.success("No workload has called an endpoint it is not allowed to call.")
+        st.caption("Two layers block connections: the network (no shared network: packets never arrive) and the "
+                   "workload identity (each endpoint lists the certificate names allowed to call it; refusals "
+                   "are logged here).")
+        st.subheader("Suspicious connections (Falco)")
+        if d["suspicious"]:
+            df = pd.DataFrame(d["suspicious"])
+            df["time"] = local_time(df["ts"], "%d %b %H:%M:%S")
+            st.dataframe(df[["time", "severity", "subject", "summary"]], hide_index=True, use_container_width=True)
+        else:
+            st.caption("No unexpected database or internet connections detected (Falco rules).")
+    with t[4]:
+        svc = st.selectbox("Service", [n["service"] for n in d["nodes"]], key="net_svc")
+        n = next(x for x in d["nodes"] if x["service"] == svc)
+        k = st.columns(4)
+        k[0].metric("State", f"{n['state']}")
+        k[1].metric("Health", n["health"])
+        k[2].metric("CPU", f"{n['cpu_percent']:.1f}%" if n["cpu_percent"] is not None else "-")
+        k[3].metric("Memory", f"{n['memory_percent']:.1f}%" if n["memory_percent"] is not None else "-")
+        st.markdown(f"**Networks:** {', '.join(n['networks']) or 'none (isolated)'}  \n**User:** {n['user']}  \n"
+                    f"**Image:** {n['image']}")
+        ins = [e for e in edges if e["to"] == svc]
+        outs = [e for e in edges if e["from"] == svc]
+        a, b = st.columns(2)
+        a.markdown("**Called by**")
+        a.dataframe(pd.DataFrame(ins)[["from", "protocol", "status"]] if ins else pd.DataFrame(),
+                    hide_index=True, use_container_width=True)
+        b.markdown("**Calls**")
+        b.dataframe(pd.DataFrame(outs)[["to", "protocol", "status"]] if outs else pd.DataFrame(),
+                    hide_index=True, use_container_width=True)
+        if n.get("tls") and n["tls"].get("reachable"):
+            st.caption(f"TLS {n['tls']['tls']} with {n['tls']['cipher']}, certificate CN={n['tls']['server_cn']}, "
+                       f"{n['tls']['cert_days_left']} days left.")
+
+
 # -------------------------------------------------------------------- main
 ss = S()
 topbar(bool(ss.token))
@@ -2163,9 +3111,14 @@ else:
         "Access decisions": access_decisions,
         "Risk model": risk_model,
         "Audit integrity": audit_integrity,
+        "Audit & compliance": audit_compliance,
         "Security settings": security_settings,
         "Session & device policy": session_device_policy,
         "Containers & quarantine": containers_page,
         "Container security": container_security,
+        "Threat center": threat_center,
+        "Network visualization": network_view,
+        "Policy management": policy_management,
+        "Incident response": incident_response,
     }[page]()
     footer()

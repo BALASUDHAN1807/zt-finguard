@@ -147,3 +147,46 @@ def test_tampered_image_manifest_is_detected():
         open(path, "w", encoding="utf-8").write(original)
     d = admin.req("GET", "/api/admin/containers").json()
     assert d["manifest_status"].startswith("valid")
+
+
+def test_runtime_alert_and_quarantine_form_one_incident():
+    """Admin module 6: the Falco shell alert and the automatic quarantine it caused are one incident."""
+    admin = logged_in("admin")
+    t = admin.req("GET", "/api/admin/threats", params={"days": 1}).json()
+    assert t["detections_by_category"]["unauthorized_shell"] >= 1
+    assert any(f["subject"] == "account" for f in t["falco"])
+    inc = [i for i in t["incidents"] if i["subject"] == "account"
+           and {"unauthorized_shell", "container_compromise"} <= set(i["categories"])]
+    assert inc and inc[0]["severity"] == "critical"
+
+
+def _call(cert: str, method: str, url: str, body: str = "") -> str:
+    script = ("import ssl,sys,urllib.request as u,urllib.error as e;"
+              "c=ssl.create_default_context(cafile='/c/ca.crt');c.load_cert_chain(f'/c/{sys.argv[1]}.crt',f'/c/{sys.argv[1]}.key');"
+              "r=u.Request(sys.argv[3],data=sys.argv[4].encode() or None,method=sys.argv[2],headers={'Content-Type':'application/json'})\n"
+              "try: print(u.urlopen(r,context=c).status)\nexcept e.HTTPError as x: print(x.code)")
+    return subprocess.run(
+        ["docker", "run", "--rm", "--network", f"{PROJECT}_auth-net", *cert_mounts("ca", cert),
+         "--entrypoint", "python", HELPER_IMAGE, "-c", script, cert, method, url, body],
+        capture_output=True, text=True, timeout=60).stdout.strip()
+
+
+def test_refused_workload_identity_shows_on_the_network_map():
+    """Admin module 7: an mTLS caller outside an endpoint's allow-list is refused AND audited."""
+    assert _call("gateway", "POST", "https://responder:8443/falco", "{}") == "403"
+    admin = logged_in("admin")
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        net = admin.req("GET", "/api/admin/network").json()
+        if any(b["actor"] == "gateway" and b["resource"] == "/falco" for b in net["blocked"]):
+            break
+        time.sleep(2)
+    else:
+        raise AssertionError("refused mTLS call not listed as blocked")
+
+
+def test_only_the_gateway_can_write_policy_data():
+    """Admin module 8: OPA's own API lets no other workload change the tunables or the Rego code."""
+    for cert in ("falco", "account", "transaction"):
+        assert _call(cert, "PUT", "https://opa:8181/v1/data/zt_policy", '{"transfer_limit_customer": 9999999}') in ("401", "403")
+    assert _call("gateway", "PUT", "https://opa:8181/v1/policies/evil", "package evil") in ("401", "403")
