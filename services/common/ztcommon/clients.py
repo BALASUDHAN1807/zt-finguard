@@ -66,6 +66,23 @@ def audit(*, actor: str, action: str, resource: str, decision: str,
     task.add_done_callback(_pending.discard)
 
 
+# --------------------------------------------------------------- notifications
+async def _send_notify(payload: dict) -> None:
+    try:
+        await mtls.client().post(mtls.url("auth", "/internal/notify"), json=payload)
+    except Exception as exc:  # noqa: BLE001
+        log.error("notification failed: %s", exc)
+
+
+def notify(username: str, category: str, title: str, body: str, severity: str = "info",
+           data: dict | None = None) -> None:
+    """Fire-and-forget customer notification through the auth service (owner of contact details)."""
+    task = asyncio.create_task(_send_notify({"username": username, "category": category, "title": title[:120],
+                                             "body": body[:400], "severity": severity, "data": data or {}}))
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)
+
+
 # ----------------------------------------------------------------------- redis
 _redis: aioredis.Redis | None = None
 

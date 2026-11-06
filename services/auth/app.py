@@ -33,6 +33,7 @@ import pyotp
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+import notify
 import sms
 from passwords import DUMMY_HASH, hash_password, verify_password
 from ztcommon import clients, config, db, mtls, sessions, tokens
@@ -228,6 +229,18 @@ async def get_user_by_id(uid: str) -> dict | None:
         return await cur.fetchone()
 
 
+async def alert(user: dict | str | None, category: str, title: str, body: str, severity: str = "info",
+                data: dict | None = None) -> None:
+    """Customer notification (in-app + SMS / e-mail by preference). Never breaks the request."""
+    try:
+        if isinstance(user, str):
+            user = await get_user(user)
+        if user:
+            await notify.push(clients.redis(), user, category, title, body, severity, data)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("notification failed: %r", exc)
+
+
 async def record_failure(user: dict) -> None:
     p = await db.pool()
     async with p.connection() as conn:
@@ -241,6 +254,25 @@ async def record_failure(user: dict) -> None:
 
 
 # ------------------------------------------------------------ device trust
+def device_parts(user_agent: str) -> dict:
+    """Device type, operating system and browser from the User-Agent (best effort)."""
+    ua = user_agent or ""
+    browser = next((b for k, b in (("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"),
+                                   ("Chrome/", "Chrome"), ("Safari/", "Safari")) if k in ua), "Other")
+    system = next((o for k, o in (("Android", "Android"), ("iPhone", "iOS"), ("iPad", "iPadOS"),
+                                  ("Windows", "Windows"), ("Mac OS X", "macOS"), ("CrOS", "ChromeOS"),
+                                  ("Linux", "Linux")) if k in ua), "Unknown")
+    if "iPad" in ua or ("Android" in ua and "Mobile" not in ua and "Android" in ua and "Tablet" in ua):
+        kind = "Tablet"
+    elif any(k in ua for k in ("Mobile", "iPhone", "Android")):
+        kind = "Mobile"
+    elif system in ("Windows", "macOS", "Linux", "ChromeOS"):
+        kind = "Desktop"
+    else:
+        kind = "API client / unknown"
+    return {"type": kind, "os": system, "browser": browser}
+
+
 def device_label(user_agent: str) -> str:
     ua = user_agent or ""
     browser = next((b for k, b in (("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"),
@@ -264,8 +296,8 @@ async def register_device(conn, user: dict, dfp: str, ctx) -> dict:
         (user["id"], dfp))
     row = await cur.fetchone()
     if row:
-        await conn.execute("UPDATE known_devices SET last_seen = now(), last_ip = %s WHERE id = %s",
-                           (ctx.ip, row["id"]))
+        await conn.execute("UPDATE known_devices SET last_seen = now(), last_ip = %s, user_agent = %s WHERE id = %s",
+                           (ctx.ip, ctx.user_agent[:400], row["id"]))
         return dict(row) | {"new": False}
     cur = await conn.execute(
         "SELECT count(*) AS n FROM known_devices WHERE user_id = %s AND status = 'trusted'", (user["id"],))
@@ -273,10 +305,11 @@ async def register_device(conn, user: dict, dfp: str, ctx) -> dict:
     status = "trusted" if first else "pending"
     label = device_label(ctx.user_agent)
     cur = await conn.execute(
-        """INSERT INTO known_devices (user_id, fingerprint, label, status, first_ip, last_ip, verified_at, verified_by)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id, status, label""",
+        """INSERT INTO known_devices (user_id, fingerprint, label, status, first_ip, last_ip, verified_at, verified_by,
+                                     user_agent)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id, status, label""",
         (user["id"], dfp, label, status, ctx.ip, ctx.ip,
-         datetime.now(timezone.utc) if first else None, "first device" if first else None))
+         datetime.now(timezone.utc) if first else None, "first device" if first else None, ctx.user_agent[:400]))
     return dict(await cur.fetchone()) | {"new": True}
 
 
@@ -366,10 +399,18 @@ async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known
     clients.audit(actor=actor, action="auth.login", resource="session", decision="allow",
                   reason=method, risk=risk["score"],
                   details={"ip": ctx.ip, "new_device": not known, "device_status": device["status"],
-                           "jti": claims["jti"], "reasons": risk["reasons"]})
+                           "jti": claims["jti"], "reasons": risk["reasons"], "device_id": device["id"],
+                           "device": device["label"]})
     if device.get("new") and device["status"] == "pending":
         clients.audit(actor=actor, action="device.new_pending", resource=device["label"], decision="alert",
-                      reason="new_device_needs_verification", details={"ip": ctx.ip})
+                      reason="new_device_needs_verification", details={"ip": ctx.ip, "device_id": device["id"]})
+        await alert(user, "new_device", "Sign-in from a new device",
+                    f"{device['label']} from {ctx.ip} signed in. It cannot move money until you approve it from a "
+                    f"trusted device. Not you? Use Account protection now.", "high",
+                    {"device_id": device["id"], "ip": ctx.ip})
+    else:
+        await alert(user, "login", "Signed in", f"{device['label']} from {ctx.ip} ({method.replace('_', ' ')}).",
+                    "info", {"device_id": device["id"], "ip": ctx.ip})
     return {
         "access_token": access, "refresh_token": refresh,
         "expires_in": tokens.ACCESS_TTL_SECONDS, "token_type": "Bearer",
@@ -401,12 +442,17 @@ async def login(body: LoginIn):
         await record_failure(user)
         clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
                       reason="bad_password", details={"ip": ctx.ip, "failures": user["failed_attempts"] + 1})
+        await alert(user, "login_failed", "Failed sign-in attempt",
+                    f"Wrong password from {ctx.ip}. If this was not you, change your password.", "medium")
         raise INVALID
 
     if not await totp_ok(user, body.totp):
         await record_failure(user)
         clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
                       reason="bad_or_replayed_totp", details={"ip": ctx.ip})
+        await alert(user, "login_failed", "Failed sign-in attempt",
+                    f"Correct password but wrong authenticator code from {ctx.ip}. If this was not you, "
+                    "change your password now.", "high")
         raise INVALID
 
     known, _status, risk = await assess_login(user, ctx, dfp, actor)
@@ -669,6 +715,9 @@ class RevokeIn(BaseModel):
 
 @app.post("/internal/revoke-user")
 async def revoke_user(body: RevokeIn, caller: str = Depends(mtls.require_caller("transaction", "gateway"))):
+    await alert(body.username, "suspicious", "Suspicious activity: you were signed out everywhere",
+                f"A high-risk action was blocked ({body.reason.replace('_', ' ')}). Sign in again with your "
+                "authenticator code. Not you? Report it in Account protection.", "critical")
     await revoke_user_sessions(body.sub, body.reason)
     clients.audit(actor=body.username, action="auth.revoke_sessions", resource="session",
                   decision="info", reason=body.reason, details={"requested_by": caller})
@@ -680,6 +729,7 @@ class RegisterIn(BaseModel):
     username: str
     password: str = Field(min_length=10, max_length=200)
     mobile: str = Field(max_length=20)
+    full_name: str | None = Field(default=None, max_length=80)
 
 
 @app.post("/register", dependencies=[gateway_only])
@@ -698,9 +748,11 @@ async def register(body: RegisterIn):
         if await cur.fetchone():
             raise HTTPException(409, "this mobile number is already registered")
         cur = await conn.execute(
-            """INSERT INTO users (username, password_hash, totp_secret, role, mobile)
-               VALUES (%s,%s,%s,'customer',%s) ON CONFLICT DO NOTHING RETURNING id""",
-            (body.username, hash_password(body.password), secret, mobile))
+            """INSERT INTO users (username, password_hash, totp_secret, role, mobile, full_name, kyc_status,
+                                  password_changed_at)
+               VALUES (%s,%s,%s,'customer',%s,%s,'pending',now()) ON CONFLICT DO NOTHING RETURNING id""",
+            (body.username, hash_password(body.password), secret, mobile,
+             (body.full_name or "").strip()[:80] or body.username.replace("_", " ").title()))
         row = await cur.fetchone()
         await conn.commit()
     if row is None:
@@ -903,7 +955,8 @@ async def device_rows(user_id: int) -> list[dict]:
     async with p.connection() as conn:
         cur = await conn.execute(
             """SELECT id, fingerprint, label, status, first_ip, last_ip, first_seen, last_seen,
-                      verified_at, verified_by FROM known_devices WHERE user_id = %s ORDER BY id""", (user_id,))
+                      verified_at, verified_by, user_agent FROM known_devices WHERE user_id = %s ORDER BY id""",
+            (user_id,))
         return await cur.fetchall()
 
 
@@ -912,6 +965,9 @@ def device_view(row: dict, current_dfp: str) -> dict:
     for k in ("first_seen", "last_seen", "verified_at"):
         out[k] = row[k].isoformat() if row[k] else None
     out["current"] = row["fingerprint"] == current_dfp
+    out |= device_parts(row.get("user_agent") or row["label"])
+    out["fingerprint"] = row["fingerprint"][:12]
+    out["unfamiliar"] = row["status"] == "pending"
     return out
 
 
@@ -966,6 +1022,7 @@ async def approve_device(device_id: int, body: DeviceActionIn, authorization: st
     row = await set_device_status(claims, device_id, "trusted", f"approved from {me['label']}")
     clients.audit(actor=claims["usr"], action="device.approve", resource=row["label"], decision="allow",
                   reason="approved_from_trusted_device")
+    await alert(claims["usr"], "device", "Device approved", f"{row['label']} is now trusted and can move money.")
     return await my_devices(authorization)
 
 
@@ -976,6 +1033,7 @@ async def revoke_device(device_id: int, body: DeviceActionIn, authorization: str
     row = await set_device_status(claims, device_id, "revoked", "")
     clients.audit(actor=claims["usr"], action="device.revoke", resource=row["label"], decision="info",
                   reason="revoked_by_owner")
+    await alert(claims["usr"], "device", "Device access revoked", f"{row['label']} was signed out and blocked.")
     return await my_devices(authorization)
 
 
@@ -1196,6 +1254,480 @@ async def admin_revoke_session(sid: str, authorization: str | None = Header(None
                   decision="alert", reason="session_revoked_by_admin",
                   details={"ip": info.get("ip"), "device": info.get("device")})
     return {"sid": sid, "revoked": True}
+
+
+# ======================================================================= customer portal
+# Profile, contact details, password, authenticator reset, notifications, sessions,
+# self-protection (lockdown / recovery). Every change re-verifies the token here, the
+# sensitive ones need a fresh authenticator code, and all are audited.
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,180}\.[A-Za-z]{2,24}$")
+LOCKDOWN_UNTIL = datetime(9999, 12, 31, tzinfo=timezone.utc)
+
+
+def mask_email(e: str | None) -> str | None:
+    if not e:
+        return None
+    name, _, dom = e.partition("@")
+    return f"{name[:2]}{'*' * max(1, len(name) - 2)}@{dom}"
+
+
+async def me(authorization: str | None) -> tuple[dict, dict]:
+    claims = caller_claims(authorization)
+    user = await get_user_by_id(claims["sub"])
+    if user is None:
+        raise HTTPException(404, "user not found")
+    return claims, user
+
+
+async def require_totp(user: dict, code: str, purpose: str) -> None:
+    if not await totp_ok(user, code):
+        clients.audit(actor=user["username"], action="auth.step_up", resource=purpose, decision="deny",
+                      reason="bad_or_replayed_totp")
+        raise HTTPException(401, "authenticator code invalid or already used")
+
+
+async def set_user(uid: int, **cols) -> None:
+    p = await db.pool()
+    async with p.connection() as conn:
+        sets = ", ".join(f"{k} = %s" for k in cols)
+        await conn.execute(f"UPDATE users SET {sets} WHERE id = %s", (*cols.values(), uid))
+        await conn.commit()
+
+
+def profile_view(user: dict) -> dict:
+    return {
+        "username": user["username"], "full_name": user.get("full_name") or user["username"],
+        "role": user["role"], "email": user.get("email"), "email_masked": mask_email(user.get("email")),
+        "email_verified": bool(user.get("email_verified")),
+        "mobile": user.get("mobile"), "mobile_masked": mask_mobile(user["mobile"]) if user.get("mobile") else None,
+        "kyc_status": user.get("kyc_status") or "verified",
+        "customer_since": user["created_at"].isoformat(),
+        "password_changed_at": (user.get("password_changed_at") or user["created_at"]).isoformat(),
+        "avatar": user.get("avatar"), "prefs": notify.prefs_of(user),
+        "mfa": {"authenticator": True, "sms": bool(user.get("mobile")), "can_disable": False},
+        "locked": bool(user["locked_until"] and user["locked_until"] > datetime.now(timezone.utc)),
+        "self_locked": bool(user.get("self_locked")), "last_login_ip": user.get("last_login_ip"),
+        "idle_timeout_minutes": user["idle_timeout_minutes"],
+    }
+
+
+@app.get("/me/profile", dependencies=[gateway_only])
+async def my_profile(authorization: str | None = Header(None)):
+    _, user = await me(authorization)
+    return profile_view(user)
+
+
+class ProfileIn(BaseModel):
+    full_name: str = Field(min_length=2, max_length=80)
+
+
+@app.put("/me/profile", dependencies=[gateway_only])
+async def update_profile(body: ProfileIn, authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    name = re.sub(r"\s+", " ", body.full_name).strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z .'-]{1,79}", name):
+        raise HTTPException(400, "use letters, spaces, dots, apostrophes and hyphens only")
+    await set_user(user["id"], full_name=name)
+    clients.audit(actor=claims["usr"], action="profile.update", resource="full_name", decision="info")
+    return profile_view(await get_user_by_id(claims["sub"]))
+
+
+class AvatarIn(BaseModel):
+    data_url: str = Field(max_length=280000)
+
+
+@app.put("/me/avatar", dependencies=[gateway_only])
+async def set_avatar(body: AvatarIn, authorization: str | None = Header(None)):
+    """PNG or JPEG up to ~200 KB. The bytes are checked, not just the declared type."""
+    import base64
+    claims, user = await me(authorization)
+    m = re.fullmatch(r"data:image/(png|jpeg);base64,([A-Za-z0-9+/=]+)", body.data_url)
+    if not m:
+        raise HTTPException(400, "send a PNG or JPEG image")
+    raw = base64.b64decode(m.group(2), validate=True)
+    if not (raw.startswith(b"\x89PNG\r\n\x1a\n") or raw.startswith(b"\xff\xd8\xff")) or len(raw) > 200_000:
+        raise HTTPException(400, "the file is not a PNG / JPEG image of at most 200 KB")
+    await set_user(user["id"], avatar=body.data_url)
+    clients.audit(actor=claims["usr"], action="profile.update", resource="avatar", decision="info")
+    return {"ok": True}
+
+
+@app.delete("/me/avatar", dependencies=[gateway_only])
+async def delete_avatar(authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    await set_user(user["id"], avatar=None)
+    return {"ok": True}
+
+
+class PrefsIn(BaseModel):
+    prefs: dict[str, bool]
+
+
+@app.put("/me/prefs", dependencies=[gateway_only])
+async def set_prefs(body: PrefsIn, authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    unknown = set(body.prefs) - set(notify.DEFAULT_PREFS)
+    if unknown:
+        raise HTTPException(400, f"unknown preferences: {', '.join(sorted(unknown))}")
+    prefs = notify.prefs_of(user) | body.prefs
+    p = await db.pool()
+    async with p.connection() as conn:
+        await conn.execute("UPDATE users SET prefs = %s WHERE id = %s", (json.dumps(prefs), user["id"]))
+        await conn.commit()
+    clients.audit(actor=claims["usr"], action="profile.prefs", resource="preferences", decision="info",
+                  details={"changed": body.prefs})
+    return {"prefs": prefs}
+
+
+# ---- contact changes: a code goes to the NEW address/number, plus the authenticator code
+class ContactStartIn(BaseModel):
+    value: str = Field(max_length=254)
+    totp: str = Field(max_length=10)
+
+
+class CodeIn(BaseModel):
+    code: str = Field(max_length=10)
+
+
+async def start_contact_change(kind: str, claims: dict, user: dict, value: str) -> dict:
+    r = clients.redis()
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    await r.hset(f"chg:{kind}:{user['id']}", mapping={"value": value, "h": otp_digest(user["id"], code, kind),
+                                                       "tries": 0})
+    await r.expire(f"chg:{kind}:{user['id']}", 600)
+    return {"code": code}
+
+
+async def confirm_contact_change(kind: str, user: dict, code: str) -> str:
+    r = clients.redis()
+    key = f"chg:{kind}:{user['id']}"
+    rec = await r.hgetall(key)
+    if not rec:
+        raise HTTPException(410, "no change in progress or the code expired - start again")
+    if not hmac.compare_digest(rec["h"], otp_digest(user["id"], code.strip(), kind)):
+        if await r.hincrby(key, "tries", 1) >= 3:
+            await r.delete(key)
+            raise HTTPException(401, "wrong code - start again")
+        raise HTTPException(401, "wrong code")
+    await r.delete(key)
+    return rec["value"]
+
+
+@app.post("/me/email/start", dependencies=[gateway_only])
+async def email_start(body: ContactStartIn, authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    email = body.value.strip().lower()
+    if not EMAIL_RE.fullmatch(email):
+        raise HTTPException(400, "enter a valid e-mail address")
+    await require_totp(user, body.totp, "email_change")
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute("SELECT 1 FROM users WHERE email = %s AND id <> %s", (email, user["id"]))
+        if await cur.fetchone():
+            raise HTTPException(409, "this e-mail address is used by another customer")
+    c = await start_contact_change("email", claims, user, email)
+    await notify.send_email(clients.redis(), email, "Confirm your e-mail address",
+                            f"Your ZT-FinGuard verification code is {c['code']}. It expires in 10 minutes.")
+    return {"sent_to": mask_email(email), "expires_in": 600}
+
+
+@app.post("/me/email/confirm", dependencies=[gateway_only])
+async def email_confirm(body: CodeIn, authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    email = await confirm_contact_change("email", user, body.code)
+    try:
+        await set_user(user["id"], email=email, email_verified=True)
+    except Exception:  # noqa: BLE001 - unique constraint race
+        raise HTTPException(409, "this e-mail address is used by another customer")
+    clients.audit(actor=claims["usr"], action="profile.email", resource="email", decision="info",
+                  reason="email_verified", details={"email": mask_email(email)})
+    if user.get("email"):
+        await notify.send_email(clients.redis(), user["email"], "Your e-mail address was changed",
+                                f"Alerts now go to {mask_email(email)}. Not you? Contact the bank immediately.")
+    await alert(await get_user_by_id(claims["sub"]), "security", "E-mail address updated",
+                f"Alerts will be sent to {mask_email(email)}.", "medium")
+    return profile_view(await get_user_by_id(claims["sub"]))
+
+
+@app.post("/me/mobile/start", dependencies=[gateway_only])
+async def mobile_start(body: ContactStartIn, authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    mobile = normalize_mobile(body.value)
+    if mobile is None:
+        raise HTTPException(400, "enter a valid 10-digit Indian mobile number")
+    if mobile == user.get("mobile"):
+        raise HTTPException(400, "that is already your number")
+    await require_totp(user, body.totp, "mobile_change")
+    if await get_user_by_mobile(mobile):
+        raise HTTPException(409, "this mobile number is already registered")
+    c = await start_contact_change("mobile", claims, user, mobile)
+    await sms.send(clients.redis(), mobile, f"{c['code']} is your code to link this number to ZT-FinGuard. "
+                                             "Valid 10 minutes.")
+    return {"sent_to": mask_mobile(mobile), "expires_in": 600}
+
+
+@app.post("/me/mobile/confirm", dependencies=[gateway_only])
+async def mobile_confirm(body: CodeIn, authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    mobile = await confirm_contact_change("mobile", user, body.code)
+    old = user.get("mobile")
+    try:
+        await set_user(user["id"], mobile=mobile)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(409, "this mobile number is already registered")
+    clients.audit(actor=claims["usr"], action="profile.mobile", resource="mobile", decision="alert",
+                  reason="mobile_changed", details={"from": mask_mobile(old) if old else None,
+                                                    "to": mask_mobile(mobile)})
+    if old:   # the old number is told, so a SIM-swap / takeover is noticed
+        await notify._inbox(clients.redis(), f"smsalert:{old}", {
+            "at": notify.now(), "from": "ZTBANK",
+            "text": f"ZT-FinGuard: your registered mobile was changed to {mask_mobile(mobile)}. Not you? Call us now."})
+    await alert(await get_user_by_id(claims["sub"]), "security", "Mobile number updated",
+                f"Sign-in codes and alerts now go to {mask_mobile(mobile)}.", "high")
+    return profile_view(await get_user_by_id(claims["sub"]))
+
+
+# ---- password and authenticator
+class PasswordIn(BaseModel):
+    current_password: str = Field(max_length=200)
+    new_password: str = Field(max_length=200)
+    totp: str = Field(max_length=10)
+
+
+@app.post("/me/password", dependencies=[gateway_only])
+async def change_password(body: PasswordIn, authorization: str | None = Header(None)):
+    """Ends every session (including this one): the next sign-in uses the new password."""
+    claims, user = await me(authorization)
+    if not verify_password(body.current_password, user["password_hash"]):
+        clients.audit(actor=claims["usr"], action="auth.password_change", resource="password", decision="deny",
+                      reason="wrong_current_password")
+        raise HTTPException(401, "current password is wrong")
+    n = await setting("password_min_length")
+    pw = body.new_password
+    if len(pw) < n or not (re.search(r"[A-Za-z]", pw) and re.search(r"\d", pw)):
+        raise HTTPException(400, f"use at least {n} characters with letters and digits")
+    if verify_password(pw, user["password_hash"]) or user["username"].lower() in pw.lower():
+        raise HTTPException(400, "choose a new password that is not your username or your current one")
+    await require_totp(user, body.totp, "password_change")
+    await set_user(user["id"], password_hash=hash_password(pw), password_changed_at=datetime.now(timezone.utc))
+    await revoke_user_sessions(claims["sub"], "password_changed")
+    clients.audit(actor=claims["usr"], action="auth.password_change", resource="password", decision="allow",
+                  reason="password_changed")
+    await alert(user, "password", "Password changed",
+                "Your password was changed and every session was signed out. Not you? Use account recovery.", "high")
+    return {"changed": True, "signed_out": True}
+
+
+class MfaResetIn(BaseModel):
+    password: str = Field(max_length=200)
+    totp: str = Field(max_length=10)
+
+
+@app.post("/me/mfa/reset/start", dependencies=[gateway_only])
+async def mfa_reset_start(body: MfaResetIn, authorization: str | None = Header(None)):
+    """Re-link the authenticator app (new phone). MFA itself can never be switched off."""
+    claims, user = await me(authorization)
+    if not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(401, "password is wrong")
+    await require_totp(user, body.totp, "mfa_reset")
+    secret = pyotp.random_base32()
+    await clients.redis().set(f"mfanew:{user['id']}", secret, ex=600)
+    return {"secret": secret, "expires_in": 600,
+            "otpauth_uri": pyotp.TOTP(secret).provisioning_uri(name=user["username"], issuer_name="ZT-FinGuard")}
+
+
+@app.post("/me/mfa/reset/confirm", dependencies=[gateway_only])
+async def mfa_reset_confirm(body: CodeIn, authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    r = clients.redis()
+    secret = await r.get(f"mfanew:{user['id']}")
+    if not secret:
+        raise HTTPException(410, "start again - the new key expired")
+    if not pyotp.TOTP(secret).verify(body.code.strip(), valid_window=1):
+        raise HTTPException(401, "that code does not match the new key - check the app and try again")
+    await set_user(user["id"], totp_secret=secret)
+    await r.delete(f"mfanew:{user['id']}")
+    await r.set(f"totp:{user['id']}:{body.code.strip()}", 1, ex=120)     # the confirming code is used up
+    clients.audit(actor=claims["usr"], action="auth.mfa_reset", resource="authenticator", decision="alert",
+                  reason="authenticator_relinked")
+    await alert(user, "mfa", "Authenticator app re-linked",
+                "A new authenticator app was linked; the old one no longer works. Not you? Lock your account now.",
+                "high")
+    return {"relinked": True}
+
+
+# ---- notifications
+@app.get("/me/notifications", dependencies=[gateway_only])
+async def my_notifications(authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    return await notify.listing(clients.redis(), user["username"])
+
+
+class ReadIn(BaseModel):
+    ids: list[str] | None = None
+
+
+@app.post("/me/notifications/read", dependencies=[gateway_only])
+async def read_notifications(body: ReadIn, authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    await notify.mark_read(clients.redis(), user["username"], body.ids)
+    return await notify.listing(clients.redis(), user["username"])
+
+
+@app.get("/me/inboxes", dependencies=[gateway_only])
+async def my_inboxes(authorization: str | None = Header(None)):
+    """Simulated phone and mailbox of the signed-in customer (demo only)."""
+    claims, user = await me(authorization)
+    r = clients.redis()
+    return {"sms": (await sms.inbox(r, user["mobile"]) if user.get("mobile") else [])
+            + (await notify.inbox(r, f"smsalert:{user['mobile']}") if user.get("mobile") else []),
+            "email": await notify.inbox(r, f"email:{user['email']}") if user.get("email") else []}
+
+
+class NotifyIn(BaseModel):
+    username: str = Field(max_length=40)
+    category: str = Field(max_length=30)
+    title: str = Field(max_length=120)
+    body: str = Field(max_length=400)
+    severity: str = Field(default="info", pattern=r"^(info|low|medium|high|critical)$")
+    data: dict = Field(default_factory=dict)
+
+
+@app.post("/internal/notify")
+async def internal_notify(body: NotifyIn,
+                          _c: str = Depends(mtls.require_caller("transaction", "account", "gateway"))):
+    if body.category not in notify.CATEGORIES:
+        raise HTTPException(400, "unknown category")
+    await alert(body.username, body.category, body.title, body.body, body.severity, body.data)
+    return {"ok": True}
+
+
+# ---- sessions
+@app.get("/me/sessions", dependencies=[gateway_only])
+async def my_sessions(authorization: str | None = Header(None)):
+    claims, _ = await me(authorization)
+    live = await sessions.active(clients.redis(), claims["sub"])
+    out = []
+    for x in live:
+        out.append({"sid": x["sid"], "device": x.get("device"), "ip": x.get("ip"), "method": x.get("method"),
+                    "started_ms": x.get("started_ms"), "idle_seconds": x.get("idle_seconds"),
+                    "current": x["sid"] == claims.get("sid"), "device_status": x.get("device_status")})
+    return {"sessions": out}
+
+
+@app.post("/me/sessions/{sid}/revoke", dependencies=[gateway_only])
+async def revoke_my_session(sid: str, authorization: str | None = Header(None)):
+    claims, _ = await me(authorization)
+    r = clients.redis()
+    info = await r.hgetall(f"sessinfo:{sid}")
+    if not info or info.get("sub") != claims["sub"]:
+        raise HTTPException(404, "session not found")
+    if sid == claims.get("sid"):
+        raise HTTPException(400, "use Sign out for this session")
+    await kill_session(r, sid)
+    clients.audit(actor=claims["usr"], action="session.revoke_own", resource=info.get("device", "?"),
+                  decision="info", reason="revoked_by_owner", details={"ip": info.get("ip")})
+    return {"revoked": sid}
+
+
+@app.post("/me/sessions/revoke-all", dependencies=[gateway_only])
+async def revoke_all_mine(authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    await revoke_user_sessions(claims["sub"], "signed_out_everywhere")
+    clients.audit(actor=claims["usr"], action="auth.revoke_sessions", resource="session", decision="info",
+                  reason="signed_out_everywhere_by_owner")
+    await alert(user, "security", "Signed out everywhere", "Every session on every device was ended.", "medium")
+    return {"revoked": True}
+
+
+# ---- account protection: lockdown and recovery
+class TotpOnlyIn(BaseModel):
+    totp: str = Field(max_length=10)
+    reason: str = Field(default="", max_length=200)
+
+
+@app.post("/me/lockdown", dependencies=[gateway_only])
+async def lockdown(body: TotpOnlyIn, authorization: str | None = Header(None)):
+    """Emergency: sign-in is refused until the customer proves who they are (recovery)."""
+    claims, user = await me(authorization)
+    await require_totp(user, body.totp, "lockdown")
+    await set_user(user["id"], self_locked=True, locked_until=LOCKDOWN_UNTIL)
+    await revoke_user_sessions(claims["sub"], "customer_lockdown")
+    clients.audit(actor=claims["usr"], action="account.lockdown", resource="user", decision="alert",
+                  reason="customer_requested_lockdown", details={"note": body.reason})
+    await alert(user, "security", "Account locked down",
+                "Sign-in is blocked on every device until you complete account recovery.", "critical")
+    return {"locked": True}
+
+
+@app.post("/me/report-access", dependencies=[gateway_only])
+async def report_unauthorised_access(body: TotpOnlyIn, authorization: str | None = Header(None)):
+    """'Someone else got in': end every session now; the gateway also opens a support ticket."""
+    claims, user = await me(authorization)
+    await require_totp(user, body.totp, "report_access")
+    await revoke_user_sessions(claims["sub"], "customer_reported_unauthorized_access")
+    clients.audit(actor=claims["usr"], action="customer.report_access", resource="user", decision="alert",
+                  reason="unauthorized_access_reported", details={"note": body.reason})
+    await alert(user, "security", "Unauthorised access reported",
+                "Every session was ended. Change your password and review your devices.", "critical")
+    return {"reported": True, "signed_out": True}
+
+
+@app.post("/me/devices/{device_id}/report-stolen", dependencies=[gateway_only])
+async def report_stolen(device_id: int, body: TotpOnlyIn, authorization: str | None = Header(None)):
+    claims, user = await me(authorization)
+    rows = await device_rows(int(claims["sub"]))
+    dev = next((d for d in rows if d["id"] == device_id), None)
+    if dev is None:
+        raise HTTPException(404, "device not found")
+    if dev["fingerprint"] == claims["dfp"]:
+        raise HTTPException(400, "report it from another device (this is the device you are using)")
+    await require_totp(user, body.totp, "report_stolen")
+    await set_device_status(claims, device_id, "revoked", "")
+    await revoke_user_sessions(claims["sub"], "device_reported_stolen")
+    clients.audit(actor=claims["usr"], action="device.reported_stolen", resource=dev["label"], decision="alert",
+                  reason="device_reported_stolen", details={"device_id": device_id, "note": body.reason})
+    await alert(user, "security", "Device reported stolen",
+                f"{dev['label']} was blocked and every session ended. Sign in again on your own device.", "critical")
+    return {"revoked": device_id, "signed_out": True}
+
+
+class RecoveryIn(BaseModel):
+    username: str = Field(max_length=40)
+    password: str = Field(max_length=200)
+    totp: str = Field(max_length=10)
+    sms_otp: str = Field(max_length=10)
+    client: ClientCtx
+
+
+@app.post("/recovery", dependencies=[gateway_only])
+async def recover(body: RecoveryIn):
+    """Verify identity with all three factors (password + authenticator + SMS code) to lift a
+    lockdown the customer started. A lock set by the bank stays: contact support."""
+    user = await get_user(body.username)
+    fail = HTTPException(401, "identity could not be verified")
+    if user is None:
+        verify_password(body.password, DUMMY_HASH)
+        raise fail
+    r = clients.redis()
+    rec = await r.hgetall(f"otp:{user['id']}")
+    ok_sms = bool(rec) and hmac.compare_digest(rec["h"], otp_digest(user["id"], body.sms_otp.strip(), rec["salt"]))
+    ok = verify_password(body.password, user["password_hash"]) and ok_sms and await totp_ok(user, body.totp)
+    if not ok:
+        await record_failure(user) if not user.get("self_locked") else None
+        clients.audit(actor=user["username"], action="account.recovery", resource="user", decision="deny",
+                      reason="identity_not_verified", details={"ip": body.client.ip})
+        raise fail
+    await r.delete(f"otp:{user['id']}")
+    locked = user["locked_until"] and user["locked_until"] > datetime.now(timezone.utc)
+    if locked and not user.get("self_locked"):
+        raise HTTPException(403, "your account was locked by the bank - raise a recovery request with support")
+    await set_user(user["id"], self_locked=False, locked_until=None, failed_attempts=0)
+    clients.audit(actor=user["username"], action="account.recovery", resource="user", decision="allow",
+                  reason="identity_verified_access_restored", details={"ip": body.client.ip})
+    await alert(user, "security", "Access restored", "Your identity was verified and sign-in is open again. "
+                "Review your devices and change your password if anything looks wrong.", "high")
+    return {"restored": True, "was_locked": bool(locked)}
 
 
 @app.get("/healthz")

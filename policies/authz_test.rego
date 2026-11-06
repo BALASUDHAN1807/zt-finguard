@@ -12,7 +12,7 @@ transfer(subject, ctx) := {
 	"context": object.union(
 		{
 			"caller": "transaction", "amount": 1000, "risk_level": "low", "device_trust": "trusted",
-			"sender_status": "active", "receiver_status": "active", "daily_used": 0, "daily_limit": 100000,
+			"sender_status": "active", "receiver_status": "active", "daily_used": 0, "daily_limit": 100000, "outgoing_enabled": true,
 		},
 		ctx,
 	),
@@ -263,4 +263,21 @@ test_simulation_uses_candidate_without_changing_live if {
 	inp := object.union(transfer(customer, {"amount": 20000}), {"policy": {"transfer_limit_customer": 10000}})
 	"amount_over_limit" in authz.simulate.reasons with input as inp
 	authz.decision.allow with input as inp
+}
+
+# ------------------------------------------------ customer portal
+test_customer_can_switch_off_own_transfers_fail_closed if {
+	"transfers_disabled_by_customer" in authz.decision.reasons with input as transfer(customer, {"outgoing_enabled": false})
+	inp := transfer(customer, {})
+	missing := object.union(object.remove(inp, ["context"]), {"context": object.remove(inp.context, ["outgoing_enabled"])})
+	"transfers_disabled_by_customer" in authz.decision.reasons with input as missing
+}
+
+test_support_tickets_own_only_and_ops_manage if {
+	authz.decision.allow with input as {"subject": customer, "action": "support.ticket", "resource": {"owner": "alice"}, "context": {"caller": "account"}}
+	not authz.decision.allow with input as {"subject": customer, "action": "support.ticket", "resource": {"owner": "bob"}, "context": {"caller": "account"}}
+	ops := {"user": "ops", "role": "operations", "mfa": true}
+	authz.decision.allow with input as {"subject": ops, "action": "support.manage", "resource": {}, "context": {"caller": "account"}}
+	admin := {"user": "admin", "role": "admin", "mfa": true}
+	not authz.decision.allow with input as {"subject": admin, "action": "support.manage", "resource": {}, "context": {"caller": "account"}}
 }

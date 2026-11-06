@@ -11,7 +11,7 @@
 #                "risk_level": "low|medium|high", "step_up": false,
 #                "device_trust": "trusted|pending",
 #                "sender_status": "active|frozen", "receiver_status": "active|frozen",
-#                "daily_used": 12000, "daily_limit": 100000}
+#                "daily_used": 12000, "daily_limit": 100000, "outgoing_enabled": true}
 # }
 #
 # result = {"allow": bool, "step_up": bool, "needs_approval": bool, "reasons": [..]}
@@ -28,6 +28,8 @@ permissions := {
 		"transaction.history:own",
 		"transaction.cancel:own",
 		"beneficiary.manage:own",
+		"account.protect:own",
+		"support.ticket:own",
 		"self.manage",
 	},
 	# Banking operations (maker-checker). Cannot move its own money (has no account),
@@ -41,6 +43,7 @@ permissions := {
 		"account.read:any",
 		"transaction.history:any",
 		"transaction.cancel:any",
+		"support.manage",
 		"self.manage",
 	},
 	"teller": {
@@ -94,6 +97,9 @@ trusted_callers := {
 	"ops.approve": {"transaction"},
 	"transaction.cancel": {"transaction"},
 	"beneficiary.manage": {"account"},
+	"account.protect": {"account"},
+	"support.ticket": {"account"},
+	"support.manage": {"account"},
 }
 
 # ------------------------------------------------ tunable policy (module 8)
@@ -191,6 +197,12 @@ deny contains "account_frozen" if {
 deny contains "payee_account_frozen" if {
 	is_transfer
 	not input.context.receiver_status == "active"
+}
+
+# Customer self-protection: the account holder switched outgoing transfers off (missing value denies).
+deny contains "transfers_disabled_by_customer" if {
+	is_transfer
+	not input.context.outgoing_enabled == true
 }
 
 within_daily_limit if input.context.daily_used + input.context.amount <= input.context.daily_limit

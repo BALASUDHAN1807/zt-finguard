@@ -426,7 +426,9 @@ def login_page() -> None:
             render_result(ss.last_transfer)
             ss.last_transfer = None
         st.markdown("## Welcome back")
-        tab_in, tab_reg = st.tabs(["Sign in", "Open an account"])
+        tab_in, tab_reg, tab_rec = st.tabs(["Sign in", "Open an account", "Recover access"])
+        with tab_rec:
+            recovery_form()
         with tab_in:
             how = st.radio("Sign in with", ["Mobile number + SMS code", "Username + password"],
                            horizontal=True, label_visibility="collapsed")
@@ -436,6 +438,7 @@ def login_page() -> None:
                 password_signin()
         with tab_reg:
             with st.form("register"):
+                nf = st.text_input("Full name")
                 nu = st.text_input("Choose a username", help="3-20 characters: a-z, 0-9, _")
                 nm = st.text_input("Mobile number", placeholder="10-digit mobile number",
                                    help="Used to sign in with a one-time SMS code")
@@ -443,12 +446,16 @@ def login_page() -> None:
                 reg = st.form_submit_button("Create account", use_container_width=True)
             if reg:
                 r = api("POST", "/api/auth/register", json={"username": nu.strip(), "password": np_,
-                                                         "mobile": nm.strip()})
+                                                         "mobile": nm.strip(), "full_name": nf.strip() or None})
                 if r is not None and r.status_code == 200:
                     d = r.json()
                     st.success(f"Account **{d['account']['account_no']}** opened for {d['username']} "
                                f"(mobile {d['mobile']}).")
                     st.markdown("Add this key to Google Authenticator / Authy (enter manually), then sign in:")
+                    svg = qr_svg(d["otpauth_uri"])
+                    if svg:
+                        st.markdown(f'<div style="width:200px;background:#fff;padding:8px">{svg}</div>',
+                                    unsafe_allow_html=True)
                     st.code(d["totp_secret"])
                     st.caption(d["otpauth_uri"])
                 elif r is not None:
@@ -467,9 +474,17 @@ def sidebar() -> str:
                     f'<span>Verified sign-in, {icon.lower()}</span></div>', unsafe_allow_html=True)
         if ss.role == "customer" and trust != "trusted":
             st.info("New device: you can view your account, but transfers stay blocked until you approve "
-                    "this device from a trusted one (Security settings).")
+                    "this device from a trusted one (My devices).")
+        if ss.role == "customer":
+            n = api("GET", "/api/me/notifications", background=True)
+            unread = n.json().get("unread", 0) if n is not None and n.status_code == 200 else 0
+            if unread:
+                st.markdown(f'<div class="zt-who"><span>🔔 {unread} unread notification'
+                            f'{"s" if unread != 1 else ""}</span></div>', unsafe_allow_html=True)
         pages = {
-            "customer": ["My account", "Send money", "Security settings"],
+            "customer": ["Dashboard", "My accounts", "Money transfer", "Transaction history", "My devices",
+                         "Security center", "AI fraud protection", "Notifications", "Account protection",
+                         "My profile", "Customer support"],
             "teller": ["Account lookup", "Security settings"],
             "operations": ["Banking & transactions", "Security settings"],
             "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Container security",
@@ -1073,35 +1088,39 @@ def keys_and_certs(d: dict) -> None:
                 "(everyone signs in again). Private keys never leave `/run/secrets` inside the containers.")
 
 
+def timeout_panel() -> None:
+    r = api("GET", "/api/me/session")
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "unavailable")
+    else:
+        cfg = r.json()
+        st.markdown("Choose how long you can stay inactive before you are signed out automatically. "
+                    f"Your administrator allows at most **{cfg['admin_max_minutes']} minutes**.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Your choice", f"{cfg['preferred_minutes']} min")
+        c2.metric("Effective timeout", f"{cfg['effective_minutes']} min")
+        c3.metric("Administrator maximum", f"{cfg['admin_max_minutes']} min")
+        with st.form("idle"):
+            choices = cfg["choices"] or [cfg["effective_minutes"]]
+            current = min(choices, key=lambda c: abs(c - cfg["effective_minutes"]))
+            pick = st.select_slider("Sign me out after this many minutes of inactivity",
+                                    options=choices, value=current)
+            if st.form_submit_button("Save", type="primary"):
+                u = api("PUT", "/api/me/session", json={"idle_timeout_minutes": pick})
+                if u is not None and u.status_code == 200:
+                    st.success(f"Saved. You will be signed out after {u.json()['effective_minutes']} "
+                               "minute(s) without activity.")
+                elif u is not None:
+                    st.error(detail(u))
+        st.caption("Automatic page refreshes do not count as activity. After a timeout you must sign in "
+                   "again with your password and authenticator code.")
+
+
 def personal_security_settings() -> None:
     tab_s, tab_d = st.tabs(["Session timeout", "My devices"])
 
     with tab_s:
-        r = api("GET", "/api/me/session")
-        if r is None or r.status_code != 200:
-            st.error(detail(r) if r is not None else "unavailable")
-        else:
-            cfg = r.json()
-            st.markdown("Choose how long you can stay inactive before you are signed out automatically. "
-                        f"Your administrator allows at most **{cfg['admin_max_minutes']} minutes**.")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Your choice", f"{cfg['preferred_minutes']} min")
-            c2.metric("Effective timeout", f"{cfg['effective_minutes']} min")
-            c3.metric("Administrator maximum", f"{cfg['admin_max_minutes']} min")
-            with st.form("idle"):
-                choices = cfg["choices"] or [cfg["effective_minutes"]]
-                current = min(choices, key=lambda c: abs(c - cfg["effective_minutes"]))
-                pick = st.select_slider("Sign me out after this many minutes of inactivity",
-                                        options=choices, value=current)
-                if st.form_submit_button("Save", type="primary"):
-                    u = api("PUT", "/api/me/session", json={"idle_timeout_minutes": pick})
-                    if u is not None and u.status_code == 200:
-                        st.success(f"Saved. You will be signed out after {u.json()['effective_minutes']} "
-                                   "minute(s) without activity.")
-                    elif u is not None:
-                        st.error(detail(u))
-            st.caption("Automatic page refreshes do not count as activity. After a timeout you must sign in "
-                       "again with your password and authenticator code.")
+        timeout_panel()
 
     with tab_d:
         r = api("GET", "/api/me/devices")
@@ -1591,7 +1610,9 @@ def banking_operations() -> None:
     st.title("Banking & transactions")
     st.caption("Operations desk: accounts, transfers, approvals and limits. Security administration is a "
                "separate role (separation of duties).")
-    t = st.tabs(["Overview", "Accounts", "Transactions", "Pending approvals"])
+    t = st.tabs(["Overview", "Accounts", "Transactions", "Pending approvals", "Support tickets"])
+    with t[4]:
+        ops_support()
     with t[0]:
         ops_overview()
     with t[1]:
@@ -2239,6 +2260,1206 @@ def cont_actions(cs: list[dict]) -> None:
         st.caption("No quarantines, restarts, recoveries or runtime alerts yet.")
 
 
+# ======================================================================= customer portal
+METHOD_LABEL = {"internal": "Within ZT-FinGuard", "imps": "IMPS", "neft": "NEFT", "rtgs": "RTGS"}
+SEV_ICON = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}
+CAT_LABEL = {"login": "Sign-in", "login_failed": "Failed sign-in", "new_device": "New device", "transaction": "Transaction",
+             "transaction_failed": "Failed transaction", "high_value": "High-value transfer", "suspicious": "Suspicious activity",
+             "mfa": "MFA", "password": "Password", "device": "Device", "security": "Account security", "support": "Support"}
+
+
+def cp_json(path: str, **params):
+    r = api("GET", path, params=params or None)
+    if r is None or r.status_code != 200:
+        st.error(detail(r) if r is not None else "service unavailable")
+        return None
+    return r.json()
+
+
+def when(ts: str | None, fmt: str = "%d %b %Y, %H:%M") -> str:
+    if not ts:
+        return "-"
+    return pd.to_datetime(ts, utc=True).tz_convert("Asia/Kolkata").strftime(fmt)
+
+
+def code_box(label: str = "Authenticator code", key: str | None = None) -> str:
+    return st.text_input(label, max_chars=6, key=key, placeholder="6 digits").strip()
+
+
+def result(res, success: str, rerun: bool = False) -> bool:
+    if res is not None and res.status_code == 200:
+        st.success(success)
+        if rerun:
+            st.rerun()
+        return True
+    ok_or_error(res, "")
+    return False
+
+
+def stat_card(label: str, value: str, sub: str = "") -> str:
+    return (f'<div class="zt-card"><div class="zt-muted">{label}</div>'
+            f'<div style="font-size:1.35rem;font-weight:650;color:var(--ink)">{value}</div>'
+            f'<div class="zt-muted">{sub}</div></div>')
+
+
+def tx_table(rows: list[dict], height: int = 360) -> None:
+    if not rows:
+        st.info("No transactions match.")
+        return
+    df = pd.DataFrame(rows)
+    df["date"] = local_time(df["created_at"], "%d %b %Y %H:%M")
+    df["signed"] = df.apply(lambda x: (-1 if x["direction"] == "out" else 1) * x["amount"], axis=1)
+    df["status"] = df["status"].map(STATUS_LABEL).fillna(df["status"])
+    df["method"] = df["method"].map(METHOD_LABEL).fillna(df["method"])
+    if "counterparty" not in df:
+        df["counterparty"] = df.apply(lambda x: x["to_account"] if x["direction"] == "out" else x["from_account"], axis=1)
+    cols = ["date", "reference", "counterparty", "description", "method", "signed", "charges", "status", "risk_score"]
+    st.dataframe(df[[c for c in cols if c in df]], hide_index=True, use_container_width=True, height=height,
+                 column_config={"signed": st.column_config.NumberColumn("Amount (₹)", format="%+.2f"),
+                                "charges": st.column_config.NumberColumn("Charges (₹)", format="%.2f"),
+                                "risk_score": st.column_config.ProgressColumn("Risk", min_value=0, max_value=1,
+                                                                              format="%.2f")})
+
+
+def monthly_chart(monthly: list[dict]) -> None:
+    if not monthly:
+        st.caption("No completed transactions yet.")
+        return
+    m = pd.DataFrame(monthly)
+    long = m.melt(id_vars="month", value_vars=["income", "spending"], var_name="flow", value_name="amount")
+    ch = alt.Chart(long).mark_bar().encode(
+        x=alt.X("month:N", title=None), xOffset="flow:N",
+        y=alt.Y("amount:Q", title="₹"),
+        color=alt.Color("flow:N", scale=alt.Scale(domain=["income", "spending"], range=["#2E7D5B", "#B8892B"]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=["month", "flow", alt.Tooltip("amount:Q", format=",.2f")]).properties(height=240)
+    st.altair_chart(ch, use_container_width=True)
+
+
+# ---------------------------------------------------------------- 1. dashboard
+def cp_dashboard() -> None:
+    o = cp_json("/api/me/overview")
+    prof = cp_json("/api/me/profile")
+    sec = cp_json("/api/me/security")
+    nt = cp_json("/api/me/notifications")
+    if not (o and prof and sec and nt):
+        return
+    a = o["account"]
+    last = next((x for x in sec["logins"][1:] if x["decision"] == "allow"), None)
+    if prof.get("avatar"):
+        c1, c2 = st.columns([1, 8])
+        c1.image(prof["avatar"], width=72)
+    else:
+        c2 = st.container()
+    c2.title(f"Good {daypart()}, {prof['full_name'].split()[0]}")
+    c2.caption(f"Customer since {when(prof['customer_since'], '%b %Y')} · KYC {prof['kyc_status']} · "
+               f"previous sign-in {when(last['ts']) if last else 'none'}"
+               + (f" from {last['ip']}" if last and last.get("ip") else ""))
+    grouped = a["masked"]
+    st.markdown(f"""<div class="zt-passbook">
+<div><div class="k">Available balance</div><div class="bal">{money(o["available"])}</div></div>
+<div><div class="k">{a["type"]} account</div><div class="v">{grouped}</div></div>
+<div><div class="k">Ledger balance</div><div class="v">{money(o["balance"])}</div></div>
+</div>""", unsafe_allow_html=True)
+    if a["status"] == "frozen":
+        st.error(f"Account frozen ({a['frozen_reason'] or 'no reason given'}). No money can be sent or received.")
+    if a["transfers_disabled"]:
+        st.warning("You switched outgoing transfers off (Account protection).")
+    k = st.columns(4)
+    k[0].markdown(stat_card("Incoming this month", money(o["month"]["incoming"]),
+                            f"{o['lifetime']['incoming_n']} credits in total"), unsafe_allow_html=True)
+    k[1].markdown(stat_card("Outgoing this month", money(o["month"]["outgoing"]),
+                            f"{o['lifetime']['outgoing_n']} debits in total"), unsafe_allow_html=True)
+    sc = sec["score"]
+    k[2].markdown(stat_card("Security status", f"{sc['score']}/100 · {sc['level']}",
+                            f"{sum(1 for d in sec['devices'] if d['status'] == 'trusted')} trusted device(s), "
+                            f"{len(sec['sessions'])} active session(s)"), unsafe_allow_html=True)
+    k[3].markdown(stat_card("Notifications", f"{nt['unread']} unread",
+                            f"{o['pending_approvals']} pending approval(s)"), unsafe_allow_html=True)
+    alerts = []
+    if o["pending_approvals"]:
+        alerts.append(f"{o['pending_approvals']} high-value transfer(s) waiting for bank approval "
+                      f"({money(o['on_hold'])} on hold).")
+    if o["verification_requests"]:
+        alerts.append(f"{o['verification_requests']} transfer(s) in the last day needed your authenticator code.")
+    pend = [d for d in sec["devices"] if d["status"] == "pending"]
+    if pend:
+        alerts.append(f"{len(pend)} device(s) waiting for your approval - check My devices.")
+    if sec["score"]["suspicious_7d"]:
+        alerts.append(f"{sec['score']['suspicious_7d']} failed or challenged sign-in(s) this week.")
+    for x in alerts:
+        st.warning(x)
+    left, right = st.columns([3, 2])
+    with left:
+        st.subheader("Income and spending")
+        monthly_chart(o["monthly"])
+        st.subheader("Recent transactions")
+        tx_table(o["recent"], 300)
+    with right:
+        st.subheader("Quick transfer")
+        quick_transfer(o)
+        st.subheader("Latest notifications")
+        for n in nt["items"][:4]:
+            st.markdown(f"{SEV_ICON.get(n['severity'], '')} **{n['title']}** "
+                        f"<span class='zt-muted'>{when(n['ts'], '%d %b %H:%M')}</span><br>"
+                        f"<span class='zt-muted'>{n['body']}</span>", unsafe_allow_html=True)
+        if o["top_payees"]:
+            st.subheader("Where your money went (90 days)")
+            tp = pd.DataFrame(o["top_payees"])
+            st.altair_chart(alt.Chart(tp).mark_bar(color="#0B3D4A").encode(
+                x=alt.X("amount:Q", title="₹"), y=alt.Y("payee:N", sort="-x", title=None),
+                tooltip=["payee", alt.Tooltip("amount:Q", format=",.2f"), "n"]).properties(height=200),
+                use_container_width=True)
+
+
+def quick_transfer(o: dict) -> None:
+    r = api("GET", "/api/beneficiaries")
+    bens = r.json() if r is not None and r.status_code == 200 else []
+    if not bens:
+        st.caption("Save a payee under Money transfer to send in one step from here.")
+        return
+    with st.form("quick_tx"):
+        pick = st.selectbox("Payee", [f"{b['nickname']} ({b['account_no']})" for b in bens])
+        amt = st.number_input("Amount (₹)", min_value=1.0, max_value=10000.0, value=500.0, step=100.0,
+                              help="Quick transfers up to ₹10,000 within ZT-FinGuard; use Money transfer for more")
+        go = st.form_submit_button("Send now", type="primary", use_container_width=True)
+    if go:
+        execute_transfer({"to_account": pick.rsplit("(", 1)[1].rstrip(")"), "amount": round(float(amt), 2),
+                          "method": "internal", "description": "Quick transfer"})
+    show_transfer_outcome()
+
+
+# ---------------------------------------------------------------- 2. my accounts
+def cp_accounts() -> None:
+    st.title("My accounts")
+    o = cp_json("/api/me/overview", months=12)
+    if not o:
+        return
+    a = o["account"]
+    t = st.tabs(["Account details", "Balance", "Statement", "Profile & preferences", "Security status"])
+    with t[0]:
+        rows = [("Account holder", S().user), ("Account number", a["account_no"]), ("Masked", a["masked"]),
+                ("Account type", a["type"]), ("IFSC", a["ifsc"]), ("Branch", a["branch"]), ("Currency", a["currency"]),
+                ("Opened on", when(a["opened"], "%d %b %Y")),
+                ("Status", "Frozen" + (f" ({a['frozen_reason']})" if a["frozen_reason"] else "") if a["status"] == "frozen"
+                 else "Active"),
+                ("Outgoing transfers", "switched off by you" if a["transfers_disabled"] else "on"),
+                ("Daily transfer limit", money(a["daily_limit"])), ("Nominee", a["nominee"])]
+        st.dataframe(pd.DataFrame(rows, columns=["", "value"]), hide_index=True, use_container_width=True)
+    with t[1]:
+        c = st.columns(3)
+        c[0].metric("Ledger balance", money(o["balance"]))
+        c[1].metric("On hold (awaiting approval)", money(o["on_hold"]))
+        c[2].metric("Available balance", money(o["available"]))
+        used = a["used_today"]
+        st.progress(min(1.0, used / a["daily_limit"]) if a["daily_limit"] else 0.0,
+                    text=f"Sent today {money(used)} of your {money(a['daily_limit'])} daily limit")
+        c = st.columns(3)
+        c[0].metric("Total received", money(o["lifetime"]["incoming"]))
+        c[1].metric("Total sent (incl. charges)", money(o["lifetime"]["outgoing"]))
+        c[2].metric("Failed / blocked transfers", o["lifetime"]["failed_n"])
+        monthly_chart(o["monthly"])
+    with t[2]:
+        statement_panel()
+    with t[3]:
+        st.caption("Full profile, contact and password changes are in My profile.")
+        profile_basics()
+        prefs_panel()
+    with t[4]:
+        sec = cp_json("/api/me/security")
+        if sec:
+            security_score_panel(sec)
+
+
+def statement_panel() -> None:
+    today = datetime.now().date()
+    c = st.columns(3)
+    f = c[0].date_input("From", value=today.replace(day=1), key="st_from")
+    to = c[1].date_input("To", value=today, key="st_to")
+    if not c[2].button("Prepare statement", type="primary", use_container_width=True):
+        if "statement" not in st.session_state:
+            return
+    else:
+        r = api("GET", "/api/me/statement", params={"date_from": str(f), "date_to": str(to)})
+        if r is None or r.status_code != 200:
+            ok_or_error(r, "")
+            return
+        st.session_state["statement"] = r.json()
+    d = st.session_state["statement"]
+    k = st.columns(4)
+    k[0].metric("Opening balance", money(d["opening_balance"]))
+    k[1].metric("Credits", money(d["total_credits"]))
+    k[2].metric("Debits", money(d["total_debits"]))
+    k[3].metric("Closing balance", money(d["closing_balance"]))
+    lines = pd.DataFrame(d["lines"])
+    if not lines.empty:
+        lines["date"] = local_time(lines["date"], "%d %b %Y %H:%M")
+        st.dataframe(lines, hide_index=True, use_container_width=True, height=320)
+    pdf_rows = [("Account", f"{d['account_no']} ({d['type']}), IFSC {d['ifsc']}"),
+                ("Period", f"{d['from']} to {d['to']}"), ("Opening balance", money(d["opening_balance"]))]
+    pdf_rows += [(x["date"][:16] if isinstance(x["date"], str) else str(x["date"]),
+                  f"{x['reference']}  {x['description'][:28]}  "
+                  + (f"Dr {money(x['debit'])}" if x["debit"] else f"Cr {money(x['credit'])}")
+                  + f"  Bal {money(x['balance'])}") for x in (lines.to_dict("records") if not lines.empty else [])]
+    pdf_rows += [("Closing balance", money(d["closing_balance"]))]
+    c = st.columns(2)
+    c[0].download_button("Download statement (PDF)", simple_pdf("Account statement", pdf_rows,
+                                                               "Generated by ZT-FinGuard. Amounts in INR."),
+                         file_name=f"statement-{d['from']}-{d['to']}.pdf", mime="application/pdf",
+                         use_container_width=True)
+    c[1].download_button("Download statement (CSV)", pd.DataFrame(d["lines"]).to_csv(index=False).encode(),
+                         file_name=f"statement-{d['from']}-{d['to']}.csv", mime="text/csv", use_container_width=True)
+
+
+# ---------------------------------------------------------------- 3. money transfer
+def execute_transfer(draft: dict, stepup: str | None = None) -> None:
+    ss = S()
+    body = dict(draft) | ({"step_up_token": stepup} if stepup else {})
+    r = api("POST", "/api/transfer", json=body)
+    if r is None:
+        return
+    d = r.json()
+    if r.status_code == 403 and d.get("decision") == "step_up":
+        ss.pending_stepup = draft | {"risk": d["risk"]}
+        ss.last_transfer = None
+        return
+    ss.pending_stepup = None
+    ss.last_transfer = {"status": r.status_code, "body": d, "to": draft["to_account"], "amount": draft["amount"],
+                        "overhead": r.headers.get("x-zt-overhead-ms"), "method": draft.get("method")}
+    if d.get("session_revoked"):
+        end_session("A high-risk transfer was blocked and **all your sessions were ended** "
+                    "(continuous verification). Sign in again with your authenticator.")
+        st.rerun()
+
+
+def show_transfer_outcome() -> None:
+    ss = S()
+    if ss.pending_stepup:
+        p = ss.pending_stepup
+        st.warning(f"**Verify this transfer**: {money(p['amount'])} to {p['to_account']} looks unusual.")
+        show_reasons(p["risk"])
+        with st.form("cp_stepup"):
+            c = code_box("Fresh authenticator code")
+            ok = st.form_submit_button("Verify and send", type="primary")
+        if ok:
+            r = api("POST", "/api/auth/step-up", json={"totp": c, "to_account": p["to_account"], "amount": p["amount"]})
+            if r is not None and r.status_code == 200:
+                execute_transfer({k: p[k] for k in ("to_account", "amount", "method", "description") if k in p},
+                                 r.json()["step_up_token"])
+                st.rerun()
+            elif r is not None:
+                st.error(detail(r))
+    if ss.last_transfer:
+        render_result(ss.last_transfer)
+        if st.button("New transfer", key=f"newtx_{id(ss.last_transfer)}"):
+            ss.last_transfer = None
+            st.session_state.pop("tx_draft", None)
+            st.rerun()
+
+
+def cp_transfer() -> None:
+    st.title("Money transfer")
+    st.caption("Every transfer is risk-scored and checked against policy before any money moves.")
+    t = st.tabs(["Send money", "Beneficiaries", "Transfer status & history"])
+    with t[0]:
+        send_flow()
+    with t[1]:
+        beneficiaries_page()
+    with t[2]:
+        rows = cp_json("/api/me/transactions", direction="out", limit=100) or []
+        st.markdown(f"**{len(rows)} recent outgoing transfers**")
+        tx_table(rows, 380)
+        if rows:
+            customer_tx_tools(rows)
+
+
+def send_flow() -> None:
+    ss = S()
+    if ss.pending_stepup or ss.last_transfer:
+        show_transfer_outcome()
+        return
+    me = api("GET", "/api/me", background=True)
+    if me is not None and me.status_code == 200 and me.json().get("device_trust") != "trusted":
+        st.warning("This device is **not trusted yet**, so transfers from it will be refused. Approve it from a "
+                   "trusted device under My devices.")
+    r = api("GET", "/api/beneficiaries")
+    bens = r.json() if r is not None and r.status_code == 200 else []
+    draft = st.session_state.get("tx_draft")
+    if draft is None:
+        with st.form("tx_form"):
+            choices = ["New payee (enter account number)"] + [f"{b['nickname']} ({b['account_no']})" for b in bens]
+            payee = st.selectbox("Pay to", choices)
+            c = st.columns(2)
+            acct = c[0].text_input("Payee account number", placeholder="ZT10000000xx",
+                                   help="Only used for a new payee")
+            amt = c[1].number_input("Amount (₹)", min_value=1.0, value=1000.0, step=100.0)
+            method = st.radio("Transfer method", list(METHOD_LABEL), horizontal=True, format_func=METHOD_LABEL.get,
+                              help="IMPS: instant, small fee up to ₹5 lakh. NEFT: free, half-hourly. "
+                                   "RTGS: free, ₹2 lakh and above.")
+            desc = st.text_input("Description (optional)", max_chars=60, placeholder="e.g. Rent for November")
+            nxt = st.form_submit_button("Review transfer", type="primary")
+        if nxt:
+            to = (acct.strip().upper() if payee == choices[0] else payee.rsplit("(", 1)[1].rstrip(")"))
+            st.session_state["tx_draft"] = {"to_account": to, "amount": round(float(amt), 2), "method": method,
+                                            "description": desc.strip() or None}
+            st.rerun()
+        return
+    # ---- review step
+    st.markdown("#### Review before you confirm")
+    v = cp_json(f"/api/me/validate-payee/{draft['to_account']}")
+    q = cp_json("/api/transfer/quote", amount=draft["amount"], method=draft["method"])
+    if not (v and q):
+        if st.button("Back"):
+            st.session_state.pop("tx_draft", None)
+            st.rerun()
+        return
+    ch = q["checks"]
+    rows = [("Payee", f"{draft['to_account']} · {v.get('holder', '?')} · IFSC {v.get('ifsc', '-')}"),
+            ("Method", f"{METHOD_LABEL[draft['method']]} ({q['settlement']})"),
+            ("Amount", money(draft["amount"])), ("Charges (incl. GST)", money(q["charges"])),
+            ("You pay", money(q["total"])), ("Description", draft["description"] or "-"),
+            ("Daily limit left", money(ch["daily_limit_left"])), ("Available balance", money(ch["available"] or 0))]
+    st.dataframe(pd.DataFrame(rows, columns=["", " "]), hide_index=True, use_container_width=True)
+    problems = []
+    if not v["valid"]:
+        problems.append(v["reason"])
+    if q["error"]:
+        problems.append(q["error"])
+    for key, msg in (("within_daily_limit", "this is above what is left of your daily limit"),
+                     ("within_per_transfer_limit", f"the per-transfer limit is {money(ch['per_transfer_limit'])}"),
+                     ("enough_balance", "not enough available balance (amount + charges)"),
+                     ("account_active", "your account is frozen"),
+                     ("transfers_enabled", "you switched outgoing transfers off (Account protection)"),
+                     ("device_trusted", "this device is not trusted yet")):
+        if not ch[key]:
+            problems.append(msg)
+    for p in problems:
+        st.error(p)
+    if ch["needs_operations_approval"]:
+        st.info("High-value transfer: it will wait for a bank officer's approval before money moves.")
+    st.caption("The final decision is made when you confirm: risk engine + policy. An unusual transfer asks for "
+               "your authenticator code (OTP / MFA verification).")
+    c = st.columns(2)
+    if c[0].button("Confirm and send", type="primary", disabled=bool(problems), use_container_width=True):
+        st.session_state.pop("tx_draft", None)
+        execute_transfer(draft)
+        st.rerun()
+    if c[1].button("Edit", use_container_width=True):
+        st.session_state.pop("tx_draft", None)
+        st.rerun()
+
+
+def beneficiaries_page() -> None:
+    r = api("GET", "/api/beneficiaries")
+    bens = r.json() if r is not None and r.status_code == 200 else []
+    if bens:
+        st.dataframe(pd.DataFrame([{"nickname": b["nickname"], "account": b["account_no"],
+                                    "added": when(b["created_at"], "%d %b %Y"), "id": b["id"]} for b in bens]),
+                     hide_index=True, use_container_width=True)
+        c = st.columns([3, 1])
+        rm = c[0].selectbox("Delete payee", [f"{b['nickname']} ({b['account_no']}) #{b['id']}" for b in bens],
+                            label_visibility="collapsed")
+        if c[1].button("Delete", use_container_width=True):
+            bid = int(rm.rsplit("#", 1)[1])
+            result(api("DELETE", f"/api/beneficiaries/{bid}"), "Payee deleted.", rerun=True)
+    else:
+        st.caption("No saved payees yet.")
+    st.markdown("**Add a beneficiary**")
+    c = st.columns([3, 1])
+    acct = c[0].text_input("Account number", placeholder="ZT10000000xx", key="ben_acct").strip().upper()
+    if c[1].button("Validate", use_container_width=True) and acct:
+        st.session_state["ben_check"] = cp_json(f"/api/me/validate-payee/{acct}")
+    chk = st.session_state.get("ben_check")
+    if chk:
+        (st.success if chk["valid"] else st.error)(
+            f"{chk.get('account_no', acct)}: holder {chk['holder']}" if chk["valid"] else chk["reason"])
+    with st.form("ben_add"):
+        nick = st.text_input("Nickname", placeholder="e.g. Amma")
+        cd = code_box("Authenticator code (saving a payee is a sensitive change)")
+        if st.form_submit_button("Save payee", type="primary"):
+            res = api("POST", "/api/beneficiaries", json={"account_no": acct, "nickname": nick.strip(), "totp": cd})
+            if result(res, "Payee saved."):
+                st.session_state.pop("ben_check", None)
+
+
+# ---------------------------------------------------------------- 4. transaction history
+def cp_history() -> None:
+    st.title("Transaction history")
+    c = st.columns(4)
+    q = c[0].text_input("Search", placeholder="name, account, description, id")
+    direction = c[1].selectbox("Type", ["All", "Incoming", "Outgoing"])
+    status = c[2].selectbox("Status", ["All", "completed", "pending", "failed", "pending_approval", "step_up_required",
+                                       "denied", "rejected", "cancelled"],
+                            format_func=lambda x: {"pending": "Pending (any)", "failed": "Failed (any)"}.get(
+                                x, STATUS_LABEL.get(x, x)))
+    method = c[3].selectbox("Method", ["All"] + list(METHOD_LABEL), format_func=lambda x: METHOD_LABEL.get(x, x))
+    c = st.columns(4)
+    f = c[0].date_input("From", value=None, key="h_from")
+    to = c[1].date_input("To", value=None, key="h_to")
+    lo = c[2].number_input("Min amount (₹)", min_value=0.0, value=0.0, step=500.0)
+    hi = c[3].number_input("Max amount (₹, 0 = any)", min_value=0.0, value=0.0, step=500.0)
+    params = {"q": q, "direction": {"Incoming": "in", "Outgoing": "out"}.get(direction, ""),
+              "status": "" if status == "All" else status, "method": "" if method == "All" else method,
+              "date_from": str(f) if f else "", "date_to": str(to) if to else "",
+              "min_amount": lo or "", "max_amount": hi or "", "limit": 500}
+    params = {k: v for k, v in params.items() if v != ""}
+    rows = cp_json("/api/me/transactions", **params) or []
+    inn = sum(x["amount"] for x in rows if x["direction"] == "in" and x["status"] == "completed")
+    out = sum(x["amount"] + x["charges"] for x in rows if x["direction"] == "out" and x["status"] == "completed")
+    k = st.columns(4)
+    k[0].metric("Transactions", len(rows))
+    k[1].metric("Received", money(inn))
+    k[2].metric("Sent", money(out))
+    k[3].metric("Failed / pending", sum(1 for x in rows if x["status"] not in ("completed",)))
+    tx_table(rows, 420)
+    c = st.columns(2)
+    x = api("GET", "/api/me/transactions", params=params | {"format": "csv"})
+    if x is not None and x.status_code == 200:
+        c[0].download_button("Export these transactions (CSV)", x.content, file_name="zt-transactions.csv",
+                             mime="text/csv", use_container_width=True)
+    if not rows:
+        return
+    st.subheader("Transaction details")
+    opts = {f"{r['reference']} · {when(r['created_at'], '%d %b %H:%M')} · {money(r['amount'])} · "
+            f"{STATUS_LABEL.get(r['status'], r['status'])}": r for r in rows}
+    r = opts[st.selectbox("Transaction", list(opts))]
+    left, right = st.columns(2)
+    with left:
+        st.dataframe(pd.DataFrame([
+            ("Reference number", r["reference"]), ("Transaction id", r["id"]),
+            ("Date", when(r["created_at"], "%d %b %Y, %H:%M:%S")),
+            ("Type", "Outgoing" if r["direction"] == "out" else "Incoming"),
+            ("Counterparty", f"{r['counterparty']} ({r['counterparty_account']})"),
+            ("Method", METHOD_LABEL.get(r["method"], r["method"])), ("Amount", money(r["amount"])),
+            ("Charges", money(r["charges"])), ("Description", r.get("description") or "-"),
+            ("Status", STATUS_LABEL.get(r["status"], r["status"])),
+            ("Risk score", f"{r['risk_score']:.2f}" if r["risk_score"] is not None else "-"),
+            ("Bank note", r.get("decision_note") or "-")], columns=["", " "]), hide_index=True,
+            use_container_width=True)
+    with right:
+        if r["status"] == "completed" or r["direction"] == "out":
+            receipt_button(r["id"], f"hist_rcpt_{r['id']}")
+        if r["status"] == "pending_approval" and r["direction"] == "out":
+            if st.button("Cancel this transfer", use_container_width=True):
+                result(api("POST", f"/api/transactions/{r['id']}/cancel", json={"note": "cancelled by customer"}),
+                       "Cancelled. No money moved.", rerun=True)
+        with st.form(f"report_{r['id']}"):
+            st.markdown("**Something wrong with this transaction?**")
+            kind = st.radio("Report as", ["Suspicious / unauthorised (fraud)", "Ask the bank to investigate"],
+                            label_visibility="collapsed")
+            what = st.text_area("What happened?", max_chars=1000, height=80)
+            if st.form_submit_button("Report", type="primary", use_container_width=True):
+                cat = "fraud" if kind.startswith("Suspicious") else "investigation"
+                res = api("POST", "/api/me/tickets", json={
+                    "category": cat, "tx_id": r["id"], "body": what or "Reported from transaction history",
+                    "subject": f"{'Unauthorised' if cat == 'fraud' else 'Investigate'} transaction {r['reference']}"})
+                if res is not None and res.status_code == 200:
+                    st.success(f"Ticket #{res.json()['id']} opened (priority {res.json()['priority']}). "
+                               "The security team has been alerted.")
+                else:
+                    ok_or_error(res, "")
+
+
+# ---------------------------------------------------------------- 5. my devices
+def cp_devices() -> None:
+    st.title("My devices")
+    d = cp_json("/api/me/devices")
+    if not d:
+        return
+    devices = d["devices"]
+    me = next((x for x in devices if x["current"]), None)
+    unfamiliar = [x for x in devices if x["status"] == "pending"]
+    k = st.columns(4)
+    k[0].metric("Registered devices", len(devices))
+    k[1].metric("Trusted", sum(1 for x in devices if x["status"] == "trusted"))
+    k[2].metric("Waiting for approval", len(unfamiliar))
+    k[3].metric("Revoked", sum(1 for x in devices if x["status"] == "revoked"))
+    for x in unfamiliar:
+        st.warning(f"**Unfamiliar device:** {x['label']} ({x['type']}, {x['os']}) from {x['last_ip']} on "
+                   f"{when(x['first_seen'])}. Approve it only if it is yours; otherwise revoke it or report it stolen.")
+    icons = {"trusted": "🟢", "pending": "🟡", "revoked": "🔴"}
+    st.dataframe(pd.DataFrame([{
+        "": icons.get(x["status"], ""), "name": x["label"] + ("  (this device)" if x["current"] else ""),
+        "type": x["type"], "operating system": x["os"], "browser": x["browser"], "status": x["status"],
+        "last active": when(x["last_seen"]), "last sign-in IP": x["last_ip"], "first seen": when(x["first_seen"]),
+        "approved": x["verified_by"] or "-", "id": x["id"]} for x in devices]), hide_index=True,
+        use_container_width=True)
+    st.caption("A device is registered automatically the first time you sign in on it. Your first device is "
+               "trusted; every later one stays pending - it can view but not move money - until you approve it here "
+               "from a trusted device with a fresh authenticator code (extra verification for new devices).")
+    t = st.tabs(["Manage", "Activity history", "Register a new device"])
+    with t[0]:
+        if me and me["status"] == "pending" and not d["has_trusted"]:
+            with st.form("cp_selfverify"):
+                st.warning("You have no trusted device left. Verify this one with a fresh authenticator code.")
+                cd = code_box()
+                if st.form_submit_button("Verify this device", type="primary"):
+                    result(api("POST", "/api/me/devices/verify-current", json={"totp": cd}), "Trusted.", rerun=True)
+        others = [x for x in devices if not x["current"]]
+        if not (me and me["status"] == "trusted"):
+            st.caption("Approving, revoking and removing devices is only possible from a trusted device.")
+        elif not others:
+            st.info("Only this device is registered.")
+        else:
+            with st.form("cp_devop"):
+                opts = {f"{x['label']} · {x['status']} · #{x['id']}": x for x in others}
+                dev = opts[st.selectbox("Device", list(opts))]
+                cd = code_box("Fresh authenticator code")
+                note = st.text_input("Note (for a stolen device)", max_chars=200)
+                c = st.columns(4)
+                ap = c[0].form_submit_button("Approve", type="primary", use_container_width=True)
+                rv = c[1].form_submit_button("Revoke access", use_container_width=True)
+                rm = c[2].form_submit_button("Remove (revoked only)", use_container_width=True)
+                stolen = c[3].form_submit_button("Report stolen", use_container_width=True)
+            if ap or rv:
+                result(api("POST", f"/api/me/devices/{dev['id']}/{'approve' if ap else 'revoke'}", json={"totp": cd}),
+                       "Done.", rerun=True)
+            if rm:
+                result(api("DELETE", f"/api/me/devices/{dev['id']}"), "Removed.", rerun=True)
+            if stolen:
+                res = api("POST", f"/api/me/report-stolen/{dev['id']}", json={"totp": cd, "reason": note})
+                if res is not None and res.status_code == 200:
+                    end_session("Device reported stolen: it was blocked, every session ended and a support ticket "
+                                f"(#{res.json().get('ticket')}) was opened. Sign in again on your own device.")
+                    st.rerun()
+                ok_or_error(res, "")
+    with t[1]:
+        a = cp_json("/api/me/device-activity")
+        ev = pd.DataFrame((a or {}).get("events", []))
+        if ev.empty:
+            st.caption("No activity yet.")
+        else:
+            names = {x["id"]: x["label"] for x in devices}
+            ev["device"] = ev.apply(lambda x: names.get(x["device_id"], x["device"] or "-"), axis=1)
+            ev["time"] = local_time(ev["ts"], "%d %b %Y %H:%M")
+            pick = st.selectbox("Device", ["All devices"] + [x["label"] for x in devices])
+            if pick != "All devices":
+                ev = ev[ev["device"] == pick]
+            st.dataframe(ev[["time", "device", "action", "decision", "reason", "ip", "risk"]], hide_index=True,
+                         use_container_width=True, height=360)
+    with t[2]:
+        st.markdown("1. Open ZT-FinGuard on the new phone or computer and sign in (mobile + SMS code and your "
+                    "authenticator code).\n2. It appears here as **pending** and you get a *new-device* alert.\n"
+                    "3. On this trusted device, choose it under **Manage**, enter a fresh authenticator code and "
+                    "press **Approve**.\n\nUntil then the new device can view your account but cannot move money.")
+
+
+# ---------------------------------------------------------------- 6. security centre
+def security_score_panel(sec: dict) -> None:
+    sc = sec["score"]
+    c = st.columns([1, 2])
+    c[0].markdown(posture_ring(sc["score"], sc["level"]), unsafe_allow_html=True)
+    with c[1]:
+        st.dataframe(pd.DataFrame([{"check": x["check"], "points": x["points"], "ok": "yes" if x["ok"] else "no"}
+                                   for x in sc["checks"]]), hide_index=True, use_container_width=True)
+    if sc["recommendations"]:
+        st.markdown("**Recommendations**")
+        for tip in sc["recommendations"]:
+            st.markdown(f"- {tip}")
+    else:
+        st.success("Nothing to improve - your account security is strong.")
+
+
+def cp_security() -> None:
+    st.title("Security center")
+    sec = cp_json("/api/me/security")
+    if not sec:
+        return
+    t = st.tabs(["Overview", "Authenticator & password", "Active sessions", "Login history",
+                 "Security events", "Alerts & timeout"])
+    with t[0]:
+        security_score_panel(sec)
+        p = sec["profile"]
+        st.markdown(f"**Two-factor authentication:** always on (authenticator app"
+                    f"{' + SMS to ' + p['mobile_masked'] if p['mobile_masked'] else ''}). "
+                    f"Password last changed {when(p['password_changed_at'], '%d %b %Y')}. "
+                    f"{len([d for d in sec['devices'] if d['status'] == 'trusted'])} trusted device(s).")
+        if sec["suspicious_logins"]:
+            st.warning(f"{len(sec['suspicious_logins'])} suspicious sign-in attempt(s) - see Login history.")
+        if st.button("Request account protection", type="primary"):
+            st.info("Open **Account protection** in the menu to freeze the account, switch transfers off, report "
+                    "unauthorised access or lock the account down.")
+    with t[1]:
+        mfa_panel()
+        password_panel()
+    with t[2]:
+        sessions_panel(sec["sessions"])
+    with t[3]:
+        lg = pd.DataFrame(sec["logins"])
+        if lg.empty:
+            st.caption("No sign-ins recorded.")
+        else:
+            lg["time"] = local_time(lg["ts"], "%d %b %Y %H:%M")
+            st.dataframe(lg[["time", "decision", "reason", "ip", "device", "risk"]], hide_index=True,
+                         use_container_width=True, height=300)
+            st.markdown("**Suspicious login attempts**")
+            sl = pd.DataFrame(sec["suspicious_logins"])
+            if sl.empty:
+                st.caption("None.")
+            else:
+                sl["time"] = local_time(sl["ts"], "%d %b %Y %H:%M")
+                st.dataframe(sl[["time", "decision", "reason", "ip", "risk"]], hide_index=True, use_container_width=True)
+    with t[4]:
+        ev = pd.DataFrame(sec["events"])
+        if ev.empty:
+            st.caption("No security events yet.")
+        else:
+            ev["time"] = local_time(ev["ts"], "%d %b %Y %H:%M")
+            st.dataframe(ev[["time", "action", "decision", "reason", "severity"]], hide_index=True,
+                         use_container_width=True, height=360)
+    with t[5]:
+        prefs_panel(only=("login_alerts", "transaction_alerts", "mfa_alerts"))
+        st.divider()
+        timeout_panel()
+
+
+def qr_svg(uri: str) -> str:
+    try:
+        import qrcode
+        import qrcode.image.svg
+        img = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage, box_size=8)
+        return img.to_string(encoding="unicode")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def mfa_panel() -> None:
+    st.markdown("#### Authenticator app")
+    st.caption("Multi-factor authentication cannot be switched off. If you got a new phone, re-link the "
+               "authenticator: confirm with your password and current code, scan the new key, then enter a code "
+               "from the new app. The old app stops working.")
+    pend = st.session_state.get("mfa_new")
+    if not pend:
+        with st.form("mfa_start"):
+            pw = st.text_input("Password", type="password")
+            cd = code_box("Current authenticator code")
+            if st.form_submit_button("Set up authenticator on a new phone"):
+                r = api("POST", "/api/me/mfa/reset/start", json={"password": pw, "totp": cd})
+                if r is not None and r.status_code == 200:
+                    st.session_state["mfa_new"] = r.json()
+                    st.rerun()
+                ok_or_error(r, "")
+        return
+    svg = qr_svg(pend["otpauth_uri"])
+    if svg:
+        st.markdown(f'<div style="width:200px;background:#fff;padding:8px">{svg}</div>', unsafe_allow_html=True)
+    st.code(pend["secret"])
+    with st.form("mfa_confirm"):
+        cd = code_box("Code from the NEW app")
+        c = st.columns(2)
+        ok = c[0].form_submit_button("Confirm", type="primary")
+        cancel = c[1].form_submit_button("Cancel")
+    if ok:
+        if result(api("POST", "/api/me/mfa/reset/confirm", json={"code": cd}), "Authenticator re-linked."):
+            st.session_state.pop("mfa_new", None)
+    if cancel:
+        st.session_state.pop("mfa_new", None)
+        st.rerun()
+
+
+def password_panel() -> None:
+    st.markdown("#### Change password")
+    with st.form("pw_change"):
+        cur = st.text_input("Current password", type="password")
+        new = st.text_input("New password", type="password", help="At least 10 characters with letters and digits")
+        rep = st.text_input("Repeat new password", type="password")
+        cd = code_box()
+        if st.form_submit_button("Change password", type="primary"):
+            if new != rep:
+                st.error("The new passwords do not match.")
+            else:
+                r = api("POST", "/api/me/password", json={"current_password": cur, "new_password": new, "totp": cd})
+                if r is not None and r.status_code == 200:
+                    end_session("Password changed. Every session was signed out - sign in with your new password.")
+                    st.rerun()
+                ok_or_error(r, "")
+
+
+def sessions_panel(sessions_list: list[dict]) -> None:
+    if not sessions_list:
+        st.caption("No active sessions.")
+        return
+    df = pd.DataFrame(sessions_list)
+    df["started"] = pd.to_datetime(df["started_ms"].astype("int64"), unit="ms", utc=True) \
+        .dt.tz_convert("Asia/Kolkata").dt.strftime("%d %b %H:%M")
+    df["idle"] = df["idle_seconds"].apply(lambda s: f"{int(s) // 60} min")
+    df["this session"] = df["current"].map({True: "yes", False: ""})
+    st.dataframe(df[["device", "ip", "method", "started", "idle", "device_status", "this session"]],
+                 hide_index=True, use_container_width=True)
+    others = [x for x in sessions_list if not x["current"]]
+    c = st.columns(2)
+    if others:
+        pick = c[0].selectbox("Session", [f"{x['device']} · {x['ip']} · {x['sid'][:8]}" for x in others])
+        sid = next(x["sid"] for x in others if pick.endswith(x["sid"][:8]))
+        if c[0].button("Revoke this session"):
+            result(api("POST", f"/api/me/sessions/{sid}/revoke"), "Session ended.", rerun=True)
+    if c[1].button("Force sign-out from all devices", type="primary"):
+        r = api("POST", "/api/me/sessions/revoke-all")
+        if r is not None and r.status_code == 200:
+            end_session("Signed out from every device, including this one.")
+            st.rerun()
+        ok_or_error(r, "")
+
+
+def prefs_panel(only: tuple | None = None) -> None:
+    p = cp_json("/api/me/profile")
+    if not p:
+        return
+    labels = {"login_alerts": "Login notifications", "transaction_alerts": "Transaction notifications",
+              "mfa_alerts": "MFA verification notifications", "support_alerts": "Support ticket updates",
+              "sms_alerts": "Send alerts by SMS", "email_alerts": "Send alerts by e-mail",
+              "monthly_statement_email": "Monthly e-statement by e-mail", "marketing": "Offers and product news"}
+    keys = only or tuple(labels)
+    with st.form(f"prefs_{'_'.join(keys)[:40]}"):
+        st.markdown("**Notification & communication preferences**")
+        vals = {k: st.toggle(labels[k], value=p["prefs"].get(k, False), key=f"pf_{k}_{len(keys)}") for k in keys}
+        st.caption("Security alerts (new device, failed sign-in, password and account changes) and transaction "
+                   "SMS are always sent - banks must send them.")
+        if st.form_submit_button("Save preferences"):
+            result(api("PUT", "/api/me/prefs", json={"prefs": vals}), "Preferences saved.")
+
+
+# ---------------------------------------------------------------- 7. AI fraud protection
+def cp_fraud() -> None:
+    st.title("AI fraud protection")
+    st.caption("Every transfer and sign-in is scored in real time by the fraud model plus rules. This is what it "
+               "saw on your account, and why.")
+    f = cp_json("/api/me/fraud")
+    if not f:
+        return
+    s = f["stats"]
+    k = st.columns(5)
+    k[0].metric("Transfers checked", s["scored"])
+    k[1].metric("Flagged", s["flagged"])
+    k[2].metric("Blocked", s["blocked"])
+    k[3].metric("Verified by you", s["verified_by_you"])
+    k[4].metric("Awaiting your code", s["pending_verification"])
+    t = st.tabs(["Alerts & warnings", "All checked transfers", "Login alerts", "Report / investigate",
+                 "Protection history"])
+    with t[0]:
+        if not f["flagged"]:
+            st.success("No suspicious transfers. Unusual ones would appear here with the reasons.")
+        for x in f["flagged"][:30]:
+            kind = {"deny": "High-risk transaction blocked", "step_up": "Transaction verification request"}.get(
+                x["decision"], "Unusual transfer (allowed)")
+            if x["decision"] == "alert":
+                kind = "High-value transfer held for approval"
+            with st.container(border=True):
+                st.markdown(f"{pill(x['decision'])} **{kind}** · {money(x['amount'] or 0)} to {x['to']} "
+                            f"<span class='zt-muted'>{when(x['ts'])} · risk {x['risk'] or 0:.2f}</span>",
+                            unsafe_allow_html=True)
+                why = [r for r in x["reasons"] if r] + [p.replace("_", " ") for p in x["policy"]
+                                                       if p not in ("step_up_required",)]
+                tags = []
+                if x.get("times_usual") and x["times_usual"] >= 3:
+                    tags.append(f"unusual amount ({x['times_usual']:.0f}x your usual)")
+                if x.get("velocity_10m") and x["velocity_10m"] >= 3:
+                    tags.append(f"abnormal frequency ({x['velocity_10m']} transfers in 10 min)")
+                if x.get("hour") is not None and x["hour"] < 6:
+                    tags.append("unusual time of day")
+                if x.get("new_payee"):
+                    tags.append("new payee")
+                st.markdown("Why: " + ("; ".join(why + tags) or "model score"))
+                if x["session_revoked"]:
+                    st.caption("All your sessions were ended to protect the account.")
+                if x["decision"] == "step_up":
+                    st.caption("Waiting for your authenticator code. Not you? Report it under Report / investigate.")
+    with t[1]:
+        tx = pd.DataFrame(f["transfers"])
+        if tx.empty:
+            st.caption("No transfers yet.")
+        else:
+            tx["time"] = local_time(tx["ts"], "%d %b %Y %H:%M")
+            tx["reasons"] = tx["reasons"].apply(lambda r: "; ".join(x for x in r if x))
+            st.dataframe(tx[["time", "to", "amount", "method", "decision", "risk", "level", "reasons"]],
+                         hide_index=True, use_container_width=True, height=380,
+                         column_config={"risk": st.column_config.ProgressColumn("Risk", min_value=0, max_value=1,
+                                                                                format="%.2f")})
+    with t[2]:
+        la = pd.DataFrame(f["login_alerts"])
+        if la.empty:
+            st.success("No unusual sign-ins.")
+        else:
+            la["time"] = local_time(la["ts"], "%d %b %Y %H:%M")
+            la["reasons"] = la["reasons"].apply(lambda r: "; ".join(x for x in r if x))
+            la["new device"] = la["new_device"].map({True: "yes", False: "", None: ""})
+            st.dataframe(la[["time", "decision", "reason", "ip", "new device", "risk", "reasons"]], hide_index=True,
+                         use_container_width=True)
+            st.caption("Location is approximated by network address (new network = different IP from last time).")
+    with t[3]:
+        flagged_ids = [x["tx_id"] for x in f["transfers"] if x.get("tx_id")]
+        with st.form("fraud_report"):
+            kind = st.radio("Request", ["Report an unauthorised transaction", "Request a transaction investigation",
+                                        "Report suspicious activity on my account"])
+            txid = st.selectbox("Transaction (optional)", [None] + flagged_ids[:100],
+                                format_func=lambda v: "-" if v is None else f"#{v}")
+            what = st.text_area("Details", max_chars=1500)
+            if st.form_submit_button("Submit", type="primary"):
+                cat = {"Report an unauthorised transaction": "fraud",
+                       "Request a transaction investigation": "investigation"}.get(kind, "fraud")
+                res = api("POST", "/api/me/tickets", json={"category": cat, "subject": kind, "tx_id": txid,
+                                                           "body": what or kind})
+                if res is not None and res.status_code == 200:
+                    st.success(f"Ticket #{res.json()['id']} opened with {res.json()['priority']} priority; the "
+                               "security team sees it in its Threat center.")
+                else:
+                    ok_or_error(res, "")
+    with t[4]:
+        rp = pd.DataFrame(f["reports"])
+        if rp.empty:
+            st.caption("No reports yet.")
+        else:
+            rp["opened"] = local_time(rp["created_at"], "%d %b %Y %H:%M")
+            st.dataframe(rp[["id", "opened", "category", "subject", "status", "priority", "tx_id"]], hide_index=True,
+                         use_container_width=True)
+
+
+# ---------------------------------------------------------------- 8. notifications
+def cp_notifications() -> None:
+    st.title("Notifications")
+    d = cp_json("/api/me/notifications")
+    if not d:
+        return
+    items = d["items"]
+    c = st.columns([2, 2, 1])
+    cats = sorted({i["category"] for i in items})
+    pick = c[0].selectbox("Type", ["All"] + cats, format_func=lambda x: CAT_LABEL.get(x, x))
+    show = c[1].radio("Show", ["All", "Unread"], horizontal=True)
+    if c[2].button("Mark all read", use_container_width=True):
+        api("POST", "/api/me/notifications/read", json={"ids": None})
+        st.rerun()
+    st.caption(f"{d['unread']} unread of {len(items)}")
+    t = st.tabs(["Inbox", "Phone & e-mail (simulated)", "Preferences"])
+    with t[0]:
+        sel = [i for i in items if (pick == "All" or i["category"] == pick) and (show == "All" or not i["read"])]
+        if not sel:
+            st.caption("Nothing here.")
+        for i in sel[:80]:
+            with st.container(border=True):
+                cols = st.columns([6, 1])
+                cols[0].markdown(f"{SEV_ICON.get(i['severity'], '')} {'**' if not i['read'] else ''}{i['title']}"
+                                 f"{'**' if not i['read'] else ''} <span class='zt-muted'>· "
+                                 f"{CAT_LABEL.get(i['category'], i['category'])} · {when(i['ts'])} · "
+                                 f"{', '.join(i['channels'])}</span><br>{i['body']}", unsafe_allow_html=True)
+                if not i["read"] and cols[1].button("Read", key=f"rd_{i['id']}"):
+                    api("POST", "/api/me/notifications/read", json={"ids": [i["id"]]})
+                    st.rerun()
+    with t[1]:
+        ib = cp_json("/api/me/inboxes") or {"sms": [], "email": []}
+        c = st.columns(2)
+        with c[0]:
+            st.markdown("**SMS**")
+            for m in sorted(ib["sms"], key=lambda x: x["at"], reverse=True)[:20]:
+                st.markdown(f"<div class='zt-card'><span class='zt-muted'>{when(m['at'])}</span><br>{m['text']}</div>",
+                            unsafe_allow_html=True)
+        with c[1]:
+            st.markdown("**E-mail**")
+            if not ib["email"]:
+                st.caption("Add and verify an e-mail address in My profile to receive e-mail alerts.")
+            for m in ib["email"][:20]:
+                st.markdown(f"<div class='zt-card'><span class='zt-muted'>{when(m['at'])} · {m['from']}</span><br>"
+                            f"<b>{m['subject']}</b><br>{m['text']}</div>", unsafe_allow_html=True)
+        st.caption("Demonstration: real SMS / e-mail need an outside provider, which the internal network "
+                   "deliberately cannot reach, so delivery is simulated here.")
+    with t[2]:
+        prefs_panel()
+
+
+# ---------------------------------------------------------------- 9. account protection
+def cp_protection() -> None:
+    st.title("Account protection")
+    o = cp_json("/api/me/overview")
+    s = cp_json("/api/me/sessions")
+    if not (o and s):
+        return
+    a = o["account"]
+    k = st.columns(4)
+    k[0].metric("Account", "Frozen" if a["status"] == "frozen" else "Active")
+    k[1].metric("Outgoing transfers", "Off" if a["transfers_disabled"] else "On")
+    k[2].metric("Active sessions", len(s["sessions"]))
+    k[3].metric("Sign-in", "Open")
+    if a["status"] == "frozen":
+        st.info(f"Frozen {when(a['frozen_at'])} by {'you' if a['frozen_by_customer'] else 'the bank'}"
+                + (f": {a['frozen_reason']}" if a["frozen_reason"] else "") + ".")
+    st.caption("Every action below needs a fresh authenticator code and is recorded in the tamper-evident audit "
+               "log. Emergency actions also alert the bank's security team.")
+    t = st.tabs(["Freeze & transfers", "Report a problem", "Sessions", "Lockdown & recovery"])
+    with t[0]:
+        with st.form("protect"):
+            opts = []
+            if a["status"] == "frozen":
+                if a["frozen_by_customer"]:
+                    opts.append(("unfreeze", "Unfreeze my account"))
+            else:
+                opts.append(("freeze", "Temporarily freeze my account (no money in or out)"))
+            opts.append(("enable_transfers", "Switch outgoing transfers back on") if a["transfers_disabled"]
+                        else ("disable_transfers", "Temporarily switch off outgoing transfers"))
+            act = st.radio("Action", opts, format_func=lambda x: x[1])
+            reason = st.text_input("Reason (optional)", max_chars=200)
+            cd = code_box()
+            if st.form_submit_button("Apply", type="primary"):
+                result(api("POST", "/api/me/protect", json={"action": act[0], "totp": cd, "reason": reason}),
+                       "Done.", rerun=True)
+        if a["status"] == "frozen" and not a["frozen_by_customer"]:
+            st.caption("The bank froze this account; only the bank can lift it. Raise a ticket in Customer support.")
+    with t[1]:
+        st.markdown("**Report unauthorised access** - someone else signed in or used your account. Every session "
+                    "is ended immediately and the security team is alerted.")
+        with st.form("rep_access"):
+            what = st.text_input("What happened?", max_chars=200)
+            cd = code_box(key="ra_code")
+            if st.form_submit_button("Report and sign everyone out", type="primary"):
+                r = api("POST", "/api/me/report-access", json={"totp": cd, "reason": what})
+                if r is not None and r.status_code == 200:
+                    end_session(f"Reported. Every session was ended and ticket #{r.json().get('ticket')} opened. "
+                                "Sign in again and change your password.")
+                    st.rerun()
+                ok_or_error(r, "")
+        st.markdown("**Report a stolen device** - see *My devices → Manage → Report stolen*.  \n"
+                    "**Report suspicious transactions** - see *Transaction history* or *AI fraud protection*.")
+    with t[2]:
+        sessions_panel(s["sessions"])
+    with t[3]:
+        st.markdown("**Account lockdown** - for emergencies (lost phone, SIM swap, account takeover). Outgoing "
+                    "transfers are switched off, every session ends and **sign-in is refused** until you verify "
+                    "your identity with your password, authenticator code and an SMS code (account recovery on the "
+                    "sign-in page).")
+        with st.form("lockdown"):
+            why = st.text_input("Reason", max_chars=200)
+            sure = st.checkbox("I understand I will be signed out and must complete account recovery to get back in")
+            cd = code_box(key="ld_code")
+            if st.form_submit_button("Lock my account down", type="primary"):
+                if not sure:
+                    st.error("Tick the box to confirm.")
+                else:
+                    r = api("POST", "/api/me/lockdown", json={"totp": cd, "reason": why})
+                    if r is not None and r.status_code == 200:
+                        end_session("Account locked down. Use 'Recover access' on the sign-in page to restore it.")
+                        st.rerun()
+                    ok_or_error(r, "")
+        st.markdown("**Account recovery** - from the sign-in page, *Recover access*. If the bank locked the "
+                    "account, raise a *recovery* ticket in Customer support.")
+
+
+def recovery_form() -> None:
+    st.caption("Lifts a lockdown you started. You need your password, your authenticator app and your phone.")
+    mob = st.text_input("Registered mobile number", key="rec_mobile")
+    if st.button("Send SMS code", key="rec_send"):
+        if send_otp(mob):
+            st.session_state["rec_mob"] = mob
+    if st.session_state.get("rec_mob"):
+        sms_messages(st.session_state["rec_mob"])
+    with st.form("recover"):
+        u = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
+        totp = code_box()
+        smsc = st.text_input("SMS code", max_chars=6)
+        if st.form_submit_button("Verify identity and restore access", type="primary"):
+            r = api("POST", "/api/auth/recovery", json={"username": u.strip(), "password": pw, "totp": totp,
+                                                        "sms_otp": smsc.strip()})
+            if r is not None and r.status_code == 200:
+                st.success("Identity verified - sign-in is open again. Switch outgoing transfers back on in Account "
+                           "protection once you are in.")
+            else:
+                ok_or_error(r, "")
+
+
+# ---------------------------------------------------------------- 10. my profile
+def profile_basics() -> None:
+    p = cp_json("/api/me/profile")
+    if not p:
+        return
+    with st.form("prof_name"):
+        name = st.text_input("Full name", value=p["full_name"], max_chars=80)
+        if st.form_submit_button("Save name"):
+            result(api("PUT", "/api/me/profile", json={"full_name": name}), "Saved.")
+
+
+def cp_profile() -> None:
+    st.title("My profile")
+    p = cp_json("/api/me/profile")
+    if not p:
+        return
+    c = st.columns([1, 4])
+    if p.get("avatar"):
+        c[0].image(p["avatar"], width=110)
+    else:
+        c[0].markdown(f"<div style='width:96px;height:96px;border-radius:50%;background:var(--ink);color:#fff;"
+                      f"display:flex;align-items:center;justify-content:center;font-size:2.2rem;font-weight:600'>"
+                      f"{p['full_name'][:1].upper()}</div>", unsafe_allow_html=True)
+    c[1].markdown(f"### {p['full_name']}\n`{p['username']}` · customer since {when(p['customer_since'], '%d %b %Y')}")
+    kyc = {"verified": "Verified", "pending": "Pending - documents not yet checked (demo)", "rejected": "Rejected"}
+    t = st.tabs(["Personal details", "Contact details", "Password", "Picture", "Preferences", "Identity verification"])
+    with t[0]:
+        st.dataframe(pd.DataFrame([("Full name", p["full_name"]), ("Username", p["username"]),
+                                   ("E-mail", (p["email"] or "not added") + (" (verified)" if p["email_verified"] else "")),
+                                   ("Mobile", p["mobile"] or "-"), ("KYC status", kyc.get(p["kyc_status"], p["kyc_status"])),
+                                   ("Last sign-in IP", p["last_login_ip"] or "-"),
+                                   ("Password changed", when(p["password_changed_at"], "%d %b %Y"))],
+                                  columns=["", " "]), hide_index=True, use_container_width=True)
+        profile_basics()
+    with t[1]:
+        contact_change("email", "E-mail address", p["email"])
+        st.divider()
+        contact_change("mobile", "Mobile number", p["mobile"])
+    with t[2]:
+        password_panel()
+        st.caption("Security preferences (session timeout, sign-in alerts, devices) are in the Security center.")
+    with t[3]:
+        up = st.file_uploader("PNG or JPEG, at most 200 KB", type=["png", "jpg", "jpeg"])
+        c = st.columns(2)
+        if up is not None and c[0].button("Upload picture", type="primary"):
+            import base64
+            raw = up.getvalue()
+            kind = "png" if raw.startswith(b"\x89PNG") else "jpeg"
+            result(api("PUT", "/api/me/avatar", json={"data_url": f"data:image/{kind};base64,"
+                                                                   + base64.b64encode(raw).decode()}),
+                   "Picture updated.", rerun=True)
+        if p.get("avatar") and c[1].button("Remove picture"):
+            result(api("DELETE", "/api/me/avatar"), "Removed.", rerun=True)
+    with t[4]:
+        prefs_panel()
+    with t[5]:
+        st.dataframe(pd.DataFrame([("Mobile number", "verified by SMS code" if p["mobile"] else "missing"),
+                                   ("E-mail", "verified" if p["email_verified"] else "not verified"),
+                                   ("Authenticator (MFA)", "enrolled"),
+                                   ("Identity documents (KYC)", kyc.get(p["kyc_status"], p["kyc_status"]))],
+                                  columns=["", "status"]), hide_index=True, use_container_width=True)
+    st.divider()
+    if st.button("Log out securely"):
+        api("POST", "/api/auth/logout", json={"refresh_token": S().refresh})
+        end_session("Signed out. Your token was revoked on the server.")
+        st.rerun()
+
+
+def contact_change(kind: str, label: str, current: str | None) -> None:
+    st.markdown(f"**{label}:** {current or 'not added'}")
+    key = f"chg_{kind}"
+    if not st.session_state.get(key):
+        with st.form(f"{key}_start"):
+            v = st.text_input(f"New {label.lower()}")
+            cd = code_box(key=f"{key}_code")
+            if st.form_submit_button("Send verification code"):
+                r = api("POST", f"/api/me/{kind}/start", json={"value": v.strip(), "totp": cd})
+                if r is not None and r.status_code == 200:
+                    st.session_state[key] = r.json()["sent_to"]
+                    st.rerun()
+                ok_or_error(r, "")
+        return
+    st.info(f"A 6-digit code was sent to {st.session_state[key]} (see Notifications → Phone & e-mail, or the "
+            "simulated inbox below).")
+    ib = cp_json("/api/me/inboxes") if kind == "email" else None
+    if kind == "mobile":
+        st.caption("The SMS goes to the new number's simulated phone; it is shown in the box below.")
+    with st.form(f"{key}_confirm"):
+        cd = st.text_input("Verification code", max_chars=6)
+        c = st.columns(2)
+        ok = c[0].form_submit_button("Confirm", type="primary")
+        cancel = c[1].form_submit_button("Cancel")
+    if ok:
+        if result(api("POST", f"/api/me/{kind}/confirm", json={"code": cd.strip()}), f"{label} updated."):
+            st.session_state.pop(key, None)
+    if cancel:
+        st.session_state.pop(key, None)
+        st.rerun()
+
+
+# ---------------------------------------------------------------- 11. support
+FAQ = [("Why does a transfer ask for my authenticator code?",
+        "The fraud model found it unusual (new payee, large amount, odd hour, many transfers). The code proves it is "
+        "you; the approval is bound to that exact payee and amount."),
+       ("Why can my new phone not send money?",
+        "New devices stay pending until you approve them from a trusted device (My devices). This stops someone who "
+        "steals your password from moving money."),
+       ("I was signed out everywhere - why?",
+        "A high-risk action was blocked, or you / the bank ended all sessions. Sign in again with your authenticator "
+        "code; if it was not you, use Account protection."),
+       ("How do I get back in after a lockdown?",
+        "On the sign-in page choose Recover access and verify with password + authenticator + SMS code."),
+       ("Will the bank ever ask for my codes?", "Never. Do not share SMS codes, authenticator codes or passwords."),
+       ("What are the transfer charges?",
+        "Within ZT-FinGuard, NEFT and RTGS: free. IMPS: ₹2.50-₹25 + GST depending on amount (none up to ₹1,000).")]
+
+
+def cp_support() -> None:
+    st.title("Customer support")
+    t = st.tabs(["My tickets", "Raise a ticket", "Contact us", "Security FAQs"])
+    with t[0]:
+        tickets = cp_json("/api/me/tickets") or []
+        if not tickets:
+            st.caption("No tickets yet.")
+        for tk in tickets:
+            with st.expander(f"#{tk['id']} · {tk['subject']} · {tk['status'].replace('_', ' ')} · {tk['priority']}"):
+                st.markdown(f"<span class='zt-muted'>{tk['category']} · opened {when(tk['created_at'])}"
+                            + (f" · transaction #{tk['tx_id']}" if tk.get("tx_id") else "") + "</span>",
+                            unsafe_allow_html=True)
+                st.markdown(tk["body"])
+                for rsp in tk["responses"]:
+                    who = "Bank" if rsp["role"] == "operations" else "You"
+                    st.markdown(f"<div class='zt-card'><b>{who}</b> <span class='zt-muted'>{when(rsp['at'])}</span>"
+                                f"<br>{rsp['message']}</div>", unsafe_allow_html=True)
+                if tk["status"] != "closed":
+                    with st.form(f"tk_reply_{tk['id']}"):
+                        msg = st.text_area("Reply", max_chars=2000, height=70)
+                        c = st.columns(2)
+                        send = c[0].form_submit_button("Send reply")
+                        close = c[1].form_submit_button("Close ticket")
+                    if send or close:
+                        result(api("POST", f"/api/me/tickets/{tk['id']}/reply",
+                                   json={"message": msg or ("Closed by customer" if close else "-"),
+                                         "status": "closed" if close else None}), "Sent.", rerun=True)
+    with t[1]:
+        with st.form("tk_new"):
+            cat = st.selectbox("Topic", ["general", "fraud", "access", "device", "recovery", "investigation"],
+                               format_func={"general": "General question", "fraud": "Fraudulent transaction",
+                                            "access": "Account access problem", "device": "Suspicious device",
+                                            "recovery": "Account recovery request",
+                                            "investigation": "Transaction investigation"}.get)
+            subj = st.text_input("Subject", max_chars=120)
+            body = st.text_area("Describe the issue", max_chars=2000)
+            txid = st.number_input("Transaction id (optional)", min_value=0, value=0, step=1)
+            if st.form_submit_button("Submit ticket", type="primary"):
+                res = api("POST", "/api/me/tickets", json={"category": cat, "subject": subj, "body": body,
+                                                           "tx_id": int(txid) or None})
+                if res is not None and res.status_code == 200:
+                    st.success(f"Ticket #{res.json()['id']} opened (priority {res.json()['priority']}).")
+                else:
+                    ok_or_error(res, "")
+    with t[2]:
+        st.markdown("**24x7 helpline:** 1800-000-0000 (demo) · **Fraud hotline:** 1930 (national cyber-crime "
+                    "helpline) · **E-mail:** support@zt-finguard.demo  \n"
+                    "Report cyber fraud also at **cybercrime.gov.in**. The bank will never ask for your password, "
+                    "PIN or one-time codes.")
+    with t[3]:
+        for q, a in FAQ:
+            with st.expander(q):
+                st.markdown(a)
+
+
+# ---------------------------------------------------------------- operations: support desk
+def ops_support() -> None:
+    status = st.selectbox("Status", ["open", "in_progress", "resolved", "closed", "all"], key="ops_tk_status")
+    tickets = cp_json("/api/ops/tickets", **({} if status == "all" else {"status": status})) or []
+    if not tickets:
+        st.caption("No tickets.")
+        return
+    st.dataframe(pd.DataFrame([{"id": t["id"], "customer": t["owner"], "category": t["category"],
+                                "priority": t["priority"], "status": t["status"], "subject": t["subject"],
+                                "opened": when(t["created_at"], "%d %b %H:%M"), "tx": t.get("tx_id")}
+                               for t in tickets]), hide_index=True, use_container_width=True)
+    tk = {f"#{t['id']} {t['owner']}: {t['subject']}": t for t in tickets}[st.selectbox("Ticket", [
+        f"#{t['id']} {t['owner']}: {t['subject']}" for t in tickets])]
+    st.markdown(tk["body"])
+    for rsp in tk["responses"]:
+        st.markdown(f"<div class='zt-card'><b>{rsp['by']}</b> <span class='zt-muted'>{when(rsp['at'])}</span><br>"
+                    f"{rsp['message']}</div>", unsafe_allow_html=True)
+    with st.form("ops_reply"):
+        msg = st.text_area("Reply to the customer", max_chars=2000)
+        new = st.selectbox("Set status", ["in_progress", "resolved", "closed", "open"])
+        if st.form_submit_button("Send", type="primary"):
+            result(api("POST", f"/api/ops/tickets/{tk['id']}/reply", json={"message": msg, "status": new}),
+                   "Reply sent; the customer was notified.", rerun=True)
+
 # ------------------------------------------- admin module 10: incident response
 def fmt_min(m) -> str:
     if m is None:
@@ -2766,7 +3987,8 @@ CATEGORY_SHORT = {"suspicious_process": "Suspicious process", "unauthorized_shel
                   "privilege_escalation": "Privilege escalation", "network_connection": "Unexpected connection",
                   "file_modification": "File modification", "credential_access": "Secret access",
                   "jwt_theft": "JWT theft / forgery", "suspicious_login": "Suspicious sign-in",
-                  "container_compromise": "Container compromise", "account_takeover": "Account takeover"}
+                  "container_compromise": "Container compromise", "account_takeover": "Account takeover",
+                  "customer_report": "Customer report"}
 STATUS_ORDER = ["new", "acknowledged", "investigating", "contained", "resolved"]
 
 
@@ -3119,6 +4341,17 @@ else:
         "Threat center": threat_center,
         "Network visualization": network_view,
         "Policy management": policy_management,
+        "Dashboard": cp_dashboard,
+        "My accounts": cp_accounts,
+        "Money transfer": cp_transfer,
+        "Transaction history": cp_history,
+        "My devices": cp_devices,
+        "Security center": cp_security,
+        "AI fraud protection": cp_fraud,
+        "Notifications": cp_notifications,
+        "Account protection": cp_protection,
+        "My profile": cp_profile,
+        "Customer support": cp_support,
         "Incident response": incident_response,
     }[page]()
     footer()

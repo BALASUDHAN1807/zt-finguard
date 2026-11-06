@@ -37,7 +37,7 @@ from ztcommon import clients, config, mtls, sessions, tokens
 REPORTS_DIR = os.environ.get("REPORTS_DIR", "/reports")
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", "240"))
 LOGIN_RATE_LIMIT = int(os.environ.get("LOGIN_RATE_LIMIT_PER_MIN", "10"))
-SIGN_IN_PATHS = {"/api/auth/login", "/api/auth/otp/request", "/api/auth/login/otp"}
+SIGN_IN_PATHS = {"/api/auth/recovery", "/api/auth/login", "/api/auth/otp/request", "/api/auth/login/otp"}
 SERVICES = ["auth", "account", "transaction", "risk", "audit", "responder"]
 
 app = FastAPI(title="ZT-FinGuard gateway", docs_url=None, redoc_url=None, openapi_url=None)
@@ -213,6 +213,7 @@ class RegisterBody(BaseModel):
     username: str = Field(max_length=40)
     password: str = Field(max_length=200)
     mobile: str = Field(max_length=20)
+    full_name: str | None = Field(default=None, max_length=80)
 
 
 @app.post("/api/auth/register")
@@ -280,6 +281,8 @@ class TransferBody(BaseModel):
     to_account: str = Field(max_length=20)
     amount: float = Field(gt=0)
     step_up_token: str | None = Field(default=None, max_length=4000)
+    method: str = Field(default="internal", pattern=r"^(internal|imps|neft|rtgs)$")
+    description: str | None = Field(default=None, max_length=60)
 
 
 @app.post("/api/transfer")
@@ -335,6 +338,426 @@ async def device_op(device_id: int, op: str, body: TotpBody, claims: dict = Depe
 async def forget_device(device_id: int, claims: dict = Depends(session)):
     await require_admin_action("self.manage", claims)
     return await forward("DELETE", "auth", f"/me/devices/{device_id}", claims)
+
+
+# ======================================================================= customer portal
+# Thin, policy-checked routes. The owning service re-verifies the token and decides with OPA;
+# the gateway adds the authenticator re-check for sensitive actions and composes read-only views.
+async def me_check(claims: dict) -> None:
+    await require_admin_action("self.manage", claims)
+
+
+async def my_events(claims: dict, action: str | None = None, limit: int = 300) -> list[dict]:
+    params = {"actor": claims["usr"], "limit": limit} | ({"action": action} if action else {})
+    data = await get_json("audit", "/explore", params=params, timeout=20)
+    return (data or {}).get("rows", [])
+
+
+def _strip(e: dict) -> dict:
+    d = e.get("details") or {}
+    return {"id": e["id"], "ts": e["ts"], "action": e["action"], "decision": e["decision"], "reason": e["reason"],
+            "risk": e["risk"], "severity": e["severity"], "ip": d.get("ip"), "device": d.get("device"),
+            "device_id": d.get("device_id"), "method": d.get("method")}
+
+
+async def verify_code(claims: dict, code: str, purpose: str) -> None:
+    v = await forward("POST", "auth", "/me/verify-totp", claims, {"totp": code, "purpose": purpose})
+    if v.status_code != 200:
+        raise HTTPException(v.status_code, json.loads(v.body).get("detail", "authenticator code invalid"))
+
+
+# ---- profile, contact details, preferences
+@app.get("/api/me/profile")
+async def cp_profile(claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("GET", "auth", "/me/profile", claims)
+
+
+class ProfileBody(BaseModel):
+    full_name: str = Field(max_length=80)
+
+
+@app.put("/api/me/profile")
+async def cp_profile_update(body: ProfileBody, claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("PUT", "auth", "/me/profile", claims, body.model_dump())
+
+
+class AvatarBody(BaseModel):
+    data_url: str = Field(max_length=280000)
+
+
+@app.put("/api/me/avatar")
+async def cp_avatar(body: AvatarBody, claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("PUT", "auth", "/me/avatar", claims, body.model_dump())
+
+
+@app.delete("/api/me/avatar")
+async def cp_avatar_delete(claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("DELETE", "auth", "/me/avatar", claims)
+
+
+class PrefsBody(BaseModel):
+    prefs: dict[str, bool]
+
+
+@app.put("/api/me/prefs")
+async def cp_prefs(body: PrefsBody, claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("PUT", "auth", "/me/prefs", claims, body.model_dump())
+
+
+class ContactBody(BaseModel):
+    value: str = Field(max_length=254)
+    totp: str = Field(max_length=10)
+
+
+class CodeBody(BaseModel):
+    code: str = Field(max_length=10)
+
+
+@app.post("/api/me/{kind}/start")
+async def cp_contact_start(body: ContactBody, kind: str = Path(pattern=r"^(email|mobile)$"),
+                           claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("POST", "auth", f"/me/{kind}/start", claims, body.model_dump())
+
+
+@app.post("/api/me/{kind}/confirm")
+async def cp_contact_confirm(body: CodeBody, kind: str = Path(pattern=r"^(email|mobile)$"),
+                             claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("POST", "auth", f"/me/{kind}/confirm", claims, body.model_dump())
+
+
+class PasswordBody(BaseModel):
+    current_password: str = Field(max_length=200)
+    new_password: str = Field(max_length=200)
+    totp: str = Field(max_length=10)
+
+
+@app.post("/api/me/password")
+async def cp_password(body: PasswordBody, claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("POST", "auth", "/me/password", claims, body.model_dump())
+
+
+class MfaResetBody(BaseModel):
+    password: str = Field(max_length=200)
+    totp: str = Field(max_length=10)
+
+
+@app.post("/api/me/mfa/reset/start")
+async def cp_mfa_start(body: MfaResetBody, claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("POST", "auth", "/me/mfa/reset/start", claims, body.model_dump())
+
+
+@app.post("/api/me/mfa/reset/confirm")
+async def cp_mfa_confirm(body: CodeBody, claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("POST", "auth", "/me/mfa/reset/confirm", claims, body.model_dump())
+
+
+# ---- notifications and the simulated phone / mailbox
+@app.get("/api/me/notifications")
+async def cp_notifications(claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("GET", "auth", "/me/notifications", claims)
+
+
+class ReadBody(BaseModel):
+    ids: list[str] | None = Field(default=None, max_length=200)
+
+
+@app.post("/api/me/notifications/read")
+async def cp_notifications_read(body: ReadBody, claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("POST", "auth", "/me/notifications/read", claims, body.model_dump())
+
+
+@app.get("/api/me/inboxes")
+async def cp_inboxes(claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("GET", "auth", "/me/inboxes", claims)
+
+
+# ---- sessions
+@app.get("/api/me/sessions")
+async def cp_sessions(claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("GET", "auth", "/me/sessions", claims)
+
+
+@app.post("/api/me/sessions/revoke-all")
+async def cp_sessions_revoke_all(claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("POST", "auth", "/me/sessions/revoke-all", claims)
+
+
+@app.post("/api/me/sessions/{sid}/revoke")
+async def cp_session_revoke(sid: str = Path(pattern=r"^[0-9a-f]{32}$"), claims: dict = Depends(session)):
+    await me_check(claims)
+    return await forward("POST", "auth", f"/me/sessions/{sid}/revoke", claims)
+
+
+# ---- accounts and history (account service)
+@app.get("/api/me/overview")
+async def cp_overview(months: int = 6, claims: dict = Depends(session)):
+    return await forward("GET", "account", f"/me/overview?months={max(1, min(months, 24))}", claims)
+
+
+@app.get("/api/me/transactions")
+async def cp_transactions(request: Request, claims: dict = Depends(session)):
+    qp = {k: v for k, v in request.query_params.items()
+          if k in ("q", "direction", "status", "method", "date_from", "date_to", "min_amount", "max_amount", "limit")
+          and v != ""}
+    fmt = request.query_params.get("format")
+    try:
+        r = await mtls.client().get(mtls.url("account", "/me/transactions"), params=qp,
+                                    headers={"Authorization": f"Bearer {claims['_raw']}"}, timeout=20)
+    except httpx.HTTPError:
+        raise HTTPException(502, "account unavailable")
+    if r.status_code != 200 or fmt != "csv":
+        return JSONResponse(r.json(), status_code=r.status_code)
+    buf = io.StringIO()
+    cols = ["created_at", "reference", "direction", "counterparty", "counterparty_account", "method", "description",
+            "amount", "charges", "status", "risk_score", "id"]
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
+    for row in r.json():
+        w.writerow(row)
+    clients.audit(actor=claims["usr"], action="transaction.export", resource="history", decision="info",
+                  details={"rows": len(r.json()), "filters": qp})
+    return Response(buf.getvalue().encode(), media_type="text/csv",
+                    headers={"Content-Disposition": 'attachment; filename="zt-transactions.csv"'})
+
+
+@app.get("/api/me/statement")
+async def cp_statement(date_from: str, date_to: str, claims: dict = Depends(session)):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to):
+        raise HTTPException(400, "dates must be YYYY-MM-DD")
+    return await forward("GET", "account", f"/me/statement?date_from={date_from}&date_to={date_to}", claims)
+
+
+@app.get("/api/me/validate-payee/{acct_no}")
+async def cp_validate(acct_no: str = Path(max_length=20), claims: dict = Depends(session)):
+    return await forward("GET", "account", f"/me/validate-payee/{acct_no}", claims)
+
+
+@app.get("/api/transfer/quote")
+async def cp_quote(amount: float, method: str = "internal", claims: dict = Depends(session)):
+    if not (0 < amount <= 10_000_000) or method not in ("internal", "imps", "neft", "rtgs"):
+        raise HTTPException(400, "bad amount or method")
+    acct = await get_json("account", "/me/overview?months=1", claims) or {}
+    q = await get_json("transaction", f"/quote?amount={amount:.2f}&method={method}")
+    if q is None:
+        raise HTTPException(502, "transaction unavailable")
+    a = acct.get("account", {})
+    left = max(0.0, a.get("daily_limit", 0) - a.get("used_today", 0))
+    checks = {
+        "within_daily_limit": amount <= left, "daily_limit_left": left,
+        "within_per_transfer_limit": amount <= _POLICY["config"]["transfer_limit_customer"],
+        "per_transfer_limit": _POLICY["config"]["transfer_limit_customer"],
+        "needs_operations_approval": amount >= _POLICY["config"]["high_value_threshold"],
+        "enough_balance": q["total"] <= acct.get("available", 0), "available": acct.get("available"),
+        "account_active": a.get("status") == "active", "transfers_enabled": not a.get("transfers_disabled", True),
+        "device_trusted": claims["_device_trust"] == "trusted",
+    }
+    return q | {"checks": checks}
+
+
+# ---- account protection
+class ProtectBody(BaseModel):
+    action: str = Field(pattern=r"^(freeze|unfreeze|disable_transfers|enable_transfers)$")
+    totp: str = Field(max_length=10)
+    reason: str = Field(default="", max_length=200)
+
+
+@app.post("/api/me/protect")
+async def cp_protect(body: ProtectBody, claims: dict = Depends(session)):
+    await verify_code(claims, body.totp, f"protect_{body.action}")
+    return await forward("POST", "account", "/me/protect", claims, {"action": body.action, "reason": body.reason})
+
+
+class ReportBody(BaseModel):
+    totp: str = Field(max_length=10)
+    reason: str = Field(default="", max_length=200)
+
+
+async def open_ticket(claims: dict, category: str, subject: str, body: str, tx_id: int | None = None) -> dict | None:
+    r = await forward("POST", "account", "/me/tickets", claims,
+                      {"category": category, "subject": subject, "body": body or subject, "tx_id": tx_id})
+    return json.loads(r.body) if r.status_code == 200 else None
+
+
+@app.post("/api/me/lockdown")
+async def cp_lockdown(body: ReportBody, claims: dict = Depends(session)):
+    """Emergency lockdown: outgoing transfers off, every session ended, sign-in refused until recovery."""
+    r = await forward("POST", "auth", "/me/lockdown", claims, body.model_dump())
+    if r.status_code != 200:
+        return r
+    await forward("POST", "account", "/me/protect", claims, {"action": "disable_transfers", "reason": "lockdown"})
+    t = await open_ticket(claims, "access", "Account lockdown requested", body.reason or "Lockdown from the portal")
+    return {"locked": True, "transfers_disabled": True, "ticket": t and t["id"]}
+
+
+@app.post("/api/me/report-access")
+async def cp_report_access(body: ReportBody, claims: dict = Depends(session)):
+    r = await forward("POST", "auth", "/me/report-access", claims, body.model_dump())
+    if r.status_code != 200:
+        return r
+    t = await open_ticket(claims, "access", "Unauthorised access reported", body.reason or "Reported from the portal")
+    return {"reported": True, "signed_out": True, "ticket": t and t["id"]}
+
+
+@app.post("/api/me/report-stolen/{device_id}")
+async def cp_report_stolen(body: ReportBody, device_id: int, claims: dict = Depends(session)):
+    r = await forward("POST", "auth", f"/me/devices/{device_id}/report-stolen", claims, body.model_dump())
+    if r.status_code != 200:
+        return r
+    t = await open_ticket(claims, "device", "Device reported stolen", body.reason or f"Device #{device_id}")
+    return {"revoked": device_id, "signed_out": True, "ticket": t and t["id"]}
+
+
+class RecoveryBody(BaseModel):
+    username: str = Field(max_length=40)
+    password: str = Field(max_length=200)
+    totp: str = Field(max_length=10)
+    sms_otp: str = Field(max_length=10)
+
+
+@app.post("/api/auth/recovery")
+async def cp_recovery(body: RecoveryBody, request: Request, x_device_id: str | None = Header(None)):
+    return await forward("POST", "auth", "/recovery", body=body.model_dump() | {"client": ctx(request, x_device_id)})
+
+
+# ---- support
+class TicketBody(BaseModel):
+    category: str = Field(pattern=r"^(general|fraud|access|device|recovery|investigation)$")
+    subject: str = Field(max_length=120)
+    body: str = Field(max_length=2000)
+    tx_id: int | None = None
+
+
+@app.get("/api/me/tickets")
+async def cp_tickets(claims: dict = Depends(session)):
+    return await forward("GET", "account", "/me/tickets", claims)
+
+
+@app.post("/api/me/tickets")
+async def cp_ticket_new(body: TicketBody, claims: dict = Depends(session)):
+    return await forward("POST", "account", "/me/tickets", claims, body.model_dump())
+
+
+class ReplyBody(BaseModel):
+    message: str = Field(max_length=2000)
+    status: str | None = Field(default=None, pattern=r"^(open|in_progress|resolved|closed)$")
+
+
+@app.post("/api/me/tickets/{tid}/reply")
+async def cp_ticket_reply(body: ReplyBody, tid: int, claims: dict = Depends(session)):
+    return await forward("POST", "account", f"/me/tickets/{tid}/reply", claims, body.model_dump())
+
+
+@app.get("/api/ops/tickets")
+async def ops_tickets(status: str | None = None, claims: dict = Depends(session)):
+    return await forward("GET", "account", "/ops/tickets" + (f"?status={status}" if status else ""), claims)
+
+
+@app.post("/api/ops/tickets/{tid}/reply")
+async def ops_ticket_reply(body: ReplyBody, tid: int, claims: dict = Depends(session)):
+    return await forward("POST", "account", f"/ops/tickets/{tid}/reply", claims, body.model_dump())
+
+
+# ---- composed views: security centre, device activity, fraud protection
+def security_score(profile: dict, devices: list[dict], logins: list[dict], prefs: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    pw_age = (now - datetime.fromisoformat(profile["password_changed_at"])).days
+    week = [x for x in logins if datetime.fromisoformat(x["ts"].replace("Z", "+00:00")) > now - timedelta(days=7)]
+    suspicious = [x for x in week if x["decision"] in ("deny", "step_up")]
+    pending = [d for d in devices if d["status"] == "pending"]
+    checks = [
+        ("Two-factor authentication on", 20, True, "Always on for every ZT-FinGuard account."),
+        ("Mobile number registered", 10, bool(profile.get("mobile")), "Add a mobile number for SMS codes and alerts."),
+        ("E-mail verified", 10, profile["email_verified"], "Add and verify an e-mail address for alerts."),
+        ("Password changed in the last 180 days", 10, pw_age <= 180, "Change your password (it is over 180 days old)."),
+        ("No devices waiting for approval", 15, not pending,
+         f"Approve or revoke {len(pending)} device(s) waiting in My devices."),
+        ("No failed or blocked sign-ins this week", 15, not suspicious,
+         f"Review {len(suspicious)} failed / challenged sign-in(s) in Login history."),
+        ("Inactivity timeout 15 minutes or less", 10, profile["idle_timeout_minutes"] <= 15,
+         "Lower your inactivity timeout to 15 minutes or less."),
+        ("Login alerts switched on", 10, prefs.get("login_alerts", True), "Switch on login notifications."),
+    ]
+    score = sum(p for _, p, ok, _ in checks if ok)
+    return {"score": score, "level": "Strong" if score >= 85 else "Good" if score >= 65 else "Needs attention",
+            "checks": [{"check": c, "points": p, "ok": ok} for c, p, ok, _ in checks],
+            "recommendations": [tip for _, _, ok, tip in checks if not ok],
+            "password_age_days": pw_age, "suspicious_7d": len(suspicious)}
+
+
+@app.get("/api/me/security")
+async def cp_security(claims: dict = Depends(session)):
+    await me_check(claims)
+    profile = await get_json("auth", "/me/profile", claims)
+    devices = (await get_json("auth", "/me/devices", claims) or {}).get("devices", [])
+    sess = (await get_json("auth", "/me/sessions", claims) or {}).get("sessions", [])
+    if profile is None:
+        raise HTTPException(502, "auth unavailable")
+    logins = [_strip(e) for e in await my_events(claims, "auth.login", 200)]
+    events = [_strip(e) for e in await my_events(claims, None, 300)
+              if e["action"].split(".")[0] in ("auth", "device", "session", "profile", "account", "customer")
+              and e["action"] != "auth.login"]
+    score = security_score(profile, devices, logins, profile["prefs"])
+    return {"profile": {k: profile[k] for k in ("username", "full_name", "email_masked", "email_verified",
+                                                "mobile_masked", "mfa", "password_changed_at", "prefs",
+                                                "idle_timeout_minutes", "kyc_status")},
+            "score": score, "devices": devices, "sessions": sess, "logins": logins[:100],
+            "suspicious_logins": [x for x in logins if x["decision"] in ("deny", "step_up")
+                                  or (x["risk"] or 0) >= 0.4][:50],
+            "events": events[:100]}
+
+
+@app.get("/api/me/device-activity")
+async def cp_device_activity(claims: dict = Depends(session)):
+    await me_check(claims)
+    rows = [_strip(e) for e in await my_events(claims, None, 500)
+            if e["action"] in ("auth.login", "auth.refresh") or e["action"].startswith("device.")]
+    return {"events": rows}
+
+
+@app.get("/api/me/fraud")
+async def cp_fraud(claims: dict = Depends(session)):
+    """The customer's own view of the AI fraud engine: every scored transfer and sign-in, with reasons."""
+    await me_check(claims)
+    tx = []
+    for e in await my_events(claims, "transaction.transfer", 300):
+        d = e.get("details") or {}
+        sig = d.get("signals") or {}
+        tx.append({"ts": e["ts"], "tx_id": d.get("tx_id"), "to": d.get("to"), "amount": d.get("amount"),
+                   "method": d.get("method", "internal"), "decision": e["decision"], "reason": e["reason"],
+                   "risk": e["risk"], "level": sig.get("level"), "reasons": [r.get("text") for r in d.get("reasons", [])],
+                   "policy": d.get("policy", []), "new_payee": sig.get("new_payee"), "times_usual": sig.get("times_usual"),
+                   "velocity_10m": sig.get("velocity_10m"), "hour": sig.get("hour"),
+                   "session_revoked": d.get("session_revoked", False), "stepped_up": d.get("stepped_up", False)})
+    logins = []
+    for e in await my_events(claims, "auth.login", 200):
+        d = e.get("details") or {}
+        if e["decision"] != "allow" or d.get("new_device") or (e["risk"] or 0) >= 0.4:
+            logins.append({"ts": e["ts"], "decision": e["decision"], "reason": e["reason"], "risk": e["risk"],
+                           "ip": d.get("ip"), "new_device": d.get("new_device"),
+                           "reasons": [r.get("text") for r in d.get("reasons", [])]})
+    tickets = await get_json("account", "/me/tickets", claims) or []
+    flagged = [t for t in tx if t["decision"] != "allow" or (t["risk"] or 0) >= 0.4]
+    return {"transfers": tx, "flagged": flagged, "login_alerts": logins,
+            "reports": [t for t in tickets if t["category"] in ("fraud", "investigation", "access", "device")],
+            "stats": {"scored": len(tx), "flagged": len(flagged),
+                      "blocked": sum(1 for t in tx if t["decision"] == "deny"),
+                      "verified_by_you": sum(1 for t in tx if t["stepped_up"]),
+                      "pending_verification": sum(1 for t in tx if t["decision"] == "step_up")}}
 
 
 # ------------------------------------------------------------ admin routes
@@ -651,7 +1074,8 @@ EDGES = [
     ("transaction", "postgres", "TLS + certificate login", "transfers"),
     ("transaction", "risk", "mTLS", "fraud score"),
     ("transaction", "opa", "mTLS", "per-request policy"),
-    ("transaction", "auth", "mTLS", "revoke sessions on fraud"),
+    ("transaction", "auth", "mTLS", "revoke sessions on fraud, customer alerts"),
+    ("account", "auth", "mTLS", "customer alerts"),
     ("audit", "postgres", "TLS + certificate login", "hash-chained log"),
     ("responder", "audit", "mTLS", "runtime alerts"),
     ("falco", "responder", "mTLS", "runtime alerts (when Falco runs)"),
@@ -780,10 +1204,9 @@ async def admin_incident_action(body: IncidentActionBody, incident_id: str = INC
         raise HTTPException(400, "status required")
     if op in ("note", "resolve") and not body.note.strip():
         raise HTTPException(400, "write a note" if op == "note" else "describe the resolution")
-    clients.audit(actor=claims["usr"], action=f"incident.{op}", resource=incident_id,
-                  decision="info", reason=op,
-                  details={"incident_id": incident_id, "note": body.note, "assignee": body.assignee,
-                           "status": body.status})
+    # awaited (not fire-and-forget): the next read of the incident must already see this step
+    await _incident_event(claims, incident_id, op, {"note": body.note, "assignee": body.assignee,
+                                                     "status": body.status})
     return {"incident_id": incident_id, "action": op}
 
 
@@ -1107,7 +1530,8 @@ CUST = {"user": "alice", "role": "customer", "mfa": True}
 
 def _tx(subject=CUST, **ctx):
     base = {"caller": "transaction", "amount": 1000, "risk_level": "low", "device_trust": "trusted",
-            "sender_status": "active", "receiver_status": "active", "daily_used": 0, "daily_limit": 100000}
+            "sender_status": "active", "receiver_status": "active", "daily_used": 0, "daily_limit": 100000,
+            "outgoing_enabled": True}
     return {"subject": subject, "action": "transaction.transfer",
             "resource": {"owner": subject["user"], "account": "ZT1"}, "context": {**base, **ctx}}
 
@@ -1120,6 +1544,7 @@ INVARIANTS = [
     ("Untrusted devices cannot transfer", _tx(device_trust="pending"), "deny"),
     ("MFA is always required", _tx({"user": "alice", "role": "customer", "mfa": False}), "deny"),
     ("Frozen accounts cannot send", _tx(sender_status="frozen"), "deny"),
+    ("A customer's own transfer switch-off is respected", _tx(outgoing_enabled=False), "deny"),
     ("Daily limit always applies", _tx(daily_used=99900, amount=500), "deny"),
     ("Over ₹2,00,000 is always refused", _tx(amount=250000), "deny"),
     ("At the approval threshold a transfer waits for Operations", None, "approval"),   # amount set per candidate
@@ -1265,7 +1690,8 @@ async def admin_policy_scenario(body: ScenarioBody, claims: dict = Depends(sessi
            "context": {"caller": caller.get(body.action, "gateway" if body.action.startswith("admin.") else "account"),
                        "amount": body.amount, "risk_level": None if body.risk_level == "unknown" else body.risk_level,
                        "device_trust": body.device_trust, "step_up": body.step_up, "sender_status": "active",
-                       "receiver_status": "active", "daily_used": body.daily_used, "daily_limit": 100000}}
+                       "receiver_status": "active", "daily_used": body.daily_used, "daily_limit": 100000,
+                       "outgoing_enabled": True}}
     now = await simulate(_POLICY["config"], inp)
     out = {"input": inp, "now": {"outcome": outcome(now), **(now or {})}}
     if body.config is not None:
@@ -1573,6 +1999,10 @@ PLAYBOOKS = {
     "account_takeover": USER_PLAYBOOK[:3] + [
         _step("ops_freeze", "Ask Operations to freeze the account (admins cannot - separation of duties)"),
         _step("fraud_label", "Label the blocked transfer in AI fraud intelligence")],
+    "customer_report": [USER_PLAYBOOK[0], USER_PLAYBOOK[2],
+                        _step("ticket", "Work the customer's support ticket with Operations (Support tickets)"),
+                        _step("fraud_label", "Label the reported transfer in AI fraud intelligence"),
+                        USER_PLAYBOOK[3]],
     "container": [
         _step("quarantine", "Isolate the container from every network", "action", "quarantine", containment=True,
               code=True),

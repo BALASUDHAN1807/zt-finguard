@@ -652,6 +652,7 @@ CATEGORY_TITLE = {
     "jwt_theft": "Token theft or forgery",
     "suspicious_login": "Suspicious sign-in activity",
     "account_takeover": "Possible account takeover (high-risk transfer blocked)",
+    "customer_report": "Customer reported fraud, unauthorised access or a stolen device",
 }
 SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 RESPONSE_ACTIONS = {"container.release", "container.restart", "container.recover", "auth.revoke_sessions",
@@ -683,6 +684,9 @@ def falco_category(rule: str) -> str:
     if "connection" in r or "outbound" in r or "internet" in r:
         return "network_connection"
     return "suspicious_process"
+
+
+CUSTOMER_REPORT_ACTIONS = {"customer.report", "customer.report_access", "device.reported_stolen", "account.lockdown"}
 
 
 def detect(e: dict) -> dict | None:
@@ -718,6 +722,11 @@ def detect(e: dict) -> dict | None:
         if reason in ("bad_password", "bad_or_replayed_totp", "bad_sms_otp"):
             return {"category": "suspicious_login", "subject": e["actor"], "severity": "low",
                     "summary": reason.replace("_", " "), "source": "auth"}
+    if e["action"] in CUSTOMER_REPORT_ACTIONS:
+        sev = "critical" if e["action"] in ("customer.report_access", "device.reported_stolen", "account.lockdown") \
+            or d.get("category") == "fraud" else "high"
+        return {"category": "customer_report", "subject": e["actor"], "severity": sev,
+                "summary": (d.get("subject") or reason.replace("_", " "))[:200], "source": "customer"}
     if e["action"] == "transaction.transfer" and e["decision"] == "deny" and "risk_too_high" in reason:
         return {"category": "account_takeover", "subject": e["actor"], "severity": "critical",
                 "summary": "high-risk transfer blocked, sessions ended", "source": "transaction"}
@@ -734,7 +743,7 @@ async def threat_events(days: int) -> list[dict]:
                       OR (decision = 'deny' AND action IN ('gateway.verify', 'auth.refresh', 'auth.login',
                                                            'transaction.transfer')))
                ORDER BY id ASC LIMIT 100000""",
-            (days, ["container.quarantine", *RESPONSE_ACTIONS]))
+            (days, ["container.quarantine", *RESPONSE_ACTIONS, *CUSTOMER_REPORT_ACTIONS]))
         return [row_out(r) for r in await cur.fetchall()]
 
 

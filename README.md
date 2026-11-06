@@ -25,6 +25,7 @@ Runs unchanged on **Docker** or **rootless Podman**.
 | **Customer-controlled session timeout** | customer picks the inactivity timeout, admin sets the maximum, gateway expires idle sessions; re-sign-in required (auto-refresh never counts as activity) |
 | **Automatic container quarantine** | Falco alert ≥ Critical → `responder` disconnects the container from every network, alerts the admin; one-click release |
 | **Device trust verification** | first device trusted; new devices are *pending* (view only, no transfers) until approved from a trusted device + TOTP; revoke ends sessions |
+| **Customer portal** | 11 pages: dashboard, accounts and statements, transfers with Indian payment methods and charges, history, devices, security center, fraud alerts with reasons, notifications, self-protection (freeze / lockdown / three-factor recovery), profile, support tickets ([docs/customer-portal.md](docs/customer-portal.md)) |
 | **Admin security dashboard** | 11 modules: overview, identity & devices, banking operations (maker-checker), AI fraud intelligence, container security, threat center, incident response, network map, restrict-only policy editor, audit & compliance, security settings ([docs/admin-dashboard.md](docs/admin-dashboard.md)) |
 | **Mobile + SMS OTP sign-in** | mobile number at sign-up; sign in with a one-time SMS code (5 min, single use, 3 tries); new device / unusual sign-in also needs the authenticator code. Simulated SMS inbox for the demo ([docs/mobile-otp.md](docs/mobile-otp.md)) |
 
@@ -109,7 +110,7 @@ through the same checks as any API call.
 
 | Role | Pages |
 |---|---|
-| customer | **My account** (balance, history with risk scores) · **Send money** (live risk score, reasons, step-up MFA, decision time) |
+| customer | **Dashboard** · **My accounts** (details, balance, statements) · **Money transfer** (IMPS / NEFT / RTGS / internal, charges, review, step-up MFA) · **Transaction history** (search, filters, export, report) · **My devices** · **Security center** · **AI fraud protection** · **Notifications** (in-app + simulated SMS / e-mail) · **Account protection** (freeze, transfer switch, lockdown, recovery) · **My profile** · **Customer support** - see [docs/customer-portal.md](docs/customer-portal.md) |
 | teller | **Account lookup** (read any account, cannot transfer) |
 | operations | **Banking & transactions** (accounts, pending approvals, freeze, daily limits, receipts) |
 | every role | **Security settings** (inactivity timeout, my devices: approve / revoke) |
@@ -124,8 +125,8 @@ through the same checks as any API call.
 ## Tests
 
 ```bash
-make opa-test     # 33 policy unit tests
-make test         # 56 end-to-end tests (49 through the gateway + 7 container tests; stack must be running)
+make opa-test     # 35 policy unit tests
+make test         # 63 end-to-end tests (49 core + 7 customer portal + 7 container tests; stack must be running)
 make scan         # Trivy; fails on CRITICAL vulnerabilities or leaked secrets
 ```
 
