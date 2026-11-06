@@ -621,11 +621,17 @@ def test_high_value_transfer_waits_for_operations_approval():
     assert meera.req("POST", f"/api/ops/pending/{tx}/approve", json={}).status_code == 403   # maker != checker
     assert logged_in("admin").req("POST", f"/api/ops/pending/{tx}/approve", json={}).status_code == 403
     ok = ops.req("POST", f"/api/ops/pending/{tx}/approve", json={"note": "confirmed by phone"})
+    assert ok.status_code == 200, ok.text
+    if ok.json()["status"] == "pending_approval":
+        # dual control: a medium risk score needs a second, different approver (teller portal)
+        assert ok.json()["required"] == 2
+        assert ops.req("POST", f"/api/ops/pending/{tx}/approve", json={}).status_code == 403   # not twice
+        ok = logged_in("teller").req("POST", f"/api/ops/pending/{tx}/approve", json={"note": "second check"})
     assert ok.status_code == 200 and ok.json()["status"] == "completed", ok.text
     assert meera.req("GET", "/api/accounts/me").json()["balance"] == me["balance"] - 55000
     assert ops.req("POST", f"/api/ops/pending/{tx}/approve", json={}).status_code == 409     # only once
     rc = meera.req("GET", f"/api/transactions/{tx}/receipt").json()
-    assert rc["status"] == "completed" and rc["decided_by"] == "ops" and len(rc["reference"]) == 20
+    assert rc["status"] == "completed" and rc["decided_by"].startswith("ops") and len(rc["reference"]) == 20
 
     r2 = _send(meera, "meera", alice, 51000)
     tx2 = r2.json()["transaction_id"]

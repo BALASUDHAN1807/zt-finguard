@@ -28,6 +28,7 @@ async def authorize(input_doc: dict) -> dict:
             "allow": bool(result.get("allow")),
             "step_up": bool(result.get("step_up")),
             "needs_approval": bool(result.get("needs_approval")),
+            "approvals_required": int(result.get("approvals_required") or 1),
             "reasons": sorted(result.get("reasons", [])),
         }
     except Exception as exc:  # noqa: BLE001 - any failure must deny

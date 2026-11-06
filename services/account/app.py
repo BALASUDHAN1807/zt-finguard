@@ -66,7 +66,7 @@ async def history(acct: str, limit: int = 25) -> list[dict]:
     async with p.connection() as conn:
         cur = await conn.execute(
             """SELECT id, from_account, to_account, amount, status, risk_score, created_at, decided_by, decision_note,
-                      method, charges, description
+                      method, charges, description, channel, kind, initiated_by
                FROM transactions WHERE from_account = %s OR to_account = %s
                ORDER BY id DESC LIMIT %s""", (acct, acct, limit))
         rows = await cur.fetchall()
@@ -99,7 +99,7 @@ async def used_today(account_no: str) -> float:
     async with p.connection() as conn:
         cur = await conn.execute(
             f"""SELECT coalesce(sum(amount), 0) AS used FROM transactions WHERE from_account = %s
-                AND status IN ('completed', 'pending_approval') AND created_at >= {TODAY}""", (account_no,))
+                AND status IN ('completed', 'pending_approval', 'on_hold', 'mfa_requested') AND created_at >= {TODAY}""", (account_no,))
         return float((await cur.fetchone())["used"])
 
 
@@ -111,6 +111,8 @@ def public(acct: dict) -> dict:
 
 
 IFSC = "ZTFG0000001"
+VAULT_OWNER = "__branch_cash__"
+VAULT_ACCOUNT = "ZT0000000001"
 BRANCH = "ZT-FinGuard Digital Branch, Chennai"
 
 
@@ -276,7 +278,8 @@ async def ops_summary(authorization: str | None = Header(None)):
         cur = await conn.execute(
             """SELECT count(*) AS accounts, coalesce(sum(balance), 0) AS deposits,
                       count(*) FILTER (WHERE status = 'frozen') AS frozen,
-                      count(*) FILTER (WHERE balance < 1000) AS low_balance FROM accounts""")
+                      count(*) FILTER (WHERE balance < 1000) AS low_balance FROM accounts
+               WHERE owner <> '__branch_cash__'""")
         a = await cur.fetchone()
         cur = await conn.execute(
             f"""SELECT count(*) FILTER (WHERE status = 'completed' AND created_at >= {TODAY}) AS today_n,
@@ -311,11 +314,11 @@ async def ops_accounts(authorization: str | None = Header(None)):
             f"""SELECT a.account_no, a.owner, a.balance, a.status, a.daily_limit, a.frozen_reason, a.frozen_by,
                        a.frozen_at, a.limit_updated_by, a.created_at,
                        coalesce(sum(t.amount) FILTER (WHERE t.from_account = a.account_no
-                                AND t.status IN ('completed','pending_approval') AND t.created_at >= {TODAY}), 0) AS used_today,
+                                AND t.status IN ('completed','pending_approval','on_hold','mfa_requested') AND t.created_at >= {TODAY}), 0) AS used_today,
                        count(t.id) FILTER (WHERE t.created_at > now() - interval '24 hours') AS tx_24h,
                        max(t.created_at) AS last_tx
                 FROM accounts a LEFT JOIN transactions t ON t.from_account = a.account_no OR t.to_account = a.account_no
-                GROUP BY a.id ORDER BY a.account_no""")
+                WHERE a.owner <> '__branch_cash__' GROUP BY a.id ORDER BY a.account_no""")
         rows = await cur.fetchall()
     out = []
     for r in rows:
@@ -331,12 +334,23 @@ async def ops_transactions(authorization: str | None = Header(None),
                            q: str | None = Query(None, max_length=40),
                            date_from: date | None = None, date_to: date | None = None,
                            min_amount: float | None = Query(None, ge=0), max_amount: float | None = Query(None, ge=0),
+                           kind: str | None = Query(None, pattern=r"^(transfer|deposit|withdrawal)$"),
+                           channel: str | None = Query(None, pattern=r"^(online|branch)$"),
+                           initiated_by: str | None = Query(None, max_length=40),
+                           tx_id: int | None = Query(None, ge=1),
                            limit: int = Query(200, ge=1, le=1000)):
     claims = user_from(authorization)
     await ops(claims, "ops.transactions", "search")
     where, args = ["TRUE"], []
-    if status:
+    if status == "pending":
+        where.append("t.status IN ('pending_approval','on_hold','mfa_requested')")
+    elif status == "failed":
+        where.append("t.status IN ('denied','rejected','cancelled')")
+    elif status:
         where.append("t.status = %s"); args.append(status)
+    for col, val in (("t.kind", kind), ("t.channel", channel), ("t.initiated_by", initiated_by), ("t.id", tx_id)):
+        if val is not None:
+            where.append(f"{col} = %s"); args.append(val)
     if account:
         where.append("(t.from_account = %s OR t.to_account = %s)"); args += [account, account]
     if q:
@@ -353,13 +367,18 @@ async def ops_transactions(authorization: str | None = Header(None),
     async with p.connection() as conn:
         cur = await conn.execute(
             f"""SELECT t.id, t.created_at, t.from_account, fa.owner AS from_name, t.to_account, ta.owner AS to_name,
-                       t.amount, t.status, t.risk_score, t.decided_by, t.decided_at, t.decision_note
+                       t.amount, t.status, t.risk_score, t.decided_by, t.decided_at, t.decision_note,
+                       t.method, t.charges, t.description, t.channel, t.kind, t.initiated_by, t.approvals_required
                 FROM transactions t JOIN accounts fa ON fa.account_no = t.from_account
                 JOIN accounts ta ON ta.account_no = t.to_account
                 WHERE {' AND '.join(where)} ORDER BY t.id DESC LIMIT %s""", (*args, limit))
         rows = await cur.fetchall()
-    return [{k: (float(v) if isinstance(v, Decimal) else v.isoformat() if hasattr(v, "isoformat") else v)
-             for k, v in r.items()} for r in rows]
+    out = []
+    for r in rows:
+        r["reference"] = utr(r)
+        out.append({k: (float(v) if isinstance(v, Decimal) else v.isoformat() if hasattr(v, "isoformat") else v)
+                    for k, v in r.items()})
+    return out
 
 
 class FreezeIn(BaseModel):
@@ -456,8 +475,9 @@ async def me_overview(authorization: str | None = Header(None), months: int = Qu
     p = await db.pool()
     async with p.connection() as conn:
         cur = await conn.execute(
-            """SELECT coalesce(sum(amount) FILTER (WHERE from_account = %(a)s AND status = 'pending_approval'), 0) AS held,
-                      count(*) FILTER (WHERE from_account = %(a)s AND status = 'pending_approval') AS pending_n,
+            """SELECT coalesce(sum(amount) FILTER (WHERE from_account = %(a)s AND status IN ('pending_approval','on_hold','mfa_requested')), 0) AS held,
+                      count(*) FILTER (WHERE from_account = %(a)s AND status IN ('pending_approval','on_hold','mfa_requested')) AS pending_n,
+                      count(*) FILTER (WHERE from_account = %(a)s AND status = 'mfa_requested') AS confirm_n,
                       count(*) FILTER (WHERE from_account = %(a)s AND status = 'step_up_required'
                                        AND created_at > now() - interval '1 day') AS stepup_n,
                       coalesce(sum(amount) FILTER (WHERE to_account = %(a)s AND status = 'completed'
@@ -503,6 +523,7 @@ async def me_overview(authorization: str | None = Header(None), months: int = Qu
                     "used_today": await used_today(no), "nominee": "registered (demo)"},
         "balance": balance, "on_hold": float(t["held"]), "available": max(0.0, balance - float(t["held"])),
         "pending_approvals": t["pending_n"], "verification_requests": t["stepup_n"],
+        "bank_confirmation_requests": t["confirm_n"],
         "month": {"incoming": float(t["in_month"]), "outgoing": float(t["out_month"])},
         "lifetime": {"incoming": float(t["in_all"]), "outgoing": float(t["out_all"]), "incoming_n": t["in_n"],
                      "outgoing_n": t["out_n"], "failed_n": t["failed_n"]},
@@ -515,7 +536,7 @@ async def me_overview(authorization: str | None = Header(None), months: int = Qu
 async def me_transactions(authorization: str | None = Header(None),
                           q: str | None = Query(None, max_length=60),
                           direction: str | None = Query(None, pattern=r"^(in|out)$"),
-                          status: str | None = Query(None, pattern=r"^(completed|denied|step_up_required|pending_approval|cancelled|rejected|failed|pending)$"),
+                          status: str | None = Query(None, pattern=r"^(completed|denied|step_up_required|pending_approval|cancelled|rejected|failed|pending|on_hold|mfa_requested)$"),
                           method: str | None = Query(None, pattern=r"^(internal|imps|neft|rtgs)$"),
                           date_from: date | None = None, date_to: date | None = None,
                           min_amount: float | None = Query(None, ge=0), max_amount: float | None = Query(None, ge=0),
@@ -532,7 +553,7 @@ async def me_transactions(authorization: str | None = Header(None),
     if status == "failed":
         where.append("t.status IN ('denied','rejected','cancelled')")
     elif status == "pending":
-        where.append("t.status IN ('pending_approval','step_up_required')")
+        where.append("t.status IN ('pending_approval','step_up_required','on_hold','mfa_requested')")
     elif status:
         where.append("t.status = %s"); args.append(status)
     if method:
@@ -554,7 +575,7 @@ async def me_transactions(authorization: str | None = Header(None),
         cur = await conn.execute(
             f"""SELECT t.id, t.from_account, t.to_account, t.amount, t.status, t.risk_score, t.created_at,
                        t.decided_by, t.decision_note, t.method, t.charges, t.description,
-                       fa.owner AS from_name, ta.owner AS to_name
+                       t.channel, t.kind, t.initiated_by, fa.owner AS from_name, ta.owner AS to_name
                 FROM transactions t JOIN accounts fa ON fa.account_no = t.from_account
                 JOIN accounts ta ON ta.account_no = t.to_account
                 WHERE {' AND '.join(where)} ORDER BY t.id DESC LIMIT %s""", (*args, limit))
@@ -563,6 +584,8 @@ async def me_transactions(authorization: str | None = Header(None),
     for r in rows:
         tx_view(r, no)
         r["counterparty"] = r["to_name"] if r["direction"] == "out" else r["from_name"]
+        if r["counterparty"] == VAULT_OWNER:
+            r["counterparty"] = "Cash at counter"
         r["counterparty_account"] = mask_acct(r["to_account"] if r["direction"] == "out" else r["from_account"])
         r.pop("from_name"); r.pop("to_name")
         r["created_at"] = r["created_at"].isoformat()
@@ -607,7 +630,7 @@ async def me_statement(date_from: date, date_to: date, authorization: str | None
             bal -= r["amount"] + r["charges"]; debits += r["amount"] + r["charges"]
         lines.append({"date": r["created_at"].isoformat(), "reference": r["reference"], "method": r["method"],
                       "description": r["description"] or (f"To {r['to_name']}" if r["direction"] == "out"
-                                                           else f"From {r['from_name']}"),
+                                                           else f"From {r['from_name']}").replace(VAULT_OWNER, "cash"),
                       "debit": round(r["amount"] + r["charges"], 2) if r["direction"] == "out" else None,
                       "credit": r["amount"] if r["direction"] == "in" else None, "balance": round(bal, 2)})
     clients.audit(actor=claims["usr"], action="account.statement", resource=no, decision="info",
@@ -629,6 +652,8 @@ async def validate_payee(acct_no: str, authorization: str | None = Header(None))
     if acct_no == mine["account_no"]:
         return {"valid": False, "reason": "that is your own account"}
     other = await fetch_account("account_no", acct_no)
+    if other and other["owner"] == VAULT_OWNER:
+        other = None
     clients.audit(actor=claims["usr"], action="payee.validate", resource=acct_no, decision="info",
                   reason="found" if other else "not_found")
     if other is None:
@@ -778,15 +803,22 @@ async def customer_reply(tid: int, body: ReplyIn, authorization: str | None = He
 
 
 @app.get("/ops/tickets", dependencies=[from_gateway])
-async def ops_tickets(authorization: str | None = Header(None), status: str | None = Query(None, max_length=20)):
+async def ops_tickets(authorization: str | None = Header(None), status: str | None = Query(None, max_length=20),
+                      q: str | None = Query(None, max_length=60)):
     claims = user_from(authorization)
     await decide(claims, "support.manage", None, "tickets")
+    where, args = [], []
+    if status:
+        where.append("status = %s"); args.append(status)
+    if q:
+        where.append("(owner ILIKE %s OR subject ILIKE %s OR body ILIKE %s OR id::text = %s)")
+        args += [f"%{q}%", f"%{q}%", f"%{q}%", q.strip()]
     p = await db.pool()
     async with p.connection() as conn:
         cur = await conn.execute(
-            "SELECT * FROM support_tickets" + (" WHERE status = %s" if status else "")
+            "SELECT * FROM support_tickets" + (" WHERE " + " AND ".join(where) if where else "")
             + " ORDER BY (status IN ('resolved','closed')), CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
-              "ELSE 2 END, id DESC LIMIT 300", (status,) if status else ())
+              "ELSE 2 END, id DESC LIMIT 300", tuple(args))
         return [ticket_out(r) for r in await cur.fetchall()]
 
 
@@ -799,6 +831,259 @@ async def ops_reply(tid: int, body: ReplyIn, authorization: str | None = Header(
                   reason=row["status"], details={"customer": row["owner"]})
     clients.notify(row["owner"], "support", f"Reply on ticket #{tid}", f"{body.message[:200]} (status: {row['status']})")
     return row
+
+
+# ======================================================================= teller portal
+def plain(r: dict) -> dict:
+    return {k: (float(v) if isinstance(v, Decimal) else v.isoformat() if hasattr(v, "isoformat") else v)
+            for k, v in r.items()}
+
+
+@app.get("/teller/accounts/{acct_no}", dependencies=[from_gateway])
+async def teller_account(acct_no: str, authorization: str | None = Header(None)):
+    """Teller view of one customer account: details, restrictions, risk status, complaints."""
+    claims = user_from(authorization)
+    acct = await fetch_account("account_no", acct_no)
+    await decide(claims, "account.read", acct["owner"] if acct else "__nobody__", acct_no)
+    if acct is None or acct["owner"] == VAULT_OWNER:
+        raise HTTPException(404, "account not found")
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """SELECT count(*) FILTER (WHERE status = 'completed') AS done,
+                      count(*) FILTER (WHERE status IN ('denied','rejected')) AS failed,
+                      count(*) FILTER (WHERE status IN ('pending_approval','on_hold','mfa_requested')) AS pending,
+                      max(risk_score) FILTER (WHERE created_at > now() - interval '30 days') AS max_risk,
+                      avg(risk_score) FILTER (WHERE created_at > now() - interval '30 days') AS avg_risk,
+                      count(*) FILTER (WHERE status = 'denied' AND risk_score >= 0.75
+                                       AND created_at > now() - interval '30 days') AS high_risk_blocks,
+                      max(created_at) AS last_tx
+               FROM transactions WHERE from_account = %(a)s OR to_account = %(a)s""", {"a": acct_no})
+        st = await cur.fetchone()
+        cur = await conn.execute("SELECT id, category, subject, status, priority, created_at, tx_id FROM support_tickets "
+                                 "WHERE owner = %s ORDER BY id DESC LIMIT 50", (acct["owner"],))
+        tickets = [plain(r) for r in await cur.fetchall()]
+    max_risk = float(st["max_risk"] or 0)
+    restrictions = []
+    if acct["status"] == "frozen":
+        restrictions.append(f"frozen by {acct['frozen_by']}: {acct['frozen_reason']}")
+    if acct["transfers_disabled"]:
+        restrictions.append("outgoing transfers switched off by the customer")
+    clients.audit(actor=claims["usr"], action="teller.view_account", resource=acct_no, decision="info",
+                  details={"customer": acct["owner"]})
+    return public(acct) | {
+        "masked": mask_acct(acct_no), "type": acct["account_type"], "ifsc": IFSC, "used_today": await used_today(acct_no),
+        "transfers_disabled": acct["transfers_disabled"], "restrictions": restrictions,
+        "stats": plain(st), "risk_status": "high" if st["high_risk_blocks"] or max_risk >= 0.75
+        else "elevated" if max_risk >= 0.4 else "normal", "tickets": tickets,
+        "available": float(acct["balance"]) - await held(acct_no)}
+
+
+async def held(acct_no: str) -> float:
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute("SELECT coalesce(sum(amount), 0) AS h FROM transactions WHERE from_account = %s "
+                                 "AND status IN ('pending_approval','on_hold','mfa_requested')", (acct_no,))
+        return float((await cur.fetchone())["h"])
+
+
+@app.get("/approvals/queue", dependencies=[from_gateway])
+async def approval_queue(authorization: str | None = Header(None)):
+    claims = user_from(authorization)
+    await ops(claims, "ops.transactions", "approval_queue")
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """SELECT t.*, fa.owner AS from_name, ta.owner AS to_name,
+                      (SELECT status FROM accounts WHERE account_no = t.from_account) AS from_status,
+                      coalesce((SELECT json_agg(json_build_object('approver', a.approver, 'role', a.role,
+                                'decision', a.decision, 'remarks', a.remarks, 'at', a.created_at) ORDER BY a.id)
+                                FROM transaction_approvals a WHERE a.tx_id = t.id), '[]') AS decisions
+               FROM transactions t JOIN accounts fa ON fa.account_no = t.from_account
+               JOIN accounts ta ON ta.account_no = t.to_account
+               WHERE t.status IN ('pending_approval','on_hold','mfa_requested') ORDER BY t.id""")
+        rows = await cur.fetchall()
+    out = []
+    for r in rows:
+        r["reference"] = utr(r)
+        score = float(r["risk_score"]) if r["risk_score"] is not None else None
+        r["risk_level"] = "high" if score is not None and score >= .75 else "medium" if score is not None \
+            and score >= .4 else "low" if score is not None else "unknown"
+        r["required"] = 2 if float(r["amount"]) >= 100000 or r["risk_level"] != "low" else 1
+        approvals = [d for d in r["decisions"] if d["decision"] == "approve"]
+        r["approvals"] = len(approvals)
+        r["customer"] = r["to_name"] if r["kind"] == "deposit" else r["from_name"]
+        out.append(plain(r))
+    return out
+
+
+@app.get("/approvals/history", dependencies=[from_gateway])
+async def approval_history(authorization: str | None = Header(None), approver: str | None = Query(None, max_length=40),
+                           limit: int = Query(300, ge=1, le=2000)):
+    claims = user_from(authorization)
+    await ops(claims, "ops.transactions", "approval_history")
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """SELECT a.*, t.amount, t.status AS tx_status, t.kind, t.channel, t.from_account, t.to_account,
+                      t.initiated_by, t.risk_score
+               FROM transaction_approvals a JOIN transactions t ON t.id = a.tx_id"""
+            + (" WHERE a.approver = %s" if approver else "") + " ORDER BY a.id DESC LIMIT %s",
+            (approver, limit) if approver else (limit,))
+        return [plain(r) for r in await cur.fetchall()]
+
+
+@app.get("/branch/stats", dependencies=[from_gateway])
+async def branch_stats(date_from: date, date_to: date, authorization: str | None = Header(None)):
+    """Branch operations and reports: everything between two Indian-calendar dates (inclusive)."""
+    claims = user_from(authorization)
+    await decide(claims, "branch.reports", None, "branch")
+    if date_to < date_from or (date_to - date_from).days > 400:
+        raise HTTPException(400, "choose a period of at most 400 days")
+    rng = {"f": date_from, "t": date_to, "v": VAULT_ACCOUNT}
+    period = ("t.created_at >= (%(f)s::date AT TIME ZONE 'Asia/Kolkata') "
+              "AND t.created_at < ((%(t)s::date + 1) AT TIME ZONE 'Asia/Kolkata')")
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(f"""
+            SELECT count(*) AS total,
+                   count(*) FILTER (WHERE status = 'completed') AS completed,
+                   count(*) FILTER (WHERE status IN ('denied','rejected','cancelled')) AS failed,
+                   count(*) FILTER (WHERE status IN ('pending_approval','on_hold','mfa_requested')) AS pending,
+                   count(*) FILTER (WHERE risk_score >= 0.75 OR (status = 'denied' AND risk_score >= 0.4)) AS high_risk,
+                   coalesce(sum(amount) FILTER (WHERE status = 'completed'), 0) AS volume,
+                   coalesce(sum(amount) FILTER (WHERE status = 'completed' AND kind = 'deposit'), 0) AS deposits,
+                   coalesce(sum(amount) FILTER (WHERE status = 'completed' AND kind = 'withdrawal'), 0) AS withdrawals,
+                   coalesce(sum(amount) FILTER (WHERE status = 'completed' AND kind = 'transfer'), 0) AS transfers,
+                   count(*) FILTER (WHERE channel = 'branch') AS counter_n,
+                   count(DISTINCT CASE WHEN channel = 'branch' THEN
+                         CASE WHEN kind = 'deposit' THEN to_account ELSE from_account END END) AS customers_served,
+                   count(DISTINCT from_account) FILTER (WHERE channel = 'online') AS online_customers
+            FROM transactions t WHERE {period}""", rng)
+        tot = plain(await cur.fetchone())
+        cur = await conn.execute(f"""
+            SELECT to_char(t.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') AS day, kind, status,
+                   count(*) AS n, coalesce(sum(amount), 0) AS amount
+            FROM transactions t WHERE {period} GROUP BY 1, 2, 3 ORDER BY 1""", rng)
+        daily = [plain(r) for r in await cur.fetchall()]
+        cur = await conn.execute(f"""
+            SELECT extract(hour FROM t.created_at AT TIME ZONE 'Asia/Kolkata')::int AS hour, channel,
+                   count(*) AS n, coalesce(sum(amount) FILTER (WHERE status = 'completed'), 0) AS amount
+            FROM transactions t WHERE {period} GROUP BY 1, 2 ORDER BY 1""", rng)
+        hourly = [plain(r) for r in await cur.fetchall()]
+        cur = await conn.execute(f"""
+            SELECT initiated_by AS teller, count(*) AS transactions,
+                   count(*) FILTER (WHERE status = 'completed') AS completed,
+                   count(*) FILTER (WHERE status IN ('denied','rejected')) AS failed,
+                   coalesce(sum(amount) FILTER (WHERE status = 'completed'), 0) AS volume,
+                   count(DISTINCT CASE WHEN kind = 'deposit' THEN to_account ELSE from_account END) AS customers
+            FROM transactions t WHERE channel = 'branch' AND {period} GROUP BY 1 ORDER BY 2 DESC""", rng)
+        tellers = [plain(r) for r in await cur.fetchall()]
+        cur = await conn.execute(f"""
+            SELECT a.approver, a.role, count(*) FILTER (WHERE a.decision = 'approve') AS approved,
+                   count(*) FILTER (WHERE a.decision = 'reject') AS rejected,
+                   count(*) FILTER (WHERE a.decision = 'hold') AS held,
+                   count(*) FILTER (WHERE a.decision = 'request_mfa') AS mfa_requested
+            FROM transaction_approvals a WHERE a.created_at >= (%(f)s::date AT TIME ZONE 'Asia/Kolkata')
+              AND a.created_at < ((%(t)s::date + 1) AT TIME ZONE 'Asia/Kolkata') GROUP BY 1, 2""", rng)
+        approvals = [plain(r) for r in await cur.fetchall()]
+        cur = await conn.execute(f"""
+            SELECT t.id, t.created_at, t.kind, t.channel, t.status, t.amount, t.risk_score, t.initiated_by,
+                   t.method, t.charges, t.description, t.decided_by, t.decision_note,
+                   CASE WHEN t.kind = 'deposit' THEN ta.owner ELSE fa.owner END AS customer,
+                   t.from_account, t.to_account
+            FROM transactions t JOIN accounts fa ON fa.account_no = t.from_account
+            JOIN accounts ta ON ta.account_no = t.to_account WHERE {period} ORDER BY t.id DESC LIMIT 2000""", rng)
+        rows = []
+        for r in await cur.fetchall():
+            r["reference"] = utr(r)
+            rows.append(plain(r))
+        cur = await conn.execute("SELECT balance FROM accounts WHERE account_no = %s", (VAULT_ACCOUNT,))
+        vault = await cur.fetchone()
+    return {"from": str(date_from), "to": str(date_to), "totals": tot, "daily": daily, "hourly": hourly,
+            "tellers": tellers, "approvals": approvals, "transactions": rows,
+            "vault_balance": float(vault["balance"]) if vault else None, "branch": BRANCH, "ifsc": IFSC}
+
+
+class StaffTicketIn(BaseModel):
+    customer: str = Field(max_length=40)
+    category: str = Field(pattern=r"^(general|fraud|access|device|recovery|investigation|protection)$")
+    subject: str = Field(min_length=3, max_length=120)
+    body: str = Field(min_length=3, max_length=2000)
+    tx_id: int | None = Field(default=None, gt=0)
+    escalate: bool = False
+
+
+@app.post("/ops/tickets", dependencies=[from_gateway])
+async def staff_ticket(body: StaffTicketIn, authorization: str | None = Header(None)):
+    """A teller / operations officer opens a ticket for a customer (e.g. at the counter) or escalates a
+    suspicious transaction to the security team."""
+    claims = user_from(authorization)
+    await decide(claims, "support.manage", None, "tickets")
+    acct = await fetch_account("owner", body.customer)
+    if acct is None:
+        raise HTTPException(404, "customer not found")
+    priority = "urgent" if body.escalate or body.category in ("fraud", "access") else PRIORITY.get(body.category, "high")
+    p = await db.pool()
+    async with p.connection() as conn:
+        cur = await conn.execute(
+            """INSERT INTO support_tickets (owner, category, subject, body, tx_id, priority, created_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+            (body.customer, body.category, body.subject, body.body, body.tx_id, priority, claims["usr"]))
+        row = await cur.fetchone()
+        await conn.commit()
+    clients.audit(actor=claims["usr"], action="teller.escalate" if body.escalate else "support.ticket",
+                  resource=f"ticket/{row['id']}", decision="alert" if body.escalate else "info",
+                  reason="suspicious_transaction_escalated" if body.escalate else "ticket_opened_by_staff",
+                  details={"ticket_id": row["id"], "customer": body.customer, "category": body.category,
+                           "tx_id": body.tx_id, "subject": body.subject[:120]})
+    clients.notify(body.customer, "support", f"Ticket #{row['id']} opened for you",
+                   f"{body.subject[:80]} - opened by {claims['usr']} at the bank.")
+    return ticket_out(row)
+
+
+class StaffProtectIn(BaseModel):
+    action: str = Field(pattern=r"^(freeze|unfreeze|disable_transfers|enable_transfers)$")
+    verification_id: str = Field(max_length=40)
+    reason: str = Field(min_length=3, max_length=200)
+
+
+@app.post("/teller/accounts/{acct_no}/protect", dependencies=[from_gateway])
+async def teller_protect(acct_no: str, body: StaffProtectIn, authorization: str | None = Header(None)):
+    """Account-protection request handled at the counter, only for a customer this teller has just
+    verified with SMS code + authenticator (checked again here with the auth service)."""
+    claims = user_from(authorization)
+    await decide(claims, "customer.service", None, acct_no)
+    acct = await fetch_account("account_no", acct_no)
+    if acct is None or acct["owner"] == VAULT_OWNER:
+        raise HTTPException(404, "account not found")
+    try:
+        v = (await mtls.client().post(mtls.url("auth", "/internal/verification/check"), json={
+            "verification_id": body.verification_id, "customer": acct["owner"], "teller": claims["usr"]})).json()
+    except Exception:  # noqa: BLE001
+        v = {"valid": False}
+    if not v.get("valid") or v.get("level") != "sms+totp":
+        raise HTTPException(403, "verify the customer first (SMS code + authenticator)")
+    if body.action == "unfreeze" and acct["status"] == "frozen" and acct["frozen_by"] not in (acct["owner"],):
+        raise HTTPException(403, "the bank froze this account - only operations can lift it")
+    p = await db.pool()
+    async with p.connection() as conn:
+        if body.action == "freeze":
+            await conn.execute("UPDATE accounts SET status = 'frozen', frozen_reason = %s, frozen_by = %s, "
+                               "frozen_at = now() WHERE account_no = %s",
+                               (f"customer request at counter: {body.reason}", acct["owner"], acct_no))
+        elif body.action == "unfreeze":
+            await conn.execute("UPDATE accounts SET status = 'active', frozen_reason = NULL, frozen_by = NULL, "
+                               "frozen_at = NULL WHERE account_no = %s", (acct_no,))
+        else:
+            await conn.execute("UPDATE accounts SET transfers_disabled = %s WHERE account_no = %s",
+                               (body.action == "disable_transfers", acct_no))
+        await conn.commit()
+    clients.audit(actor=claims["usr"], action=f"teller.protect_{body.action}", resource=acct_no, decision="alert",
+                  reason=body.reason, details={"customer": acct["owner"], "verification_id": body.verification_id})
+    clients.notify(acct["owner"], "security", "Account protection updated at the counter",
+                   f"{body.action.replace('_', ' ').capitalize()} done by teller {claims['usr']} at your request.", "high")
+    return {"account_no": acct_no, "done": body.action}
 
 
 @app.get("/healthz")

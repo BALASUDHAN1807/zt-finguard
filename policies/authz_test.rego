@@ -281,3 +281,74 @@ test_support_tickets_own_only_and_ops_manage if {
 	admin := {"user": "admin", "role": "admin", "mfa": true}
 	not authz.decision.allow with input as {"subject": admin, "action": "support.manage", "resource": {}, "context": {"caller": "account"}}
 }
+
+# ------------------------------------------------ teller portal
+teller := {"user": "teller", "role": "teller", "mfa": true}
+
+branch(action, ctx) := {
+	"subject": teller,
+	"action": action,
+	"resource": {"owner": "alice", "account": "ZT1"},
+	"context": object.union(
+		{
+			"caller": "transaction", "amount": 5000, "risk_level": "low", "device_trust": "trusted",
+			"sender_status": "active", "receiver_status": "active", "daily_used": 0, "daily_limit": 100000,
+			"outgoing_enabled": true, "verification": "sms+totp",
+		},
+		ctx,
+	),
+}
+
+test_counter_withdrawal_needs_sms_and_authenticator if {
+	authz.decision.allow with input as branch("branch.withdraw", {})
+	"customer_not_verified" in authz.decision.reasons with input as branch("branch.withdraw", {"verification": "sms"})
+	"customer_not_verified" in authz.decision.reasons with input as branch("branch.transfer", {"verification": null})
+	authz.decision.allow with input as branch("branch.deposit", {"verification": null})
+}
+
+test_counter_money_needs_teller_on_trusted_device if {
+	"device_not_trusted" in authz.decision.reasons with input as branch("branch.deposit", {"device_trust": "pending"})
+}
+
+test_counter_rules_reuse_banking_policy if {
+	"account_frozen" in authz.decision.reasons with input as branch("branch.withdraw", {"sender_status": "frozen"})
+	"daily_limit_exceeded" in authz.decision.reasons with input as branch("branch.withdraw", {"daily_used": 99000})
+	"amount_over_limit" in authz.decision.reasons with input as branch("branch.withdraw", {"amount": 250000})
+	authz.decision.needs_approval with input as branch("branch.withdraw", {"amount": 60000})
+	not authz.decision.needs_approval with input as branch("branch.deposit", {"amount": 60000})
+	authz.decision.needs_approval with input as branch("branch.deposit", {"amount": 250000})
+}
+
+customer_cannot_do_counter_work if {
+	not authz.decision.allow with input as object.union(branch("branch.deposit", {}), {"subject": customer})
+}
+
+test_customers_and_admins_cannot_use_the_counter if {
+	customer_cannot_do_counter_work
+	admin := {"user": "admin", "role": "admin", "mfa": true}
+	not authz.decision.allow with input as object.union(branch("branch.withdraw", {}), {"subject": admin})
+}
+
+approval(subject, ctx) := {
+	"subject": subject,
+	"action": "ops.approve",
+	"resource": {},
+	"context": object.union(
+		{
+			"caller": "transaction", "amount": 60000, "risk_level": "low",
+			"initiator": "alice", "owner": "alice", "prior_approvers": [],
+		},
+		ctx,
+	),
+}
+
+test_dual_control_and_maker_checker if {
+	authz.decision.allow with input as approval(teller, {})
+	authz.decision.approvals_required == 1 with input as approval(teller, {})
+	authz.decision.approvals_required == 2 with input as approval(teller, {"amount": 150000})
+	authz.decision.approvals_required == 2 with input as approval(teller, {"risk_level": "medium"})
+	"maker_cannot_approve" in authz.decision.reasons with input as approval(teller, {"initiator": "teller"})
+	"already_approved_by_you" in authz.decision.reasons with input as approval(teller, {"prior_approvers": ["teller"]})
+	ops := {"user": "ops", "role": "operations", "mfa": true}
+	authz.decision.allow with input as approval(ops, {"prior_approvers": ["teller"]})
+}

@@ -25,6 +25,7 @@ Runs unchanged on **Docker** or **rootless Podman**.
 | **Customer-controlled session timeout** | customer picks the inactivity timeout, admin sets the maximum, gateway expires idle sessions; re-sign-in required (auto-refresh never counts as activity) |
 | **Automatic container quarantine** | Falco alert ≥ Critical → `responder` disconnects the container from every network, alerts the admin; one-click release |
 | **Device trust verification** | first device trusted; new devices are *pending* (view only, no transfers) until approved from a trusted device + TOTP; revoke ends sessions |
+| **Teller portal** | 12 pages: counter deposits / withdrawals / transfers only after the customer proves identity (SMS code + authenticator), dual-control approvals (maker-checker, 2 approvers from ₹1 lakh), customer 360 with masked data, AI risk view, branch reports ([docs/teller-portal.md](docs/teller-portal.md)) |
 | **Customer portal** | 11 pages: dashboard, accounts and statements, transfers with Indian payment methods and charges, history, devices, security center, fraud alerts with reasons, notifications, self-protection (freeze / lockdown / three-factor recovery), profile, support tickets ([docs/customer-portal.md](docs/customer-portal.md)) |
 | **Admin security dashboard** | 11 modules: overview, identity & devices, banking operations (maker-checker), AI fraud intelligence, container security, threat center, incident response, network map, restrict-only policy editor, audit & compliance, security settings ([docs/admin-dashboard.md](docs/admin-dashboard.md)) |
 | **Mobile + SMS OTP sign-in** | mobile number at sign-up; sign in with a one-time SMS code (5 min, single use, 3 tries); new device / unusual sign-in also needs the authenticator code. Simulated SMS inbox for the demo ([docs/mobile-otp.md](docs/mobile-otp.md)) |
@@ -67,7 +68,7 @@ Open **https://localhost:8501** (import `certs/ca.crt` into your browser to remo
 | `alice` (mobile 9876500001) | customer | sign in with mobile + SMS code; send ₹750 to `ZT1000000004` → allowed (low risk) |
 | `alice` | customer | send ₹20,000 to a new payee → **step-up** code required |
 | `bob` | customer | send his whole balance → **blocked + all sessions ended** |
-| `teller` | teller | look up any account; cannot transfer |
+| `teller` | teller | verify a customer at the counter (SMS + authenticator), cash deposit / withdrawal, approve others' held transactions (never its own) |
 | `ops` | operations | banking desk: approve high-value transfers, freeze accounts, set daily limits, receipts |
 | `meera` | customer | business account (₹5,00,000): send ₹55,000 → waits for operations approval |
 | `admin` | admin | security dashboard, decisions, model card, audit-chain verification |
@@ -111,8 +112,8 @@ through the same checks as any API call.
 | Role | Pages |
 |---|---|
 | customer | **Dashboard** · **My accounts** (details, balance, statements) · **Money transfer** (IMPS / NEFT / RTGS / internal, charges, review, step-up MFA) · **Transaction history** (search, filters, export, report) · **My devices** · **Security center** · **AI fraud protection** · **Notifications** (in-app + simulated SMS / e-mail) · **Account protection** (freeze, transfer switch, lockdown, recovery) · **My profile** · **Customer support** - see [docs/customer-portal.md](docs/customer-portal.md) |
-| teller | **Account lookup** (read any account, cannot transfer) |
-| operations | **Banking & transactions** (accounts, pending approvals, freeze, daily limits, receipts) |
+| teller | **Teller dashboard** · **Customer lookup** · **Identity verification** (SMS + authenticator at the counter) · **Transaction management** (deposit / withdrawal / transfer) · **Transaction approvals** (maker-checker, dual control) · **AI risk assessment** · **Transaction history** · **Branch operations** · **Teller security center** · **Customer support** · **Reports & audit history** · **Teller profile & settings** - see [docs/teller-portal.md](docs/teller-portal.md) |
+| operations | **Banking & transactions** (accounts, pending approvals, freeze, daily limits, receipts, support tickets) · **Transaction approvals** |
 | every role | **Security settings** (inactivity timeout, my devices: approve / revoke) |
 | admin | **Security overview** · **Identity & devices** · **AI fraud intelligence** · **Container security** · **Threat center** · **Incident response** · **Network visualization** · **Policy management** (restrict-only editor, simulation, versions, rollback) · **Audit & compliance** (explorer, export, compliance report) · **Access decisions** · **Session & device policy** · **Security settings** (platform settings, keys & certificates) - see [docs/admin-dashboard.md](docs/admin-dashboard.md) |
 
@@ -125,8 +126,8 @@ through the same checks as any API call.
 ## Tests
 
 ```bash
-make opa-test     # 35 policy unit tests
-make test         # 63 end-to-end tests (49 core + 7 customer portal + 7 container tests; stack must be running)
+make opa-test     # 40 policy unit tests
+make test         # 68 end-to-end tests (49 core + 7 customer + 5 teller portal + 7 container tests; stack must be running)
 make scan         # Trivy; fails on CRITICAL vulnerabilities or leaked secrets
 ```
 

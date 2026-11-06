@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 import pyotp
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 import notify
@@ -1728,6 +1728,267 @@ async def recover(body: RecoveryIn):
     await alert(user, "security", "Access restored", "Your identity was verified and sign-in is open again. "
                 "Review your devices and change your password if anything looks wrong.", "high")
     return {"restored": True, "was_locked": bool(locked)}
+
+
+# ======================================================================= teller portal
+# Counter work: tellers look customers up (masked contact details) and verify them with an SMS
+# code to the registered mobile (+ the customer's authenticator for money leaving the account).
+# The transaction service asks this service whether a verification is valid before any money moves.
+STAFF = {"teller", "operations"}
+VERIFY_TTL_MIN = 10
+
+
+def require_staff(claims: dict, roles: set[str] = STAFF) -> None:
+    if claims.get("role") not in roles:
+        raise HTTPException(403, "staff only")
+
+
+def customer_acct(uid: int) -> str:
+    return f"ZT{1_000_000_000 + uid}"
+
+
+async def find_customer(q: str) -> list[dict]:
+    q = q.strip()
+    p = await db.pool()
+    async with p.connection() as conn:
+        uid = None
+        if re.fullmatch(r"ZT\d{10}", q.upper()):
+            uid = int(q.upper()[2:]) - 1_000_000_000
+        elif re.fullmatch(r"(CUST-)?\d{1,9}", q.upper()):
+            uid = int(q.upper().replace("CUST-", ""))
+        if uid is not None:
+            cur = await conn.execute("SELECT * FROM users WHERE id = %s AND role = 'customer'", (uid,))
+        else:
+            like = f"%{q[:40]}%"
+            cur = await conn.execute(
+                "SELECT * FROM users WHERE role = 'customer' AND (username ILIKE %s OR full_name ILIKE %s) "
+                "ORDER BY username LIMIT 25", (like, like))
+        return await cur.fetchall()
+
+
+def customer_card(u: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    return {"username": u["username"], "customer_id": f"CUST-{u['id']}", "full_name": u.get("full_name") or u["username"],
+            "account_no": customer_acct(u["id"]), "mobile": mask_mobile(u["mobile"]) if u.get("mobile") else None,
+            "email": mask_email(u.get("email")), "email_verified": bool(u.get("email_verified")),
+            "kyc_status": u.get("kyc_status") or "verified", "customer_since": u["created_at"].isoformat(),
+            "locked": bool(u["locked_until"] and u["locked_until"] > now), "self_locked": bool(u.get("self_locked")),
+            "failed_attempts": u["failed_attempts"], "last_login_ip": u.get("last_login_ip")}
+
+
+@app.get("/teller/customers", dependencies=[gateway_only])
+async def teller_search(q: str = Query(min_length=1, max_length=40), authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    require_staff(claims)
+    rows = await find_customer(q)
+    clients.audit(actor=claims["usr"], action="teller.lookup", resource="customers", decision="info",
+                  details={"q": q[:40], "results": len(rows)})
+    return [customer_card(u) for u in rows]
+
+
+@app.get("/teller/customers/{username}", dependencies=[gateway_only])
+async def teller_customer(username: str, authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    require_staff(claims)
+    u = await get_user(username)
+    if u is None or u["role"] != "customer":
+        raise HTTPException(404, "customer not found")
+    devices = [device_view(d, "") for d in await device_rows(u["id"])]
+    for d in devices:
+        d.pop("fingerprint", None)
+    clients.audit(actor=claims["usr"], action="teller.view_customer", resource=username, decision="info")
+    return customer_card(u) | {"devices": devices,
+                               "trusted_devices": sum(1 for d in devices if d["status"] == "trusted")}
+
+
+class VerifyStartIn(BaseModel):
+    customer: str = Field(max_length=40)
+    purpose: str = Field(pattern=r"^(account_service|deposit|withdrawal|transfer|recovery|device_removal|protection|"
+                                 r"approval)$")
+
+
+NEEDS_TOTP = {"withdrawal", "transfer", "recovery", "device_removal", "protection"}
+
+
+@app.post("/teller/verify", dependencies=[gateway_only])
+async def verify_start(body: VerifyStartIn, authorization: str | None = Header(None)):
+    """Start a counter verification: pre-checks + a one-time SMS code to the registered mobile."""
+    claims = caller_claims(authorization)
+    require_staff(claims)
+    u = await get_user(body.customer)
+    if u is None or u["role"] != "customer":
+        raise HTTPException(404, "customer not found")
+    if not u.get("mobile"):
+        raise HTTPException(409, "no registered mobile - the customer must update it before counter service")
+    devices = await device_rows(u["id"])
+    now = datetime.now(timezone.utc)
+    checks = {"registered_mobile": mask_mobile(u["mobile"]), "email_verified": bool(u.get("email_verified")),
+              "kyc_status": u.get("kyc_status"), "trusted_devices": sum(1 for d in devices if d["status"] == "trusted"),
+              "pending_devices": sum(1 for d in devices if d["status"] == "pending"),
+              "sign_in_locked": bool(u["locked_until"] and u["locked_until"] > now),
+              "self_locked": bool(u.get("self_locked")), "failed_attempts": u["failed_attempts"]}
+    required = "sms+totp" if body.purpose in NEEDS_TOTP else "sms"
+    vid = uuid.uuid4().hex[:16]
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    r = clients.redis()
+    await r.hset(f"tv:{vid}", mapping={"h": otp_digest(u["id"], code, vid), "customer": u["username"],
+                                       "teller": claims["usr"], "required": required, "tries": 0})
+    await r.expire(f"tv:{vid}", VERIFY_TTL_MIN * 60)
+    p = await db.pool()
+    async with p.connection() as conn:
+        await conn.execute(
+            """INSERT INTO identity_verifications (id, customer, teller, purpose, required, checks, expires_at)
+               VALUES (%s,%s,%s,%s,%s,%s, now() + make_interval(mins => %s))""",
+            (vid, u["username"], claims["usr"], body.purpose, required, json.dumps(checks), VERIFY_TTL_MIN))
+        await conn.commit()
+    await sms.send(r, u["mobile"], f"{code} is your ZT-FinGuard counter verification code ({body.purpose.replace('_', ' ')}). "
+                                     "Give it only to the teller in front of you. Valid 10 minutes.")
+    clients.audit(actor=claims["usr"], action="teller.verify_start", resource=u["username"], decision="info",
+                  reason=body.purpose, details={"verification_id": vid, "required": required})
+    return {"verification_id": vid, "customer": u["username"], "required": required, "checks": checks,
+            "sent_to": mask_mobile(u["mobile"]), "expires_in": VERIFY_TTL_MIN * 60}
+
+
+class VerifyCompleteIn(BaseModel):
+    sms_code: str = Field(max_length=10)
+    totp: str | None = Field(default=None, max_length=10)
+
+
+async def _finish_verification(vid: str, status: str, attempts: int) -> None:
+    p = await db.pool()
+    async with p.connection() as conn:
+        await conn.execute("UPDATE identity_verifications SET status = %s, attempts = %s, "
+                           "completed_at = CASE WHEN %s <> 'started' THEN now() END WHERE id = %s",
+                           (status, attempts, status, vid))
+        await conn.commit()
+
+
+@app.post("/teller/verify/{vid}", dependencies=[gateway_only])
+async def verify_complete(vid: str, body: VerifyCompleteIn, authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    require_staff(claims)
+    r = clients.redis()
+    rec = await r.hgetall(f"tv:{vid}")
+    if not rec:
+        raise HTTPException(410, "verification expired - start again")
+    if rec["teller"] != claims["usr"]:
+        raise HTTPException(403, "this verification belongs to another teller")
+    if rec.get("passed"):
+        return {"verification_id": vid, "status": "passed", "level": rec["passed"]}
+    u = await get_user(rec["customer"])
+    ok_sms = hmac.compare_digest(rec["h"], otp_digest(u["id"], body.sms_code.strip(), vid))
+    ok_totp = await totp_ok(u, body.totp) if (body.totp and ok_sms) else False
+    level = "sms+totp" if ok_sms and ok_totp else "sms" if ok_sms else None
+    tries = int(await r.hincrby(f"tv:{vid}", "tries", 1))
+    enough = level == "sms+totp" or (level == "sms" and rec["required"] == "sms")
+    if not enough:
+        failed = tries >= 3
+        if failed:
+            await r.delete(f"tv:{vid}")
+        await _finish_verification(vid, "failed" if failed else "started", tries)
+        clients.audit(actor=claims["usr"], action="teller.verify", resource=rec["customer"], decision="deny",
+                      reason="customer_verification_failed",
+                      details={"verification_id": vid, "sms_ok": ok_sms, "totp_ok": ok_totp, "attempt": tries})
+        if failed:
+            await alert(u, "security", "Failed identity check at the counter",
+                        "Someone could not prove they are you at a ZT-FinGuard counter. Not you? Call us now.", "high")
+        raise HTTPException(401, {"error": "verification failed" + (" - start again" if failed else ""),
+                                  "sms_ok": ok_sms, "totp_ok": ok_totp, "attempts_left": max(0, 3 - tries)})
+    await r.hset(f"tv:{vid}", "passed", level)
+    await _finish_verification(vid, "passed", tries)
+    clients.audit(actor=claims["usr"], action="teller.verify", resource=rec["customer"], decision="allow",
+                  reason=f"customer_verified_{level}", details={"verification_id": vid})
+    await alert(u, "security", "Identity confirmed at the counter",
+                f"You were verified by teller {claims['usr']}. Not you? Report it in Account protection.", "medium")
+    return {"verification_id": vid, "status": "passed", "level": level, "customer": rec["customer"]}
+
+
+class VerifyCheckIn(BaseModel):
+    verification_id: str = Field(max_length=40)
+    customer: str = Field(max_length=40)
+    teller: str = Field(max_length=40)
+
+
+@app.post("/internal/verification/check")
+async def verify_check(body: VerifyCheckIn, _c: str = Depends(mtls.require_caller("transaction", "account", "gateway"))):
+    """Is this a passed, unexpired verification of THIS customer by THIS teller? Returns the level."""
+    rec = await clients.redis().hgetall(f"tv:{body.verification_id}")
+    if not rec or not rec.get("passed") or rec["customer"] != body.customer or rec["teller"] != body.teller:
+        return {"valid": False, "level": None}
+    return {"valid": True, "level": rec["passed"]}
+
+
+@app.get("/teller/verifications", dependencies=[gateway_only])
+async def verification_history(customer: str | None = Query(None, max_length=40), mine: bool = False,
+                               limit: int = Query(200, ge=1, le=1000), authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    require_staff(claims)
+    where, args = ["TRUE"], []
+    if customer:
+        where.append("customer = %s"); args.append(customer)
+    if mine:
+        where.append("teller = %s"); args.append(claims["usr"])
+    p = await db.pool()
+    async with p.connection() as conn:
+        await conn.execute("UPDATE identity_verifications SET status = 'expired' WHERE status = 'started' "
+                           "AND expires_at < now()")
+        await conn.commit()
+        cur = await conn.execute(f"SELECT * FROM identity_verifications WHERE {' AND '.join(where)} "
+                                 "ORDER BY created_at DESC LIMIT %s", (*args, limit))
+        rows = await cur.fetchall()
+    return [{k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()} for r in rows]
+
+
+class ServiceIn(BaseModel):
+    verification_id: str = Field(max_length=40)
+    action: str = Field(pattern=r"^(restore_access|remove_device|end_sessions)$")
+    device_id: int | None = None
+    remarks: str = Field(default="", max_length=200)
+
+
+@app.post("/teller/customers/{username}/service", dependencies=[gateway_only])
+async def teller_service(username: str, body: ServiceIn, authorization: str | None = Header(None)):
+    """Counter requests (recovery, device removal, sign out everywhere) - only with a passed
+    sms+totp verification of this customer by this teller."""
+    claims = caller_claims(authorization)
+    require_staff(claims)
+    v = await verify_check(VerifyCheckIn(verification_id=body.verification_id, customer=username,
+                                         teller=claims["usr"]))
+    if not v["valid"] or v["level"] != "sms+totp":
+        raise HTTPException(403, "verify the customer first (SMS code + authenticator)")
+    u = await get_user(username)
+    if body.action == "restore_access":
+        locked = u["locked_until"] and u["locked_until"] > datetime.now(timezone.utc)
+        if not locked:
+            raise HTTPException(409, "sign-in is not locked")
+        await set_user(u["id"], self_locked=False, locked_until=None, failed_attempts=0)
+        msg = "Sign-in was restored at the counter after your identity was verified."
+    elif body.action == "remove_device":
+        rows = await device_rows(u["id"])
+        dev = next((d for d in rows if d["id"] == body.device_id), None)
+        if dev is None:
+            raise HTTPException(404, "device not found")
+        await set_device_status({"sub": str(u["id"])}, dev["id"], "revoked", "")
+        await revoke_user_sessions(str(u["id"]), "device_removed_at_counter")
+        msg = f"{dev['label']} was removed at the counter and every session ended."
+    else:
+        await revoke_user_sessions(str(u["id"]), "signed_out_at_counter")
+        msg = "Every session was ended at your request at the counter."
+    clients.audit(actor=claims["usr"], action=f"teller.{body.action}", resource=username, decision="alert",
+                  reason=body.action, details={"verification_id": body.verification_id, "device_id": body.device_id,
+                                               "remarks": body.remarks})
+    await alert(u, "security", "Request completed at the counter", msg, "high")
+    return {"done": body.action, "customer": username}
+
+
+@app.get("/me/staff", dependencies=[gateway_only])
+async def my_staff_profile(authorization: str | None = Header(None)):
+    claims = caller_claims(authorization)
+    u = await get_user_by_id(claims["sub"])
+    return {"username": u["username"], "role": u["role"], "employee_id": u.get("employee_id"),
+            "branch": u.get("branch"), "full_name": u.get("full_name") or u["username"],
+            "token": {"issued": claims["iat"], "expires": claims["exp"], "session": (claims.get("sid") or "")[:8],
+                      "methods": claims.get("amr"), "device_bound": bool(claims.get("dfp"))}}
 
 
 @app.get("/healthz")

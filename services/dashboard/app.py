@@ -135,7 +135,8 @@ def detail(r: httpx.Response):
 
 
 STATUS_LABEL = {"completed": "Completed", "denied": "Blocked", "step_up_required": "Extra code needed",
-                "pending_approval": "Waiting for approval", "cancelled": "Cancelled", "rejected": "Rejected"}
+                "pending_approval": "Waiting for approval", "cancelled": "Cancelled", "rejected": "Rejected",
+                "on_hold": "On hold (bank review)", "mfa_requested": "Bank asks you to confirm"}
 
 
 def compact_money(x: float) -> str:
@@ -485,8 +486,11 @@ def sidebar() -> str:
             "customer": ["Dashboard", "My accounts", "Money transfer", "Transaction history", "My devices",
                          "Security center", "AI fraud protection", "Notifications", "Account protection",
                          "My profile", "Customer support"],
-            "teller": ["Account lookup", "Security settings"],
-            "operations": ["Banking & transactions", "Security settings"],
+            "teller": ["Teller dashboard", "Customer lookup", "Identity verification", "Transaction management",
+                       "Transaction approvals", "AI risk assessment", "Transaction history", "Branch operations",
+                       "Teller security center", "Customer support", "Reports & audit history",
+                       "Teller profile & settings"],
+            "operations": ["Banking & transactions", "Transaction approvals", "Security settings"],
             "admin": ["Security overview", "Identity & devices", "AI fraud intelligence", "Container security",
                       "Threat center", "Incident response", "Network visualization", "Policy management",
                       "Audit & compliance", "Access decisions", "Session & device policy",
@@ -1476,8 +1480,7 @@ def identity_logins() -> None:
 
 
 # ------------------------------------------------ module 3: banking helpers
-TX_STATUS = {"completed": "Completed", "denied": "Blocked", "step_up_required": "Extra code needed",
-             "pending_approval": "Waiting for approval", "cancelled": "Cancelled", "rejected": "Rejected"}
+TX_STATUS = STATUS_LABEL
 
 
 def pdf_escape(t: str) -> str:
@@ -1558,7 +1561,19 @@ def receipt_button(tx_id: int, key: str) -> None:
 
 
 def customer_tx_tools(rows: list[dict]) -> None:
-    pending = [x for x in rows if x["status"] == "pending_approval" and x["direction"] == "out"]
+    pending = [x for x in rows if x["status"] in ("pending_approval", "on_hold", "mfa_requested")
+               and x["direction"] == "out"]
+    for x in [x for x in pending if x["status"] == "mfa_requested"]:
+        with st.form(f"confirm_{x['id']}"):
+            st.warning(f"The bank asks you to confirm transfer #{x['id']} of {money(x['amount'])} to "
+                       f"{x['to_account']}. Confirm only if you made it; otherwise cancel it and report fraud.")
+            cd = st.text_input("Authenticator code", max_chars=6, key=f"cfc_{x['id']}")
+            if st.form_submit_button("Confirm it was me", type="primary"):
+                r = api("POST", f"/api/me/transactions/{x['id']}/confirm", json={"totp": cd.strip()})
+                if r is not None and r.status_code == 200:
+                    st.success("Confirmed - back in the approval queue.")
+                    st.rerun()
+                ok_or_error(r, "")
     a, b = st.columns(2)
     with a:
         st.markdown("**Receipt**")
@@ -2380,6 +2395,9 @@ def cp_dashboard() -> None:
     if o["pending_approvals"]:
         alerts.append(f"{o['pending_approvals']} high-value transfer(s) waiting for bank approval "
                       f"({money(o['on_hold'])} on hold).")
+    if o.get("bank_confirmation_requests"):
+        alerts.append(f"The bank asks you to confirm {o['bank_confirmation_requests']} held transfer(s) - open "
+                      "Money transfer → Transfer status & history.")
     if o["verification_requests"]:
         alerts.append(f"{o['verification_requests']} transfer(s) in the last day needed your authenticator code.")
     pend = [d for d in sec["devices"] if d["status"] == "pending"]
@@ -3460,6 +3478,884 @@ def ops_support() -> None:
             result(api("POST", f"/api/ops/tickets/{tk['id']}/reply", json={"message": msg, "status": new}),
                    "Reply sent; the customer was notified.", rerun=True)
 
+# ======================================================================= teller portal
+KIND_LABEL = {"deposit": "Cash deposit", "withdrawal": "Cash withdrawal", "transfer": "Transfer"}
+PURPOSES = {"account_service": "General account service", "deposit": "Cash deposit", "withdrawal": "Cash withdrawal",
+            "transfer": "Transfer", "recovery": "Account recovery", "device_removal": "Device removal",
+            "protection": "Account protection request", "approval": "Confirm a held transaction"}
+
+
+def who(name: str | None) -> str:
+    return "Branch cash" if name == "__branch_cash__" else (name or "-")
+
+
+def staff_tx_frame(rows: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["time"] = local_time(df["created_at"], "%d %b %Y %H:%M")
+    df["from"] = (df["from_name"] if "from_name" in df else df["from_account"]).map(who)
+    df["to"] = (df["to_name"] if "to_name" in df else df["to_account"]).map(who)
+    df["type"] = df["kind"].map(KIND_LABEL).fillna(df["kind"])
+    df["status"] = df["status"].map(STATUS_LABEL).fillna(df["status"])
+    return df
+
+
+def staff_tx_table(rows: list[dict], height: int = 380) -> None:
+    df = staff_tx_frame(rows)
+    if df.empty:
+        st.info("No transactions match.")
+        return
+    cols = ["time", "reference", "type", "channel", "from", "to", "amount", "charges", "status", "risk_score",
+            "initiated_by", "decided_by", "decision_note", "description"]
+    st.dataframe(df[[c for c in cols if c in df]], hide_index=True, use_container_width=True, height=height,
+                 column_config={"amount": st.column_config.NumberColumn("Amount (₹)", format="%.2f"),
+                                "charges": st.column_config.NumberColumn("Charges (₹)", format="%.2f"),
+                                "risk_score": st.column_config.ProgressColumn("Risk", min_value=0, max_value=1,
+                                                                              format="%.2f"),
+                                "decision_note": "remarks"})
+
+
+def verified_customer() -> dict | None:
+    return st.session_state.get("tv_session")
+
+
+def verification_badge() -> None:
+    v = verified_customer()
+    if v:
+        left = int(v["expires_at"] - time.time())
+        if left > 0:
+            st.success(f"Verified customer: **{v['customer']}** ({v['level']}) for {PURPOSES.get(v['purpose'], v['purpose'])}"
+                       f" - valid {left // 60} min {left % 60} s more.")
+            return
+        st.session_state.pop("tv_session", None)
+    st.info("No verified customer at the counter. Withdrawals, transfers and account requests need a verification "
+            "(Identity verification page).")
+
+
+# ---------------------------------------------------------------- 1. dashboard
+def tl_dashboard() -> None:
+    d = cp_json("/api/teller/dashboard")
+    if not d:
+        return
+    s = d["staff"]
+    st.title(f"Good {daypart()}, {s.get('full_name', S().user)}")
+    st.caption(f"{s.get('employee_id', '-')} · {s.get('role', '').title()} · {s.get('branch', '-')}")
+    verification_badge()
+    t, y = d["today"], d["yesterday"]
+    k = st.columns(4)
+    k[0].metric("Today's transactions", t["total"], delta=t["total"] - y["total"])
+    k[1].metric("Completed", t["completed"])
+    k[2].metric("Failed / blocked", t["failed"])
+    k[3].metric("Pending approvals", d["approvals"]["pending"],
+                help=f"{d['approvals']['high_value']} high-value, {d['approvals']['risky']} risky")
+    k = st.columns(4)
+    k[0].metric("High-risk transactions", t["high_risk"])
+    k[1].metric("Customers served today", t["customers_served"], help="distinct customers at the counter")
+    k[2].metric("Daily volume", compact_money(t["volume"]), delta=compact_money(t["volume"] - y["volume"]))
+    k[3].metric("Verifications today", d["verifications_today"])
+    left, right = st.columns([3, 2])
+    with left:
+        st.subheader("Transaction activity today")
+        hr = pd.DataFrame(d["hourly"])
+        if hr.empty:
+            st.caption("No transactions yet today.")
+        else:
+            st.altair_chart(alt.Chart(hr).mark_bar().encode(
+                x=alt.X("hour:O", title="hour (IST)"), y=alt.Y("n:Q", title="transactions"),
+                color=alt.Color("channel:N", scale=alt.Scale(range=["#0B3D4A", "#B8892B"]),
+                                legend=alt.Legend(orient="top", title=None)),
+                tooltip=["hour", "channel", "n", alt.Tooltip("amount:Q", format=",.0f")]).properties(height=220),
+                use_container_width=True)
+        st.subheader("Branch performance (last 7 days)")
+        w = d["week"]
+        c = st.columns(4)
+        c[0].metric("Volume", compact_money(w["volume"]))
+        c[1].metric("Deposits", compact_money(w["deposits"]))
+        c[2].metric("Withdrawals", compact_money(w["withdrawals"]))
+        c[3].metric("Success rate", f"{100 * w['completed'] / max(w['total'], 1):.0f} %")
+        st.subheader("Recent customer activity")
+        staff_tx_table(d["recent_customer"], 300)
+    with right:
+        st.subheader("Quick actions")
+        st.caption("Use the menu: Identity verification → Transaction management (deposit / withdrawal / transfer) "
+                   "→ Transaction approvals.")
+        st.subheader("Pending verification & requests")
+        for v in d["verifications_open"][:5]:
+            st.markdown(f"- {v['customer']} · {PURPOSES.get(v['purpose'], v['purpose'])} · started by {v['teller']} "
+                        f"{when(v['created_at'], '%H:%M')}")
+        for r in d["requests"][:6]:
+            st.markdown(f"- ticket #{r['id']} · {r['owner']} · {r['category']} · {r['subject']}")
+        if not d["verifications_open"] and not d["requests"]:
+            st.caption("Nothing waiting.")
+        st.subheader("Security alerts")
+        if not d["security_alerts"]:
+            st.caption("No high-severity events.")
+        for a in d["security_alerts"][:6]:
+            st.markdown(f"{SEV_ICON.get(a['severity'], '')} {when(a['ts'], '%d %b %H:%M')} · {a['action']} · "
+                        f"{a['actor']} · {a['reason']}")
+        st.subheader("My recent activity")
+        for m in d["recent_mine"][:6]:
+            st.markdown(f"- {when(m['ts'], '%H:%M')} {m['action']} {m['resource']} ({m['decision']})")
+        st.subheader(f"Notifications ({d['notifications']['unread']} unread)")
+        for n in d["notifications"]["items"][:3]:
+            st.markdown(f"{SEV_ICON.get(n['severity'], '')} **{n['title']}** - {n['body']}")
+
+
+# ---------------------------------------------------------------- 2. customer lookup
+def tl_lookup() -> None:
+    st.title("Customer lookup")
+    c = st.columns([3, 1])
+    q = c[0].text_input("Search by name, username, customer id (CUST-3) or account number (ZT1000000003)",
+                        key="tl_q")
+    if c[1].button("Search", type="primary", use_container_width=True) and q.strip():
+        st.session_state["tl_results"] = cp_json("/api/teller/customers", q=q.strip())
+    res = st.session_state.get("tl_results") or []
+    if res:
+        st.dataframe(pd.DataFrame([{k: r[k] for k in ("customer_id", "username", "full_name", "account_no", "mobile",
+                                                      "kyc_status", "locked")} for r in res]),
+                     hide_index=True, use_container_width=True)
+        pick = st.selectbox("Open customer", [r["username"] for r in res])
+        if st.button("View profile"):
+            st.session_state["tl_customer"] = pick
+    name = st.session_state.get("tl_customer")
+    if name:
+        customer_360(name)
+
+
+def customer_360(name: str) -> None:
+    d = cp_json(f"/api/teller/customers/{name}")
+    if not d:
+        return
+    cu, ac = d["customer"], d["account"]
+    st.subheader(f"{cu['full_name']} · {cu['customer_id']}")
+    risk_icon = {"normal": "🟢", "elevated": "🟡", "high": "🔴"}.get(ac["risk_status"], "")
+    k = st.columns(4)
+    k[0].metric("Account", ac["masked"], help=ac["account_no"])
+    k[1].metric("Type / status", f"{ac['type']} · {ac['status']}")
+    k[2].metric("Available balance", money(ac["available"]))
+    k[3].metric("Risk status", f"{risk_icon} {ac['risk_status']}")
+    for r in ac["restrictions"]:
+        st.warning(f"Restriction: {r}")
+    if cu["locked"]:
+        st.error("Sign-in is locked" + (" (customer lockdown)" if cu["self_locked"] else ""))
+    t = st.tabs(["Profile", "Transactions", "Login activity", "Devices", "Suspicious activity", "Complaints",
+                 "Verifications"])
+    with t[0]:
+        st.dataframe(pd.DataFrame([
+            ("Customer id", cu["customer_id"]), ("Username", cu["username"]), ("Full name", cu["full_name"]),
+            ("Account number", f"{ac['masked']} (full: {ac['account_no']})"), ("Account type", ac["type"]),
+            ("Account status", ac["status"]), ("KYC / verification", cu["kyc_status"]),
+            ("Registered mobile", cu["mobile"] or "-"),
+            ("Registered e-mail", (cu["email"] or "not added") + (" (verified)" if cu["email_verified"] else "")),
+            ("Customer since", when(cu["customer_since"], "%d %b %Y")), ("Daily limit", money(ac["daily_limit"])),
+            ("Sent today", money(ac["used_today"])), ("Failed sign-ins", cu["failed_attempts"]),
+            ("Restrictions", "; ".join(ac["restrictions"]) or "none")], columns=["", " "]), hide_index=True,
+            use_container_width=True)
+        st.caption("Contact details are masked (least privilege). Confirm them with the customer, never read them out.")
+    with t[1]:
+        staff_tx_table(d["transactions"], 320)
+    with t[2]:
+        lg = pd.DataFrame(d["logins"])
+        if lg.empty:
+            st.caption("No sign-ins.")
+        else:
+            lg["time"] = local_time(lg["ts"], "%d %b %Y %H:%M")
+            st.dataframe(lg[["time", "decision", "reason", "ip", "device", "risk"]], hide_index=True,
+                         use_container_width=True)
+    with t[3]:
+        dv = pd.DataFrame(cu.get("devices") or [])
+        if dv.empty:
+            st.caption("No devices.")
+        else:
+            st.dataframe(dv[["id", "label", "type", "os", "status", "last_ip", "last_seen"]], hide_index=True,
+                         use_container_width=True)
+    with t[4]:
+        al = pd.DataFrame(d["alerts"])
+        if al.empty:
+            st.success("No suspicious activity.")
+        else:
+            al["time"] = local_time(al["ts"], "%d %b %Y %H:%M")
+            st.dataframe(al[["time", "action", "decision", "reason", "severity", "risk"]], hide_index=True,
+                         use_container_width=True)
+    with t[5]:
+        tk = pd.DataFrame(ac["tickets"])
+        if not tk.empty:
+            st.dataframe(tk, hide_index=True, use_container_width=True)
+        else:
+            st.caption("No complaints.")
+    with t[6]:
+        vf = pd.DataFrame(d["verifications"])
+        if vf.empty:
+            st.caption("Never verified at a counter.")
+        else:
+            st.dataframe(vf[["created_at", "teller", "purpose", "required", "status", "attempts"]], hide_index=True,
+                         use_container_width=True)
+
+
+# ---------------------------------------------------------------- 3. identity verification
+def tl_verify() -> None:
+    st.title("Identity verification")
+    st.caption("Zero Trust at the counter: the customer proves who they are with an SMS code sent to the "
+               "registered mobile; money leaving the account and account requests also need the customer's "
+               "authenticator code. Every attempt is recorded; 3 failures end the verification and alert the customer.")
+    verification_badge()
+    t = st.tabs(["Verify a customer", "Verification history"])
+    with t[0]:
+        cur = st.session_state.get("tv_pending")
+        if not cur:
+            with st.form("tv_start"):
+                c = st.columns(2)
+                cust = c[0].text_input("Customer username", value=st.session_state.get("tl_customer", ""))
+                purpose = c[1].selectbox("Purpose", list(PURPOSES), format_func=PURPOSES.get)
+                if st.form_submit_button("Run checks and send SMS code", type="primary"):
+                    r = api("POST", "/api/teller/verify", json={"customer": cust.strip(), "purpose": purpose})
+                    if r is not None and r.status_code == 200:
+                        st.session_state["tv_pending"] = r.json() | {"purpose": purpose}
+                        st.rerun()
+                    ok_or_error(r, "")
+        else:
+            ch = cur["checks"]
+            st.markdown(f"**{cur['customer']}** · {PURPOSES[cur['purpose']]} · code sent to {cur['sent_to']} · "
+                        f"needs **{cur['required']}**")
+            rows = [("Registered mobile", ch["registered_mobile"], True),
+                    ("Account status", ch.get("account_status"), ch.get("account_status") == "active"),
+                    ("Account restrictions", "; ".join(ch.get("restrictions") or []) or "none",
+                     not ch.get("restrictions")),
+                    ("Sign-in locked", "yes" if ch["sign_in_locked"] else "no", not ch["sign_in_locked"]),
+                    ("Trusted devices", ch["trusted_devices"], ch["trusted_devices"] > 0),
+                    ("Devices waiting for approval", ch["pending_devices"], ch["pending_devices"] == 0),
+                    ("Suspicious sign-ins (7 days)", ch.get("suspicious_logins_7d", 0), not ch.get("suspicious_logins_7d")),
+                    ("Risk status", ch.get("risk_status"), ch.get("risk_status") == "normal"),
+                    ("E-mail verified", "yes" if ch["email_verified"] else "no", True),
+                    ("KYC", ch["kyc_status"], ch["kyc_status"] == "verified")]
+            st.dataframe(pd.DataFrame([{"check": a, "result": str(b), "": "✅" if ok else "⚠️"} for a, b, ok in rows]),
+                         hide_index=True, use_container_width=True)
+            with st.form("tv_done"):
+                c = st.columns(2)
+                sms_c = c[0].text_input("SMS code the customer received", max_chars=6)
+                totp = c[1].text_input("Customer's authenticator code", max_chars=6,
+                                       disabled=cur["required"] == "sms") if cur["required"] != "sms" else ""
+                b = st.columns(2)
+                ok = b[0].form_submit_button("Verify", type="primary")
+                cancel = b[1].form_submit_button("Reject / cancel")
+            if ok:
+                r = api("POST", f"/api/teller/verify/{cur['verification_id']}",
+                        json={"sms_code": sms_c.strip(), "totp": (totp or "").strip() or None})
+                if r is not None and r.status_code == 200:
+                    st.session_state["tv_session"] = {"verification_id": cur["verification_id"],
+                                                      "customer": cur["customer"], "level": r.json()["level"],
+                                                      "purpose": cur["purpose"], "expires_at": time.time() + 600}
+                    st.session_state.pop("tv_pending", None)
+                    st.rerun()
+                else:
+                    ok_or_error(r, "")
+            if cancel:
+                st.session_state.pop("tv_pending", None)
+                st.rerun()
+            st.caption("The customer reads the code from their own phone (demo: customer portal → Notifications → "
+                       "Phone & e-mail, or the SMS inbox on the sign-in page).")
+    with t[1]:
+        mine = st.toggle("Only my verifications", value=False)
+        v = cp_json("/api/teller/verifications", mine=str(mine).lower()) or []
+        df = pd.DataFrame(v)
+        if df.empty:
+            st.caption("No verifications yet.")
+        else:
+            df["time"] = local_time(df["created_at"], "%d %b %Y %H:%M")
+            k = st.columns(3)
+            k[0].metric("Verifications", len(df))
+            k[1].metric("Passed", int((df["status"] == "passed").sum()))
+            k[2].metric("Failed", int((df["status"] == "failed").sum()))
+            st.dataframe(df[["time", "customer", "teller", "purpose", "required", "status", "attempts", "id"]],
+                         hide_index=True, use_container_width=True)
+
+
+# ---------------------------------------------------------------- 4. transaction management
+def tl_transactions() -> None:
+    st.title("Transaction management")
+    verification_badge()
+    v = verified_customer()
+    t = st.tabs(["New counter transaction", "Status & cancel", "History"])
+    with t[0]:
+        draft = st.session_state.get("tl_draft")
+        if draft is None:
+            with st.form("tl_tx"):
+                c = st.columns(3)
+                kind = c[0].selectbox("Transaction", list(KIND_LABEL), format_func=KIND_LABEL.get)
+                acct = c[1].text_input("Customer account number", placeholder="ZT10000000xx")
+                amt = c[2].number_input("Amount (₹)", min_value=1.0, value=1000.0, step=500.0)
+                c = st.columns(3)
+                to = c[0].text_input("Payee account (transfer only)", placeholder="ZT10000000xx")
+                method = c[1].selectbox("Method (transfer)", list(METHOD_LABEL), format_func=METHOD_LABEL.get)
+                desc = c[2].text_input("Description", max_chars=60)
+                if st.form_submit_button("Review", type="primary"):
+                    st.session_state["tl_draft"] = {"kind": kind, "account_no": acct.strip().upper(),
+                                                    "amount": round(float(amt), 2), "to_account": to.strip().upper() or None,
+                                                    "method": method, "description": desc.strip() or None}
+                    st.rerun()
+        else:
+            q = cp_json("/api/teller/quote", account_no=draft["account_no"], amount=draft["amount"],
+                        method=draft["method"], kind=draft["kind"])
+            if q:
+                ch = q["checks"]
+                rows = [("Transaction", KIND_LABEL[draft["kind"]]), ("Customer account", draft["account_no"]),
+                        ("Amount", money(draft["amount"])), ("Charges", money(q["charges"])),
+                        ("Total debit" if draft["kind"] != "deposit" else "Credit", money(q["total"] if draft["kind"] != "deposit" else draft["amount"])),
+                        ("Available balance", money(ch["available"])), ("Daily limit left", money(ch["daily_limit_left"])),
+                        ("Customer code needed", ch["customer_code_needed"]),
+                        ("Second approval", "yes" + (" (dual control: 2 approvers)" if ch["dual_control"] else "")
+                         if ch["needs_approval"] else "no")]
+                if draft["kind"] == "transfer":
+                    rows.insert(2, ("Payee", f"{draft['to_account']} by {METHOD_LABEL[draft['method']]}"))
+                st.dataframe(pd.DataFrame(rows, columns=["", " "]), hide_index=True, use_container_width=True)
+                probs = [m for k2, m in (("account_active", "the account is frozen"),
+                                         ("transfers_enabled", "the customer switched outgoing transfers off"),
+                                         ("enough_balance", "not enough available balance"),
+                                         ("within_daily_limit", "above the customer's daily limit"),
+                                         ("teller_device_trusted", "your device is not trusted")) if not ch[k2]]
+                if q.get("error"):
+                    probs.append(q["error"])
+                needs_v = draft["kind"] != "deposit"
+                if needs_v and not (v and v["customer"] and v["level"] == "sms+totp"):
+                    probs.append("verify the customer (SMS + authenticator) first")
+                for p in probs:
+                    st.error(p)
+                c = st.columns(2)
+                if c[0].button("Confirm transaction", type="primary", disabled=bool(probs), use_container_width=True):
+                    body = {k: draft[k] for k in ("account_no", "amount", "to_account", "method", "description")}
+                    if v:
+                        body["verification_id"] = v["verification_id"]
+                    r = api("POST", f"/api/teller/transactions/{draft['kind']}", json=body)
+                    st.session_state["tl_last"] = (r.status_code, r.json()) if r is not None else None
+                    st.session_state.pop("tl_draft", None)
+                    st.rerun()
+                if c[1].button("Edit", use_container_width=True):
+                    st.session_state.pop("tl_draft", None)
+                    st.rerun()
+        last = st.session_state.get("tl_last")
+        if last:
+            code, d = last
+            dec = d.get("decision", "error")
+            st.markdown(f"#### Result {pill(dec)}", unsafe_allow_html=True)
+            if dec == "allow":
+                st.success(f"{KIND_LABEL.get(d['kind'], d['kind'])} completed - transaction #{d['transaction_id']}.")
+                receipt_button(d["transaction_id"], f"tl_rcpt_{d['transaction_id']}")
+            elif dec == "pending_approval":
+                st.info(f"Transaction #{d['transaction_id']} needs approval by another officer (maker-checker).")
+            elif dec == "deny":
+                st.error("Refused by policy: " + ", ".join(d.get("reasons", [])))
+            else:
+                st.error(str(d.get("detail", d)))
+            if "risk" in d:
+                st.caption(f"Risk {d['risk']['score']:.2f} ({d['risk']['level']})")
+                show_reasons(d["risk"])
+    with t[1]:
+        rows = cp_json("/api/teller/transactions", status="pending", limit=200) or []
+        staff_tx_table(rows, 260)
+        cancellable = [r for r in rows if r["status"] in ("pending_approval", "on_hold", "mfa_requested")]
+        if cancellable:
+            with st.form("tl_cancel"):
+                pick = st.selectbox("Cancel an eligible pending transaction",
+                                    [f"#{r['id']} {who(r['from_name'])} {money(r['amount'])}" for r in cancellable])
+                note = st.text_input("Reason", max_chars=200)
+                if st.form_submit_button("Cancel transaction"):
+                    tid = int(pick.split()[0][1:])
+                    result(api("POST", f"/api/transactions/{tid}/cancel", json={"note": note or "cancelled at counter"}),
+                           "Cancelled. No money moved.", rerun=True)
+    with t[2]:
+        rows = cp_json("/api/teller/transactions", channel="branch", limit=300) or []
+        staff_tx_table(rows, 380)
+        if rows:
+            pick = st.selectbox("Receipt for", [f"#{r['id']} {r['reference']}" for r in rows])
+            receipt_button(int(pick.split()[0][1:]), "tl_hist_rcpt")
+
+
+# ---------------------------------------------------------------- 5. approvals
+def tl_approvals() -> None:
+    st.title("Transaction approvals")
+    st.caption("Maker-checker with dual control (policy-as-code): whoever started a transaction can never approve "
+               "it; ₹1 lakh+ or medium/high risk needs two different approvers (teller and operations, or two "
+               "tellers). Money moves only on the last required approval.")
+    d = cp_json("/api/teller/approvals")
+    if not d:
+        return
+    q = d["queue"]
+    k = st.columns(4)
+    k[0].metric("Waiting", len(q))
+    k[1].metric("High value (₹50k+)", sum(1 for x in q if x["amount"] >= 50000))
+    k[2].metric("Suspicious (medium/high risk)", sum(1 for x in q if x["risk_level"] != "low"))
+    k[3].metric("Waiting for customer MFA", sum(1 for x in q if x["status"] == "mfa_requested"))
+    t = st.tabs(["Queue", "Decision history"])
+    with t[0]:
+        if not q:
+            st.success("Nothing waiting for approval.")
+        for x in q:
+            mine = x.get("initiated_by") == d["me"]
+            ai = x.get("ai") or {}
+            with st.container(border=True):
+                st.markdown(f"**#{x['id']} · {KIND_LABEL.get(x['kind'], x['kind'])} · {money(x['amount'])}** "
+                            f"{who(x['from_name'])} → {who(x['to_name'])} · {x['channel']} · "
+                            f"<span class='zt-pill zt-{'high' if x['risk_level'] == 'high' else 'medium' if x['risk_level'] == 'medium' else 'low'}'>"
+                            f"risk {x['risk_score'] if x['risk_score'] is not None else '-'} {x['risk_level']}</span> · "
+                            f"status **{STATUS_LABEL.get(x['status'], x['status'])}** · approvals {x['approvals']}/{x['required']}",
+                            unsafe_allow_html=True)
+                st.caption(f"{x['reference']} · {when(x['created_at'])} · started by {x.get('initiated_by') or x['customer']}"
+                           + (f" · customer verified at counter: {ai.get('verification')}" if ai.get("verification") else "")
+                           + (f" · device {ai.get('device_trust')}" if ai.get("device_trust") else ""))
+                why = [r for r in ai.get("reasons", []) if r]
+                if why:
+                    st.markdown("AI reasons: " + "; ".join(why))
+                if x["decisions"]:
+                    st.markdown("Decisions: " + "; ".join(f"{z['approver']} ({z['role']}) {z['decision']}"
+                                                          + (f" - {z['remarks']}" if z.get('remarks') else "")
+                                                          for z in x["decisions"]))
+                if mine:
+                    st.warning("You started this transaction - you cannot approve it (maker-checker).")
+                with st.form(f"ap_{x['id']}"):
+                    rem = st.text_input("Remarks", max_chars=200, key=f"rem_{x['id']}")
+                    c = st.columns(5)
+                    acts = {"approve": c[0].form_submit_button("Approve", type="primary", disabled=mine
+                                                                or x["status"] == "mfa_requested"),
+                            "reject": c[1].form_submit_button("Reject"),
+                            "hold": c[2].form_submit_button("Hold", disabled=x["status"] == "on_hold"),
+                            "release": c[3].form_submit_button("Release hold", disabled=x["status"] != "on_hold"),
+                            "request_mfa": c[4].form_submit_button("Request customer MFA",
+                                                                   disabled=x["channel"] != "online")}
+                for op, pressed in acts.items():
+                    if pressed:
+                        r = api("POST", f"/api/teller/approvals/{x['id']}/{op}", json={"note": rem})
+                        if r is not None and r.status_code == 200:
+                            st.success(f"{op}: {r.json().get('status')}"
+                                       + (f" ({r.json()['approvals']}/{r.json()['required']} approvals)"
+                                          if op == "approve" else ""))
+                            st.rerun()
+                        ok_or_error(r, "")
+    with t[1]:
+        h = pd.DataFrame(d["history"])
+        if h.empty:
+            st.caption("No decisions yet.")
+        else:
+            h["time"] = local_time(h["created_at"], "%d %b %Y %H:%M:%S")
+            st.dataframe(h[["time", "tx_id", "approver", "role", "decision", "remarks", "amount", "kind", "tx_status",
+                            "initiated_by"]], hide_index=True, use_container_width=True, height=420)
+
+
+# ---------------------------------------------------------------- 6. AI risk
+def tl_risk() -> None:
+    st.title("AI risk assessment")
+    days = st.selectbox("Period", [1, 7, 30, 90], index=1, format_func=lambda d: f"last {d} day(s)")
+    d = cp_json("/api/teller/risk", days=days)
+    if not d:
+        return
+    items = d["items"]
+    k = st.columns(4)
+    k[0].metric("Transactions scored", len(items))
+    k[1].metric("Flagged", len(d["flagged"]))
+    k[2].metric("Blocked", sum(1 for i in items if i["decision"] == "deny"))
+    k[3].metric("High-risk accounts", len(d["accounts"]))
+    t = st.tabs(["Warnings", "All scores", "High-risk accounts", "Login anomalies", "False positives"])
+    with t[0]:
+        for i in d["flagged"][:40]:
+            with st.container(border=True):
+                st.markdown(f"{pill(i['decision'])} **{i['customer']}** · {money(i['amount'] or 0)} → {i['to']} · "
+                            f"{i['channel']} · risk **{(i['risk'] or 0):.2f}** · fraud probability "
+                            f"**{(i['probability'] or 0):.2f}** <span class='zt-muted'>{when(i['ts'])}</span>",
+                            unsafe_allow_html=True)
+                if i["warnings"]:
+                    st.markdown("Warnings: " + ", ".join(i["warnings"]))
+                if i["reasons"]:
+                    st.markdown("AI explanation: " + "; ".join(r for r in i["reasons"] if r))
+                st.markdown("Recommended: " + "; ".join(i["recommended"]))
+    with t[1]:
+        df = pd.DataFrame(items)
+        if not df.empty:
+            df["time"] = local_time(df["ts"], "%d %b %H:%M")
+            df["warnings"] = df["warnings"].apply(", ".join)
+            st.dataframe(df[["time", "customer", "channel", "amount", "decision", "risk", "probability", "warnings",
+                             "tx_id"]], hide_index=True, use_container_width=True, height=420,
+                         column_config={"risk": st.column_config.ProgressColumn("Risk", min_value=0, max_value=1,
+                                                                                format="%.2f")})
+    with t[2]:
+        if d["accounts"]:
+            st.dataframe(pd.DataFrame(d["accounts"]), hide_index=True, use_container_width=True)
+        else:
+            st.success("No high-risk accounts.")
+    with t[3]:
+        lg = pd.DataFrame(d["logins"])
+        if lg.empty:
+            st.caption("No anomalies.")
+        else:
+            lg["time"] = local_time(lg["ts"], "%d %b %H:%M")
+            lg["reasons"] = lg["reasons"].apply(lambda r: "; ".join(x for x in r if x))
+            st.dataframe(lg[["time", "customer", "decision", "reason", "ip", "new_device", "risk", "reasons"]],
+                         hide_index=True, use_container_width=True)
+    with t[4]:
+        with st.form("fp"):
+            ids = [i["tx_id"] for i in d["flagged"] if i.get("tx_id")]
+            tx = st.selectbox("Flagged transaction", ids or [0], format_func=lambda v: f"#{v}")
+            note = st.text_input("Why do you think it is a false positive?", max_chars=300)
+            if st.form_submit_button("Report false positive") and ids:
+                result(api("POST", "/api/teller/risk/false-positive", json={"tx_id": tx, "note": note}),
+                       "Reported to the security team.")
+        fp = pd.DataFrame(d["false_positive_reports"])
+        if not fp.empty:
+            st.dataframe(fp, hide_index=True, use_container_width=True)
+
+
+# ---------------------------------------------------------------- 7. transaction history
+def tl_history() -> None:
+    st.title("Customer transaction history")
+    c = st.columns(4)
+    acct = c[0].text_input("Customer account", placeholder="ZT10000000xx").strip().upper()
+    txid = c[1].number_input("Transaction id", min_value=0, value=0, step=1)
+    kind = c[2].selectbox("Type", ["All"] + list(KIND_LABEL), format_func=lambda x: KIND_LABEL.get(x, x))
+    status = c[3].selectbox("Status", ["All", "completed", "failed", "pending", "rejected", "denied",
+                                       "pending_approval", "on_hold", "mfa_requested", "cancelled"],
+                            format_func=lambda x: STATUS_LABEL.get(x, x.title()))
+    c = st.columns(4)
+    f = c[0].date_input("From", value=None, key="tlh_f")
+    to = c[1].date_input("To", value=None, key="tlh_t")
+    lo = c[2].number_input("Min ₹", min_value=0.0, value=0.0, step=500.0)
+    hi = c[3].number_input("Max ₹ (0 = any)", min_value=0.0, value=0.0, step=500.0)
+    params = {"account": acct, "tx_id": int(txid) or "", "kind": "" if kind == "All" else kind,
+              "status": "" if status == "All" else status, "date_from": str(f) if f else "",
+              "date_to": str(to) if to else "", "min_amount": lo or "", "max_amount": hi or "", "limit": 500}
+    params = {k: v for k, v in params.items() if v != ""}
+    rows = cp_json("/api/teller/transactions", **params) or []
+    k = st.columns(4)
+    k[0].metric("Transactions", len(rows))
+    k[1].metric("Completed", sum(1 for r in rows if r["status"] == "completed"))
+    k[2].metric("Failed / rejected", sum(1 for r in rows if r["status"] in ("denied", "rejected", "cancelled")))
+    k[3].metric("Pending", sum(1 for r in rows if r["status"] in ("pending_approval", "on_hold", "mfa_requested")))
+    staff_tx_table(rows, 420)
+    c = st.columns(3)
+    x = api("GET", "/api/teller/transactions", params=params | {"format": "csv"})
+    if x is not None and x.status_code == 200:
+        c[0].download_button("Export CSV", x.content, file_name="customer-transactions.csv", mime="text/csv",
+                             use_container_width=True)
+    if rows:
+        df = staff_tx_frame(rows)
+        pdf_rows = [("Filters", ", ".join(f"{k}={v}" for k, v in params.items()) or "none"),
+                    ("Transactions", str(len(rows)))] + [
+            (r["time"], f"{r['reference']} {r['type']} {who(r['from_name'])}->{who(r['to_name'])} "
+                        f"{money(r['amount'])} {r['status']}") for r in df.to_dict("records")[:60]]
+        c[1].download_button("Customer report (PDF)", simple_pdf("Customer transaction report", pdf_rows,
+                                                                 f"Generated by {S().user}"),
+                             file_name="customer-report.pdf", mime="application/pdf", use_container_width=True)
+        pick = c[2].selectbox("Receipt", [f"#{r['id']} {r['reference']}" for r in rows], label_visibility="collapsed")
+        receipt_button(int(pick.split()[0][1:]), "tlh_rcpt")
+
+
+# ---------------------------------------------------------------- 8. branch operations
+def tl_branch() -> None:
+    st.title("Branch operations")
+    today = datetime.now().date()
+    c = st.columns(2)
+    f = c[0].date_input("From", value=today, key="br_f")
+    to = c[1].date_input("To", value=today, key="br_t")
+    d = cp_json("/api/teller/branch", date_from=str(f), date_to=str(to))
+    if not d:
+        return
+    t = d["totals"]
+    st.caption(f"{d['branch']} · IFSC {d['ifsc']} · branch {d['status']['branch']} · core services "
+               f"{'healthy' if d['status']['services_ok'] else 'DEGRADED'} · cash in vault {money(d['vault_balance'] or 0)}")
+    k = st.columns(5)
+    k[0].metric("Transactions", t["total"])
+    k[1].metric("Volume", compact_money(t["volume"]))
+    k[2].metric("Deposits", compact_money(t["deposits"]))
+    k[3].metric("Withdrawals", compact_money(t["withdrawals"]))
+    k[4].metric("Fund transfers", compact_money(t["transfers"]))
+    k = st.columns(5)
+    k[0].metric("Pending", t["pending"])
+    k[1].metric("Failed", t["failed"])
+    k[2].metric("High risk", t["high_risk"])
+    k[3].metric("Counter customers", t["customers_served"])
+    k[4].metric("Verifications", f"{d['verifications']['passed']}/{d['verifications']['total']} passed")
+    tabs = st.tabs(["Volume", "Teller activity", "Customer activity", "Security alerts", "Limits"])
+    with tabs[0]:
+        dd = pd.DataFrame(d["daily"])
+        if not dd.empty:
+            st.altair_chart(alt.Chart(dd[dd["status"] == "completed"]).mark_bar().encode(
+                x=alt.X("day:N", title=None), y=alt.Y("amount:Q", title="₹"),
+                color=alt.Color("kind:N", scale=alt.Scale(range=["#0B3D4A", "#B8892B", "#2E7D5B"]),
+                                legend=alt.Legend(orient="top", title=None)),
+                tooltip=["day", "kind", "n", alt.Tooltip("amount:Q", format=",.0f")]).properties(height=260),
+                use_container_width=True)
+        else:
+            st.caption("No transactions in this period.")
+    with tabs[1]:
+        if d["tellers"]:
+            st.dataframe(pd.DataFrame(d["tellers"]), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No counter transactions.")
+        if d["approvals"]:
+            st.dataframe(pd.DataFrame(d["approvals"]), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No approval decisions.")
+    with tabs[2]:
+        staff_tx_table(d["transactions"][:200], 380)
+    with tabs[3]:
+        al = pd.DataFrame(d["security_alerts"])
+        if al.empty:
+            st.success("No high-severity branch events.")
+        else:
+            al["time"] = local_time(al["ts"], "%d %b %H:%M")
+            st.dataframe(al[["time", "actor", "action", "decision", "reason", "severity"]], hide_index=True,
+                         use_container_width=True)
+    with tabs[4]:
+        rows = cp_json("/api/teller/transactions", status="pending", limit=200) or []
+        st.markdown(f"**{len(rows)} pending branch transactions** - money is held against the daily limits.")
+        st.caption("Daily limits are per account (default ₹1,00,000) and count completed + held money; "
+                   "Operations changes them under Banking & transactions.")
+
+
+# ---------------------------------------------------------------- 9. teller security
+def tl_security() -> None:
+    st.title("Teller security center")
+    me_ = cp_json("/api/teller/me")
+    sec = cp_json("/api/me/security")
+    if not (me_ and sec):
+        return
+    tok = me_["token"]
+    k = st.columns(4)
+    k[0].metric("MFA", "on (" + "+".join(tok.get("methods") or []) + ")")
+    k[1].metric("This device", me_["device_trust"])
+    k[2].metric("Token expires", datetime.fromtimestamp(tok["expires"]).strftime("%H:%M:%S"),
+                help="15-minute RS256 access token, bound to this device; refreshed while you work")
+    k[3].metric("Idle sign-out in", f"{(me_.get('session_seconds_left') or 0) // 60} min")
+    t = st.tabs(["Sessions & JWT", "Login history", "Devices", "Alerts", "Activity log", "Permissions",
+                 "Timeout & alerts"])
+    with t[0]:
+        st.markdown(f"Session `{tok['session']}`, device-bound: {tok['device_bound']}, issued "
+                    f"{datetime.fromtimestamp(tok['issued']).strftime('%H:%M:%S')}.")
+        sessions_panel(sec["sessions"])
+        if st.button("Force logout from this session"):
+            api("POST", "/api/auth/logout", json={"refresh_token": S().refresh})
+            end_session("Signed out. Your token was revoked on the server.")
+            st.rerun()
+    with t[1]:
+        lg = pd.DataFrame(sec["logins"])
+        if not lg.empty:
+            lg["time"] = local_time(lg["ts"], "%d %b %Y %H:%M")
+            st.dataframe(lg[["time", "decision", "reason", "ip", "device", "risk"]], hide_index=True,
+                         use_container_width=True)
+        if sec["suspicious_logins"]:
+            st.warning(f"{len(sec['suspicious_logins'])} suspicious sign-in attempt(s) on your teller account.")
+    with t[2]:
+        dv = pd.DataFrame(sec["devices"])
+        if not dv.empty:
+            st.dataframe(dv[["label", "type", "os", "status", "last_ip", "last_seen", "current"]], hide_index=True,
+                         use_container_width=True)
+        st.caption("Counter transactions are refused from an untrusted device. Approve new devices from a trusted one "
+                   "(same flow as customers).")
+    with t[3]:
+        ev = await_free_alerts()
+        if not ev.empty:
+            st.dataframe(ev, hide_index=True, use_container_width=True)
+        else:
+            st.success( "No unauthorised-access alerts.")
+    with t[4]:
+        ev = pd.DataFrame(sec["events"])
+        acts = cp_json("/api/teller/reports", date_from=str(datetime.now().date().replace(day=1)),
+                       date_to=str(datetime.now().date())) or {}
+        my = pd.DataFrame(acts.get("my_actions", []))
+        if not my.empty:
+            my["time"] = local_time(my["ts"], "%d %b %H:%M:%S")
+            st.dataframe(my[["time", "action", "resource", "decision", "reason"]], hide_index=True,
+                         use_container_width=True, height=380)
+    with t[5]:
+        st.markdown(f"Role **{S().role}** - permissions granted by the OPA policy:")
+        st.dataframe(pd.DataFrame({"permission": me_["permissions"]}), hide_index=True, use_container_width=True)
+        st.caption("Not permitted: security administration, policy changes, approving your own transactions, moving "
+                   "a customer's money without their SMS + authenticator verification.")
+        p = sec["profile"]
+        st.markdown(f"Account restrictions: {'locked' if p.get('locked') else 'none'}.")
+    with t[6]:
+        timeout_panel()
+        prefs_panel(only=("login_alerts", "transaction_alerts", "mfa_alerts", "support_alerts"))
+
+
+def await_free_alerts() -> pd.DataFrame:
+    sec = cp_json("/api/me/security") or {}
+    ev = pd.DataFrame([e for e in sec.get("events", []) + sec.get("suspicious_logins", [])
+                       if e.get("decision") in ("deny", "alert", "step_up")])
+    if not ev.empty:
+        ev["time"] = local_time(ev["ts"], "%d %b %H:%M")
+        ev = ev[["time", "action", "decision", "reason"]] if "action" in ev else ev
+    return ev
+
+
+# ---------------------------------------------------------------- 10. customer support
+def tl_support() -> None:
+    st.title("Customer support & requests")
+    verification_badge()
+    t = st.tabs(["Requests & complaints", "Create ticket / escalate", "Counter requests"])
+    with t[0]:
+        c = st.columns(2)
+        q = c[0].text_input("Search complaints (customer, subject, id)")
+        stt = c[1].selectbox("Status", ["all", "open", "in_progress", "resolved", "closed"])
+        tickets = cp_json("/api/ops/tickets", **({"q": q} if q else {}), **({} if stt == "all" else {"status": stt})) or []
+        if not tickets:
+            st.caption("No tickets.")
+        else:
+            st.dataframe(pd.DataFrame([{"id": x["id"], "customer": x["owner"], "category": x["category"],
+                                        "priority": x["priority"], "status": x["status"], "subject": x["subject"],
+                                        "opened": when(x["created_at"], "%d %b %H:%M"),
+                                        "by": x.get("created_by") or "customer"} for x in tickets]),
+                         hide_index=True, use_container_width=True)
+            tk = {f"#{x['id']} {x['owner']}: {x['subject']}": x for x in tickets}[
+                st.selectbox("Ticket", [f"#{x['id']} {x['owner']}: {x['subject']}" for x in tickets])]
+            st.markdown(tk["body"])
+            for rsp in tk["responses"]:
+                st.markdown(f"<div class='zt-card'><b>{rsp['by']}</b> <span class='zt-muted'>{when(rsp['at'])}</span>"
+                            f"<br>{rsp['message']}</div>", unsafe_allow_html=True)
+            with st.form("tl_reply"):
+                msg = st.text_area("Remark / reply to the customer (the customer is notified)", max_chars=2000)
+                new = st.selectbox("Status", ["in_progress", "resolved", "closed", "open"])
+                if st.form_submit_button("Update", type="primary"):
+                    result(api("POST", f"/api/ops/tickets/{tk['id']}/reply", json={"message": msg, "status": new}),
+                           "Updated; the customer was notified.", rerun=True)
+    with t[1]:
+        with st.form("tl_ticket"):
+            c = st.columns(2)
+            cust = c[0].text_input("Customer username", value=st.session_state.get("tl_customer", ""))
+            cat = c[1].selectbox("Category", ["general", "fraud", "access", "device", "recovery", "investigation",
+                                              "protection"])
+            subj = st.text_input("Subject", max_chars=120)
+            body = st.text_area("Details", max_chars=2000)
+            c = st.columns(2)
+            txid = c[0].number_input("Transaction id (optional)", min_value=0, value=0, step=1)
+            esc = c[1].checkbox("Escalate as suspicious to the security team")
+            if st.form_submit_button("Create ticket", type="primary"):
+                result(api("POST", "/api/ops/tickets", json={"customer": cust.strip(), "category": cat, "subject": subj,
+                                                             "body": body, "tx_id": int(txid) or None, "escalate": esc}),
+                       "Ticket created" + (" and escalated" if esc else "") + ".")
+    with t[2]:
+        v = verified_customer()
+        if not (v and v["level"] == "sms+totp"):
+            st.info("Verify the customer with SMS code + authenticator first (Identity verification).")
+            return
+        d = cp_json(f"/api/teller/customers/{v['customer']}")
+        if not d:
+            return
+        st.markdown(f"Serving **{v['customer']}** ({d['account']['account_no']}).")
+        with st.form("tl_service"):
+            what = st.selectbox("Request", ["restore_access", "end_sessions", "remove_device", "freeze", "unfreeze",
+                                            "disable_transfers", "enable_transfers"],
+                                format_func={"restore_access": "Account recovery: restore sign-in",
+                                             "end_sessions": "Sign out all sessions",
+                                             "remove_device": "Remove a registered device",
+                                             "freeze": "Freeze the account", "unfreeze": "Unfreeze (customer freeze only)",
+                                             "disable_transfers": "Switch outgoing transfers off",
+                                             "enable_transfers": "Switch outgoing transfers on"}.get)
+            devs = d["customer"].get("devices") or []
+            dev = st.selectbox("Device (for removal)", [None] + [x["id"] for x in devs],
+                               format_func=lambda i: "-" if i is None else next(f"#{x['id']} {x['label']} ({x['status']})"
+                                                                               for x in devs if x["id"] == i))
+            rem = st.text_input("Remarks", max_chars=200)
+            if st.form_submit_button("Carry out request", type="primary"):
+                if what in ("restore_access", "end_sessions", "remove_device"):
+                    r = api("POST", f"/api/teller/customers/{v['customer']}/service",
+                            json={"verification_id": v["verification_id"], "action": what, "device_id": dev,
+                                  "remarks": rem})
+                else:
+                    r = api("POST", f"/api/teller/accounts/{d['account']['account_no']}/protect",
+                            json={"action": what, "verification_id": v["verification_id"], "reason": rem or what})
+                result(r, "Done; the customer was notified.")
+
+
+# ---------------------------------------------------------------- 11. reports
+def tl_reports() -> None:
+    st.title("Reports & audit history")
+    today = datetime.now().date()
+    c = st.columns(3)
+    kind = c[0].selectbox("Report period", ["Daily", "Monthly", "Custom"])
+    if kind == "Daily":
+        f = to = c[1].date_input("Day", value=today, key="rp_day")
+    elif kind == "Monthly":
+        m = c[1].date_input("Any day in the month", value=today, key="rp_m")
+        f = m.replace(day=1)
+        to = (f.replace(month=f.month % 12 + 1, year=f.year + (f.month == 12)) - pd.Timedelta(days=1))
+        to = to.date() if hasattr(to, "date") else to
+    else:
+        f = c[1].date_input("From", value=today.replace(day=1), key="rp_f")
+        to = c[2].date_input("To", value=today, key="rp_t")
+    d = cp_json("/api/teller/reports", date_from=str(f), date_to=str(to))
+    if not d:
+        return
+    t = d["totals"]
+    st.caption(f"{f} to {to}")
+    reports = {
+        "Transactions": pd.DataFrame(d["transactions"]),
+        "Teller performance": pd.DataFrame(d["tellers"]),
+        "Approval decisions": pd.DataFrame(d["approval_history"]),
+        "Rejected transactions": pd.DataFrame([x for x in d["transactions"] if x["status"] in ("rejected", "denied")]),
+        "Customer verifications": pd.DataFrame(d["verifications"]),
+        "Suspicious transactions": pd.DataFrame([x for x in d["transactions"] if (x.get("risk_score") or 0) >= 0.4]),
+        "My login history": pd.DataFrame(d["my_logins"]),
+        "My action audit log": pd.DataFrame(d["my_actions"]),
+        "Approval audit log": pd.DataFrame(d["approval_audit"]),
+    }
+    k = st.columns(4)
+    k[0].metric("Transactions", t["total"])
+    k[1].metric("Volume", compact_money(t["volume"]))
+    k[2].metric("Approval decisions", len(d["approval_history"]))
+    k[3].metric("Verifications", len(d["verifications"]))
+    name = st.selectbox("Report", list(reports))
+    df = reports[name]
+    if df.empty:
+        st.caption("Nothing in this period.")
+        return
+    st.dataframe(df, hide_index=True, use_container_width=True, height=420)
+    c = st.columns(2)
+    c[0].download_button("Export CSV", df.to_csv(index=False).encode(), file_name=f"{name.lower().replace(' ', '-')}.csv",
+                         mime="text/csv", use_container_width=True)
+    head = [("Period", f"{f} to {to}"), ("Rows", str(len(df))), ("Generated by", S().user)]
+    body = [(str(i + 1), " | ".join(str(v) for v in r.values())[:110]) for i, r in enumerate(df.head(60).to_dict("records"))]
+    c[1].download_button("Export PDF", simple_pdf(f"{name} report", head + body, "ZT-FinGuard teller reports"),
+                         file_name=f"{name.lower().replace(' ', '-')}.pdf", mime="application/pdf",
+                         use_container_width=True)
+
+
+# ---------------------------------------------------------------- 12. profile & settings
+def tl_profile() -> None:
+    st.title("Teller profile & settings")
+    me_ = cp_json("/api/teller/me")
+    p = cp_json("/api/me/profile")
+    if not (me_ and p):
+        return
+    t = st.tabs(["Profile", "Password & MFA", "Session", "Notifications"])
+    with t[0]:
+        st.dataframe(pd.DataFrame([("Name", p["full_name"]), ("Username", p["username"]),
+                                   ("Employee id", me_.get("employee_id") or "-"), ("Role", me_["role"].title()),
+                                   ("Assigned branch", me_.get("branch") or "-"),
+                                   ("Mobile", p["mobile_masked"] or "-"),
+                                   ("E-mail", (p["email"] or "not added") + (" (verified)" if p["email_verified"] else "")),
+                                   ("Access permissions", ", ".join(me_["permissions"]))], columns=["", " "]),
+                     hide_index=True, use_container_width=True)
+        st.caption("Role, branch and permissions are assigned by the bank (OPA policy); you can update only your name "
+                   "and contact details.")
+        profile_basics()
+        contact_change("email", "E-mail address", p["email"])
+    with t[1]:
+        password_panel()
+        mfa_panel()
+    with t[2]:
+        tok = me_["token"]
+        st.markdown(f"Session `{tok['session']}` · device trust **{me_['device_trust']}** · token expires "
+                    f"{datetime.fromtimestamp(tok['expires']).strftime('%H:%M:%S')} · sign-in methods "
+                    f"{', '.join(tok.get('methods') or [])}")
+        timeout_panel()
+    with t[3]:
+        prefs_panel(only=("login_alerts", "transaction_alerts", "mfa_alerts", "support_alerts", "sms_alerts",
+                          "email_alerts"))
+    st.divider()
+    if st.button("Log out securely"):
+        api("POST", "/api/auth/logout", json={"refresh_token": S().refresh})
+        end_session("Signed out. Your token was revoked on the server.")
+        st.rerun()
+
 # ------------------------------------------- admin module 10: incident response
 def fmt_min(m) -> str:
     if m is None:
@@ -4342,16 +5238,26 @@ else:
         "Network visualization": network_view,
         "Policy management": policy_management,
         "Dashboard": cp_dashboard,
+        "Teller dashboard": tl_dashboard,
+        "Customer lookup": tl_lookup,
+        "Identity verification": tl_verify,
+        "Transaction management": tl_transactions,
+        "Transaction approvals": tl_approvals,
+        "AI risk assessment": tl_risk,
+        "Transaction history": tl_history if S().role == "teller" else cp_history,
+        "Branch operations": tl_branch,
+        "Teller security center": tl_security,
+        "Reports & audit history": tl_reports,
+        "Teller profile & settings": tl_profile,
         "My accounts": cp_accounts,
         "Money transfer": cp_transfer,
-        "Transaction history": cp_history,
         "My devices": cp_devices,
         "Security center": cp_security,
         "AI fraud protection": cp_fraud,
         "Notifications": cp_notifications,
         "Account protection": cp_protection,
         "My profile": cp_profile,
-        "Customer support": cp_support,
+        "Customer support": tl_support if S().role == "teller" else cp_support,
         "Incident response": incident_response,
     }[page]()
     footer()

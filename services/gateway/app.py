@@ -663,8 +663,28 @@ async def cp_ticket_reply(body: ReplyBody, tid: int, claims: dict = Depends(sess
 
 
 @app.get("/api/ops/tickets")
-async def ops_tickets(status: str | None = None, claims: dict = Depends(session)):
-    return await forward("GET", "account", "/ops/tickets" + (f"?status={status}" if status else ""), claims)
+async def ops_tickets(status: str | None = None, q: str | None = None, claims: dict = Depends(session)):
+    params = {k: v for k, v in (("status", status), ("q", q)) if v}
+    try:
+        r = await mtls.client().get(mtls.url("account", "/ops/tickets"), params=params,
+                                    headers={"Authorization": f"Bearer {claims['_raw']}"})
+    except httpx.HTTPError:
+        raise HTTPException(502, "account unavailable")
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+class StaffTicketBody(BaseModel):
+    customer: str = Field(max_length=40)
+    category: str = Field(pattern=r"^(general|fraud|access|device|recovery|investigation|protection)$")
+    subject: str = Field(max_length=120)
+    body: str = Field(max_length=2000)
+    tx_id: int | None = None
+    escalate: bool = False
+
+
+@app.post("/api/ops/tickets")
+async def ops_ticket_new(body: StaffTicketBody, claims: dict = Depends(session)):
+    return await forward("POST", "account", "/ops/tickets", claims, body.model_dump())
 
 
 @app.post("/api/ops/tickets/{tid}/reply")
@@ -1363,7 +1383,7 @@ async def ops_limit(body: LimitBody, acct_no: str = ACCOUNT_NO, claims: dict = D
 
 
 @app.post("/api/ops/pending/{tx_id}/{op}")
-async def ops_decide(body: NoteBody, tx_id: int, op: str = Path(pattern=r"^(approve|reject)$"),
+async def ops_decide(body: NoteBody, tx_id: int, op: str = Path(pattern=r"^(approve|reject|hold|release|request_mfa)$"),
                      claims: dict = Depends(session)):
     return await forward("POST", "transaction", f"/pending/{tx_id}/{op}", claims, body.model_dump())
 
@@ -1389,7 +1409,9 @@ ROLE_ACTIONS = {
                  "beneficiary.manage"],
     "operations": ["ops.accounts", "ops.transactions", "ops.freeze", "ops.limits", "ops.approve",
                    "account.read", "transaction.history", "transaction.cancel"],
-    "teller": ["account.read", "transaction.history"],
+    "teller": ["account.read", "transaction.history", "transaction.cancel", "customer.lookup", "customer.verify",
+               "customer.service", "branch.deposit", "branch.withdraw", "branch.transfer", "branch.reports",
+               "ops.approve", "ops.transactions", "teller.risk", "support.manage"],
     "admin": ["admin.dashboard", "admin.devices", "admin.quarantine", "admin.search", "admin.user_control",
               "admin.fraud", "admin.containers", "admin.threats", "admin.network", "admin.session_policy",
               "admin.settings"],
@@ -2295,6 +2317,375 @@ async def admin_settings_update(body: SettingsBody, claims: dict = Depends(sessi
         raise HTTPException(502, "could not record the change; nothing was changed")
     await clients.redis().hset("zt:settings", mapping={c["setting"]: c["to"] for c in changes})
     return {"changes": changes, "settings": await current_settings()}
+
+
+# ======================================================================= teller portal
+async def staff_get(service: str, path: str, claims: dict, params: dict | None = None, timeout: float = 20):
+    try:
+        r = await mtls.client().get(mtls.url(service, path), params=params or {},
+                                    headers={"Authorization": f"Bearer {claims['_raw']}"}, timeout=timeout)
+    except httpx.HTTPError:
+        raise HTTPException(502, f"{service} unavailable")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, r.json().get("detail", "error") if r.headers.get("content-type", "")
+                            .startswith("application/json") else r.text)
+    return r.json()
+
+
+async def events_of(actor: str | None = None, action: str | None = None, limit: int = 300, **extra) -> list[dict]:
+    params = {"limit": limit} | ({"actor": actor} if actor else {}) | ({"action": action} if action else {}) | extra
+    return ((await get_json("audit", "/explore", params=params, timeout=20)) or {}).get("rows", [])
+
+
+def today_ist() -> str:
+    return datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()
+
+
+@app.get("/api/teller/me")
+async def teller_me(claims: dict = Depends(session)):
+    await require_admin_action("self.manage", claims)
+    staff = await get_json("auth", "/me/staff", claims) or {}
+    return staff | {"permissions": ROLE_ACTIONS.get(claims["role"], []), "device_trust": claims["_device_trust"],
+                    "session_seconds_left": claims["_idle_left"]}
+
+
+@app.get("/api/teller/customers")
+async def teller_search(q: str, claims: dict = Depends(session)):
+    await require_admin_action("customer.lookup", claims)
+    if not 1 <= len(q.strip()) <= 40:
+        raise HTTPException(400, "type 1-40 characters")
+    return await staff_get("auth", "/teller/customers", claims, {"q": q.strip()})
+
+
+@app.get("/api/teller/customers/{username}")
+async def teller_customer(username: str = USERNAME, claims: dict = Depends(session)):
+    """Customer 360 for the counter: masked identity, account and restrictions, risk, devices,
+    recent logins, suspicious activity, complaints, transactions and verification history."""
+    await require_admin_action("customer.lookup", claims)
+    card = await staff_get("auth", f"/teller/customers/{username}", claims)
+    acct = await staff_get("account", f"/teller/accounts/{card['account_no']}", claims)
+    txs = await staff_get("account", "/ops/transactions", claims, {"account": card["account_no"], "limit": 100})
+    logins = [_strip(e) for e in await events_of(username, "auth.login", 50)]
+    alerts = [_strip(e) | {"action": e["action"]} for e in await events_of(username, None, 300)
+              if e["severity"] in ("high", "critical") or e["decision"] == "deny"][:40]
+    verifs = await staff_get("auth", "/teller/verifications", claims, {"customer": username, "limit": 50})
+    return {"customer": card, "account": acct, "transactions": txs, "logins": logins, "alerts": alerts,
+            "verifications": verifs}
+
+
+class TellerVerifyBody(BaseModel):
+    customer: str = Field(max_length=40)
+    purpose: str = Field(pattern=r"^(account_service|deposit|withdrawal|transfer|recovery|device_removal|protection|"
+                                 r"approval)$")
+
+
+@app.post("/api/teller/verify")
+async def teller_verify_start(body: TellerVerifyBody, claims: dict = Depends(session)):
+    await require_admin_action("customer.verify", claims)
+    r = await forward("POST", "auth", "/teller/verify", claims, body.model_dump())
+    if r.status_code != 200:
+        return r
+    out = json.loads(r.body)
+    # extra pre-checks the auth service cannot see: account status and recent suspicious sign-ins
+    card = await get_json("auth", f"/teller/customers/{body.customer}", claims) or {}
+    acct = await get_json("account", f"/teller/accounts/{card.get('account_no')}", claims) or {}
+    bad = [e for e in await events_of(body.customer, "auth.login", 100)
+           if e["decision"] in ("deny", "step_up") and e["ts"] >= (datetime.now(timezone.utc) - timedelta(days=7))
+           .isoformat()[:19]]
+    out["checks"] |= {"account_status": acct.get("status"), "restrictions": acct.get("restrictions", []),
+                      "risk_status": acct.get("risk_status"), "suspicious_logins_7d": len(bad)}
+    return out
+
+
+class TellerVerifyDone(BaseModel):
+    sms_code: str = Field(max_length=10)
+    totp: str | None = Field(default=None, max_length=10)
+
+
+@app.post("/api/teller/verify/{vid}")
+async def teller_verify_done(body: TellerVerifyDone, vid: str = Path(pattern=r"^[0-9a-f]{16}$"),
+                             claims: dict = Depends(session)):
+    await require_admin_action("customer.verify", claims)
+    return await forward("POST", "auth", f"/teller/verify/{vid}", claims, body.model_dump())
+
+
+@app.get("/api/teller/verifications")
+async def teller_verifications(customer: str | None = None, mine: bool = False, limit: int = 200,
+                               claims: dict = Depends(session)):
+    await require_admin_action("customer.verify", claims)
+    params = {"mine": str(mine).lower(), "limit": max(1, min(limit, 1000))} | ({"customer": customer} if customer else {})
+    return await staff_get("auth", "/teller/verifications", claims, params)
+
+
+class CounterTxBody(BaseModel):
+    account_no: str = Field(max_length=20)
+    amount: float = Field(gt=0)
+    to_account: str | None = Field(default=None, max_length=20)
+    method: str = Field(default="internal", pattern=r"^(internal|imps|neft|rtgs)$")
+    description: str | None = Field(default=None, max_length=60)
+    verification_id: str | None = Field(default=None, max_length=40)
+
+
+@app.post("/api/teller/transactions/{kind}")
+async def teller_counter_tx(body: CounterTxBody, kind: str = Path(pattern=r"^(deposit|withdrawal|transfer)$"),
+                            claims: dict = Depends(session)):
+    # the teller's own device trust is checked by policy, exactly like a customer's
+    return await forward("POST", "transaction", f"/branch/{kind}", claims, body.model_dump(),
+                         extra_headers={"X-ZT-Device-Trust": claims["_device_trust"]})
+
+
+@app.get("/api/teller/quote")
+async def teller_quote(account_no: str, amount: float, method: str = "internal", kind: str = "transfer",
+                       claims: dict = Depends(session)):
+    await require_admin_action("customer.lookup", claims)
+    if not (0 < amount <= 10_000_000) or method not in ("internal", "imps", "neft", "rtgs"):
+        raise HTTPException(400, "bad amount or method")
+    acct = await staff_get("account", f"/teller/accounts/{account_no}", claims)
+    q = await get_json("transaction", f"/quote?amount={amount:.2f}&method={method if kind == 'transfer' else 'internal'}")
+    if q is None:
+        raise HTTPException(502, "transaction unavailable")
+    left = max(0.0, acct["daily_limit"] - acct["used_today"])
+    outgoing = kind in ("withdrawal", "transfer")
+    return q | {"checks": {
+        "account_active": acct["status"] == "active",
+        "transfers_enabled": not acct["transfers_disabled"] or not outgoing,
+        "enough_balance": (not outgoing) or q["total"] <= acct["available"], "available": acct["available"],
+        "within_daily_limit": (not outgoing) or amount <= left, "daily_limit_left": left,
+        "needs_approval": amount >= (200000 if kind == "deposit" else _POLICY["config"]["high_value_threshold"]),
+        "dual_control": amount >= 100000, "teller_device_trusted": claims["_device_trust"] == "trusted",
+        "customer_code_needed": "SMS + authenticator" if outgoing else "none (deposit)"}}
+
+
+@app.get("/api/teller/approvals")
+async def teller_approvals(claims: dict = Depends(session)):
+    queue = await staff_get("account", "/approvals/queue", claims)
+    hist = await staff_get("account", "/approvals/history", claims, {"limit": 300})
+    # AI view for each held transaction: model reasons + signals from the audit chain
+    sig = {}
+    for e in await events_of(None, "transaction.transfer", 500) + await events_of(None, "branch.", 500):
+        d = e.get("details") or {}
+        if d.get("tx_id"):
+            sig[d["tx_id"]] = {"reasons": [r.get("text") for r in d.get("reasons", [])], "policy": d.get("policy"),
+                               "signals": d.get("signals") or {}, "verification": d.get("verification"),
+                               "device_trust": (d.get("signals") or {}).get("device_trust")}
+    for q in queue:
+        q["ai"] = sig.get(q["id"], {})
+    return {"queue": queue, "history": hist, "me": claims["usr"]}
+
+
+@app.post("/api/teller/approvals/{tx_id}/{op}")
+async def teller_approval(body: NoteBody, tx_id: int,
+                          op: str = Path(pattern=r"^(approve|reject|hold|release|request_mfa)$"),
+                          claims: dict = Depends(session)):
+    return await forward("POST", "transaction", f"/pending/{tx_id}/{op}", claims, body.model_dump())
+
+
+@app.post("/api/me/transactions/{tx_id}/confirm")
+async def customer_confirm_tx(body: TotpBody, tx_id: int, claims: dict = Depends(session)):
+    await verify_code(claims, body.totp, "confirm_held_transaction")
+    return await forward("POST", "transaction", f"/me/transactions/{tx_id}/confirm", claims)
+
+
+@app.get("/api/teller/transactions")
+async def teller_transactions(request: Request, claims: dict = Depends(session)):
+    keys = ("status", "account", "q", "date_from", "date_to", "min_amount", "max_amount", "kind", "channel",
+            "initiated_by", "tx_id", "limit")
+    qp = {k: v for k, v in request.query_params.items() if k in keys and v != ""}
+    rows = await staff_get("account", "/ops/transactions", claims, qp)
+    if request.query_params.get("format") != "csv":
+        return rows
+    buf = io.StringIO()
+    cols = ["created_at", "reference", "id", "kind", "channel", "from_account", "from_name", "to_account", "to_name",
+            "method", "amount", "charges", "status", "risk_score", "initiated_by", "decided_by", "decision_note",
+            "description"]
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    clients.audit(actor=claims["usr"], action="teller.export", resource="transactions", decision="info",
+                  details={"rows": len(rows), "filters": qp})
+    return Response(buf.getvalue().encode(), media_type="text/csv",
+                    headers={"Content-Disposition": 'attachment; filename="zt-customer-transactions.csv"'})
+
+
+def recommended_actions(item: dict) -> list[str]:
+    tips = []
+    if item["decision"] == "deny" and item.get("risk", 0) and item["risk"] >= 0.75:
+        tips.append("Call the customer on the registered mobile; consider asking them to lock the account down")
+    if item.get("new_payee"):
+        tips.append("Confirm the payee with the customer before approving")
+    if (item.get("times_usual") or 0) >= 3:
+        tips.append("Ask for the purpose of the payment (amount far above usual)")
+    if (item.get("velocity") or 0) >= 3:
+        tips.append("Several transfers in minutes - check for an ongoing scam call")
+    if item.get("device_trust") not in (None, "trusted"):
+        tips.append("Made from an unverified device - verify the customer at the counter")
+    return tips or ["No action needed"]
+
+
+@app.get("/api/teller/risk")
+async def teller_risk(days: int = 7, claims: dict = Depends(session)):
+    """AI risk view for the counter: every scored transaction with its probability and reasons, plus
+    sign-in anomalies and high-risk accounts. Tellers see amounts (they serve the customer)."""
+    await require_admin_action("teller.risk", claims)
+    since = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 90)))).isoformat()
+    items = []
+    for e in await events_of(None, "transaction.transfer", 1500, since=since) + \
+            await events_of(None, "branch.", 500, since=since):
+        d, sig = e.get("details") or {}, (e.get("details") or {}).get("signals") or {}
+        reasons = d.get("reasons", [])
+        item = {"ts": e["ts"], "tx_id": d.get("tx_id"), "customer": d.get("customer") or e["actor"],
+                "channel": "branch" if e["action"].startswith("branch.") else "online", "action": e["action"],
+                "amount": d.get("amount"), "to": d.get("to"), "decision": e["decision"], "reason": e["reason"],
+                "risk": e["risk"], "probability": sig.get("ml_probability"), "level": sig.get("level"),
+                "reasons": [r.get("text") for r in reasons], "factors": [r.get("factor") for r in reasons],
+                "new_payee": sig.get("new_payee"), "times_usual": sig.get("times_usual"),
+                "velocity": sig.get("velocity_10m"), "hour": sig.get("hour"), "device_trust": sig.get("device_trust"),
+                "drain_ratio": sig.get("drain_ratio")}
+        item["warnings"] = [w for w, on in (
+            ("unusual amount", (item["times_usual"] or 0) >= 3 or "unusual_amount" in item["factors"]),
+            ("unusual time", "hour" in item["factors"] or (item["hour"] is not None and item["hour"] < 6)),
+            ("abnormal frequency", (item["velocity"] or 0) >= 3),
+            ("drains the balance", (item["drain_ratio"] or 0) >= 0.5),
+            ("new payee", bool(item["new_payee"])),
+            ("untrusted device", item["device_trust"] not in (None, "trusted"))) if on]
+        item["recommended"] = recommended_actions(item)
+        items.append(item)
+    logins = []
+    for e in await events_of(None, "auth.login", 1000, since=since):
+        d = e.get("details") or {}
+        if e["decision"] != "allow" or d.get("new_device") or (e["risk"] or 0) >= 0.4:
+            logins.append({"ts": e["ts"], "customer": e["actor"], "decision": e["decision"], "reason": e["reason"],
+                           "risk": e["risk"], "ip": d.get("ip"), "new_device": d.get("new_device"),
+                           "reasons": [r.get("text") for r in d.get("reasons", [])]})
+    by_cust: dict[str, dict] = {}
+    for it in items:
+        c = by_cust.setdefault(it["customer"], {"customer": it["customer"], "transfers": 0, "flagged": 0, "blocked": 0,
+                                                "max_risk": 0.0, "warnings": set()})
+        c["transfers"] += 1
+        c["max_risk"] = max(c["max_risk"], it["risk"] or 0)
+        c["flagged"] += 1 if (it["risk"] or 0) >= 0.4 or it["decision"] != "allow" else 0
+        c["blocked"] += 1 if it["decision"] == "deny" else 0
+        c["warnings"] |= set(it["warnings"])
+    accounts = sorted(({**c, "warnings": sorted(c["warnings"])} for c in by_cust.values() if c["flagged"]),
+                      key=lambda c: (-c["max_risk"], -c["blocked"]))
+    fps = [{"ts": e["ts"], "by": e["actor"], **(e.get("details") or {})}
+           for e in await events_of(None, "fraud.false_positive_report", 200)]
+    return {"items": items, "flagged": [i for i in items if (i["risk"] or 0) >= 0.4 or i["decision"] != "allow"],
+            "logins": logins, "accounts": accounts, "false_positive_reports": fps}
+
+
+class FalsePositiveBody(BaseModel):
+    tx_id: int = Field(gt=0)
+    note: str = Field(min_length=3, max_length=300)
+
+
+@app.post("/api/teller/risk/false-positive")
+async def teller_false_positive(body: FalsePositiveBody, claims: dict = Depends(session)):
+    """Tellers report a possible false positive; the security team decides (admin fraud labels)."""
+    await require_admin_action("teller.risk", claims)
+    clients.audit(actor=claims["usr"], action="fraud.false_positive_report", resource=f"tx/{body.tx_id}",
+                  decision="info", reason="teller_reported_false_positive",
+                  details={"tx_id": body.tx_id, "note": body.note})
+    return {"reported": body.tx_id}
+
+
+@app.get("/api/teller/branch")
+async def teller_branch(date_from: str | None = None, date_to: str | None = None, claims: dict = Depends(session)):
+    await require_admin_action("branch.reports", claims)
+    f, t = date_from or today_ist(), date_to or today_ist()
+    if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", f) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", t)):
+        raise HTTPException(400, "dates must be YYYY-MM-DD")
+    stats = await staff_get("account", "/branch/stats", claims, {"date_from": f, "date_to": t})
+    verifs = await staff_get("auth", "/teller/verifications", claims, {"limit": 1000})
+    verifs = [v for v in verifs if f <= v["created_at"][:10] <= t]
+    staff = {"teller", "ops"}
+    alerts = [e for e in await events_of(None, None, 400)
+              if (e["severity"] in ("high", "critical") and (e["action"].startswith(("branch.", "teller.", "transaction.",
+                                                                                     "customer.", "auth.login"))))][:50]
+    return stats | {"verifications": {"total": len(verifs), "passed": sum(v["status"] == "passed" for v in verifs),
+                                      "failed": sum(v["status"] == "failed" for v in verifs), "rows": verifs},
+                    "security_alerts": [_strip(e) | {"actor": e["actor"]} for e in alerts],
+                    "status": {"branch": "open", "services_ok": all([(await health_of(x))["healthy"]
+                                                                     for x in ("account", "transaction", "auth")]),
+                               "staff_on_duty": sorted(staff)}}
+
+
+@app.get("/api/teller/dashboard")
+async def teller_dashboard(claims: dict = Depends(session)):
+    await require_admin_action("branch.reports", claims)
+    today = today_ist()
+    yesterday = (datetime.fromisoformat(today) - timedelta(days=1)).date().isoformat()
+    week_ago = (datetime.fromisoformat(today) - timedelta(days=7)).date().isoformat()
+    t = await staff_get("account", "/branch/stats", claims, {"date_from": today, "date_to": today})
+    y = await staff_get("account", "/branch/stats", claims, {"date_from": yesterday, "date_to": yesterday})
+    w = await staff_get("account", "/branch/stats", claims, {"date_from": week_ago, "date_to": today})
+    queue = await staff_get("account", "/approvals/queue", claims)
+    verifs = await staff_get("auth", "/teller/verifications", claims, {"limit": 200})
+    tickets = await staff_get("account", "/ops/tickets", claims, {"status": "open"})
+    mine = [_strip(e) | {"action": e["action"], "resource": e["resource"]} for e in await events_of(claims["usr"], None, 30)]
+    notes = await get_json("auth", "/me/notifications", claims) or {"items": [], "unread": 0}
+    staff = await get_json("auth", "/me/staff", claims) or {}
+    alerts = [e for e in await events_of(None, None, 300) if e["severity"] in ("high", "critical")
+              and e["action"].startswith(("branch.", "teller.", "transaction.", "customer.", "account."))][:15]
+    return {"staff": staff, "today": t["totals"], "yesterday": y["totals"], "week": w["totals"],
+            "hourly": t["hourly"], "daily": w["daily"], "recent_customer": t["transactions"][:12],
+            "recent_mine": mine, "approvals": {"pending": len(queue),
+                                               "high_value": sum(1 for q in queue if q["amount"] >= 50000),
+                                               "risky": sum(1 for q in queue if q["risk_level"] != "low")},
+            "verifications_open": [v for v in verifs if v["status"] == "started"],
+            "verifications_today": sum(1 for v in verifs if v["created_at"][:10] == today),
+            "requests": [x for x in tickets if x["category"] in ("recovery", "access", "device", "protection")],
+            "tickets_open": len(tickets), "security_alerts": [_strip(e) | {"actor": e["actor"]} for e in alerts],
+            "notifications": notes}
+
+
+@app.get("/api/teller/reports")
+async def teller_reports(date_from: str, date_to: str, claims: dict = Depends(session)):
+    await require_admin_action("branch.reports", claims)
+    if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to)):
+        raise HTTPException(400, "dates must be YYYY-MM-DD")
+    stats = await staff_get("account", "/branch/stats", claims, {"date_from": date_from, "date_to": date_to})
+    hist = await staff_get("account", "/approvals/history", claims, {"limit": 2000})
+    hist = [h for h in hist if date_from <= h["created_at"][:10] <= date_to]
+    verifs = [v for v in await staff_get("auth", "/teller/verifications", claims, {"limit": 1000})
+              if date_from <= v["created_at"][:10] <= date_to]
+    logins = [_strip(e) for e in await events_of(claims["usr"], "auth.login", 300)]
+    actions = [_strip(e) | {"action": e["action"], "resource": e["resource"]}
+               for e in await events_of(claims["usr"], None, 500)]
+    approval_logs = [_strip(e) | {"action": e["action"], "resource": e["resource"], "actor": e["actor"]}
+                     for e in await events_of(None, "transaction.", 800)
+                     if e["action"] in ("transaction.approve", "transaction.reject", "transaction.hold",
+                                        "transaction.release", "transaction.request_mfa")]
+    return stats | {"approval_history": hist, "verifications": verifs, "my_logins": logins, "my_actions": actions,
+                    "approval_audit": approval_logs}
+
+
+class CounterServiceBody(BaseModel):
+    verification_id: str = Field(max_length=40)
+    action: str = Field(pattern=r"^(restore_access|remove_device|end_sessions)$")
+    device_id: int | None = None
+    remarks: str = Field(default="", max_length=200)
+
+
+@app.post("/api/teller/customers/{username}/service")
+async def teller_service(body: CounterServiceBody, username: str = USERNAME, claims: dict = Depends(session)):
+    await require_admin_action("customer.service", claims)
+    return await forward("POST", "auth", f"/teller/customers/{username}/service", claims, body.model_dump())
+
+
+class CounterProtectBody(BaseModel):
+    action: str = Field(pattern=r"^(freeze|unfreeze|disable_transfers|enable_transfers)$")
+    verification_id: str = Field(max_length=40)
+    reason: str = Field(max_length=200)
+
+
+@app.post("/api/teller/accounts/{acct_no}/protect")
+async def teller_protect(body: CounterProtectBody, acct_no: str = Path(pattern=r"^ZT\d{10}$"),
+                         claims: dict = Depends(session)):
+    await require_admin_action("customer.service", claims)
+    return await forward("POST", "account", f"/teller/accounts/{acct_no}/protect", claims, body.model_dump())
+
 
 
 @app.get("/healthz")

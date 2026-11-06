@@ -46,9 +46,23 @@ permissions := {
 		"support.manage",
 		"self.manage",
 	},
+	# Bank teller (counter): serves verified customers, is maker for counter transactions and a
+	# checker for others (never for its own), never touches security tooling.
 	"teller": {
 		"account.read:any",
 		"transaction.history:any",
+		"transaction.cancel:any",
+		"customer.lookup",
+		"customer.verify",
+		"customer.service",
+		"branch.deposit",
+		"branch.withdraw",
+		"branch.transfer",
+		"branch.reports",
+		"ops.approve",
+		"ops.transactions",
+		"teller.risk",
+		"support.manage",
 		"self.manage",
 	},
 	# Separation of duties: admins run security tooling but can never
@@ -100,6 +114,14 @@ trusted_callers := {
 	"account.protect": {"account"},
 	"support.ticket": {"account"},
 	"support.manage": {"account"},
+	"customer.lookup": {"gateway"},
+	"customer.verify": {"gateway"},
+	"customer.service": {"gateway", "account"},
+	"branch.deposit": {"transaction"},
+	"branch.withdraw": {"transaction"},
+	"branch.transfer": {"transaction"},
+	"branch.reports": {"gateway", "account"},
+	"teller.risk": {"gateway"},
 }
 
 # ------------------------------------------------ tunable policy (module 8)
@@ -156,7 +178,13 @@ granted if {
 
 granted if concat(":", [input.action, "any"]) in permissions[role]
 
-is_transfer if input.action == "transaction.transfer"
+# every action that moves money: online transfers and counter (branch) transactions
+is_transfer if input.action in {"transaction.transfer", "branch.deposit", "branch.withdraw", "branch.transfer"}
+
+is_branch if startswith(input.action, "branch.")
+
+# money leaving a customer's account (a deposit leaves the branch vault)
+is_outgoing if input.action in {"transaction.transfer", "branch.withdraw", "branch.transfer"}
 
 # ------------------------------------------------------------- deny reasons
 deny contains "mfa_required" if not input.subject.mfa == true
@@ -184,8 +212,28 @@ deny contains "device_not_trusted" if {
 }
 
 deny contains "amount_over_limit" if {
-	is_transfer
+	input.action == "transaction.transfer"
 	input.context.amount > transfer_limit[role]
+}
+
+# Counter limits per transaction (cash withdrawals and counter transfers keep the online ceiling).
+branch_limit := {
+	"branch.deposit": 1000000,
+	"branch.withdraw": transfer_limit.customer,
+	"branch.transfer": transfer_limit.customer,
+}
+
+deny contains "amount_over_limit" if {
+	is_branch
+	input.context.amount > branch_limit[input.action]
+}
+
+# Zero Trust at the counter: the customer proves who they are with an SMS code sent to the
+# registered mobile AND their authenticator before money leaves their account. A deposit
+# needs no customer code (money only comes in), but the teller is still verified.
+deny contains "customer_not_verified" if {
+	input.action in {"branch.withdraw", "branch.transfer"}
+	not input.context.verification == "sms+totp"
 }
 
 # Frozen accounts can neither send nor receive (a missing status must deny).
@@ -201,14 +249,14 @@ deny contains "payee_account_frozen" if {
 
 # Customer self-protection: the account holder switched outgoing transfers off (missing value denies).
 deny contains "transfers_disabled_by_customer" if {
-	is_transfer
+	is_outgoing
 	not input.context.outgoing_enabled == true
 }
 
 within_daily_limit if input.context.daily_used + input.context.amount <= input.context.daily_limit
 
 deny contains "daily_limit_exceeded" if {
-	is_transfer
+	is_outgoing
 	not within_daily_limit
 }
 
@@ -234,8 +282,42 @@ deny contains reason if {
 
 # ---------------------------------------------------------- maker-checker
 needs_approval if {
-	is_transfer
+	is_outgoing
 	input.context.amount >= high_value_threshold
+}
+
+# large cash deposits are also checked by a second person
+needs_approval if {
+	input.action == "branch.deposit"
+	input.context.amount >= 200000
+}
+
+# ------------------------------------------------- dual control for approvals
+# input.context for ops.approve: amount, risk_level, initiator, owner, prior_approvers
+dual_control_threshold := 100000
+
+approvals_required := 2 if {
+	input.context.amount >= dual_control_threshold
+} else := 2 if {
+	input.context.risk_level in {"medium", "high", "unknown"}
+} else := 1
+
+is_approval if input.action == "ops.approve"
+
+# maker-checker: whoever started a transaction can never approve it
+deny contains "maker_cannot_approve" if {
+	is_approval
+	input.subject.user == input.context.initiator
+}
+
+deny contains "owner_cannot_approve" if {
+	is_approval
+	input.subject.user == input.context.owner
+}
+
+deny contains "already_approved_by_you" if {
+	is_approval
+	input.subject.user in input.context.prior_approvers
 }
 
 # ------------------------------------------------------------------ step-up
@@ -264,6 +346,7 @@ decision := {
 	"allow": allow,
 	"step_up": step_up,
 	"needs_approval": needs_approval,
+	"approvals_required": approvals_required,
 	"reasons": reasons,
 }
 
