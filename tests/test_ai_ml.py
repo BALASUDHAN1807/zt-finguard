@@ -7,6 +7,10 @@ recommendations, predictive analytics and the built-in security assistant - end 
 from __future__ import annotations
 
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import pytest
 
 from test_customer_portal import PW, portal_user, send
 from test_e2e import Client, _drain_attempt, account_of, fresh_code, fresh_customer, logged_in
@@ -158,3 +162,75 @@ def test_assistant_answers_from_live_data_and_never_acts():
     assert "gateway" not in (st.get("quarantined") or {})                      # nothing was done
     for who in ("alice", "teller"):
         assert logged_in(who).req("POST", "/api/admin/ai/assistant", json={"question": "help"}).status_code == 403
+
+
+def _hold_plan(admin: Client, start_balance: float, spent: float) -> tuple[int, int] | None:
+    """Pick a cash deposit and a transfer amount whose fraud-model probability puts the combined score
+    in the "high" band (60-74) once the burst and the bank rules are added. Uses the admin what-if
+    explanation, so no money moves while searching.
+
+    Other contributions at transfer time: new payee 0.15, unusual amount (> 5x the average) 0.30,
+    velocity 5 transactions in a minute = 0.88 x 0.30 = 0.264, first-sign-in login risk ~0.02.
+    1 - 0.85 x 0.70 x 0.736 x 0.979 = 0.571  ->  model probability 0.07 - 0.42 gives 60 - 74;
+    aim for the middle (0.24) so small differences cannot cross a band."""
+    for deposit in (0, 10000, 25000, 50000, 100000, 150000):
+        bal = start_balance + deposit - spent
+        best = None
+        for amount in range(1000, int(min(49750, bal * 0.98)), 750):
+            p = admin.req("POST", "/api/admin/ai/explain", json={
+                "amount": amount, "sender_balance": bal, "receiver_balance": 50000,
+                "hour": datetime.now(ZoneInfo("Asia/Kolkata")).hour}).json()["ml_probability"]
+            if 0.14 <= p <= 0.34 and (best is None or abs(p - 0.24) < best[0]):
+                best = (abs(p - 0.24), amount)
+                if best[0] < 0.03:
+                    break
+        if best:
+            return deposit, best[1]
+    return None
+
+
+def test_high_severity_transfer_is_stepped_up_then_held_for_dual_control():
+    """The adaptive engine's middle band end to end: 'high' (60-74) = step-up MFA first, then the
+    transfer waits for two bank officers (OPA ai_risk_hold) and only then does money move."""
+    if datetime.now(ZoneInfo("Asia/Kolkata")).hour >= 22:
+        pytest.skip("22:00-23:59 IST: the PaySim model jumps from ~0 to ~1 with amount at these hours, "
+                    "so no transfer lands in the 'high' band; the OPA test covers the rule")
+    admin, teller, ops = logged_in("admin"), logged_in("teller"), logged_in("ops")
+    name, payee = fresh_customer(), fresh_customer()
+    small = [100, 110, 120, 130, 140]
+    plan = _hold_plan(admin, 50000, sum(small))
+    if plan is None:
+        pytest.skip("no deposit / amount reaches the 'high' band at this hour")
+    deposit, amount = plan
+    acct, to = account_of(name), account_of(payee)
+    if deposit:
+        assert teller.req("POST", "/api/teller/transactions/deposit",
+                          json={"account_no": acct, "amount": deposit}).status_code == 200
+    c = Client(device=f"e2e-{name}")
+    assert c.login(name).status_code == 200
+    bob = account_of("bob")
+    for amt in small:                                     # a quick burst: 5 transfers within a minute
+        assert send(c, name, bob, amt).status_code == 200
+    r = c.req("POST", "/api/transfer", json={"to_account": to, "amount": amount})
+    risk = r.json()["risk"]
+    assert r.status_code == 403 and r.json()["decision"] == "step_up", r.text
+    assert risk["severity"] == "high" and risk["recommended_action"] == "hold", risk
+    assert risk["components"]["velocity"] >= 80 and risk["explanation"].startswith("Held because")
+    su = c.req("POST", "/api/auth/step-up", json={"totp": fresh_code(name), "to_account": to, "amount": amount})
+    held = c.req("POST", "/api/transfer", json={"to_account": to, "amount": amount,
+                                                "step_up_token": su.json()["step_up_token"]})
+    assert held.status_code == 202 and held.json()["decision"] == "pending_approval", held.text
+    tx = held.json()["transaction_id"]
+    before = c.req("GET", "/api/me/overview").json()["balance"]
+    first = teller.req("POST", f"/api/teller/approvals/{tx}/approve", json={"note": "AI hold reviewed"})
+    assert first.status_code == 200 and first.json()["status"] == "pending_approval" and \
+        first.json()["required"] == 2, first.text                                    # dual control
+    assert c.req("GET", "/api/me/overview").json()["balance"] == before   # nothing moved yet
+    done = ops.req("POST", f"/api/teller/approvals/{tx}/approve", json={"note": "second check"})
+    assert done.status_code == 200 and done.json()["status"] == "completed", done.text
+    time.sleep(1)
+    rows = admin.req("GET", "/api/admin/audit/explore", params={"actor": name, "action": "transaction.transfer",
+                                                                 "limit": 20}).json()["rows"]
+    assert any(x["reason"] == "ai_risk_hold" for x in rows)
+    d = admin.req("GET", "/api/admin/ai/intel", params={"days": 1, "subject": name}).json()["decisions"]
+    assert any(x["action"] == "hold" and x["severity"] == "high" for x in d)

@@ -355,14 +355,19 @@ These are trend indicators to investigate, not certainties.
 
 ## Tests
 
-`tests/test_ai_ml.py` has 8 tests:
+`tests/test_ai_ml.py` has 9 tests:
 1. five models are compared on held-out data and monitored;
 2. a transfer decision carries engines, severity and action, and its exact Shapley values add up;
 3. an account drain is critical, blocked, explained and kept in the decision history;
-4. a velocity burst raises the velocity engine (step-up, or hold for review when the score reaches "high");
+4. a velocity burst raises the velocity engine;
 5. sensitive requests are re-scored and recorded;
 6. every sign-in is scored by login intelligence;
 7. recommendations and predictive analytics are returned;
-8. the assistant answers from live data, respects roles and never acts.
+8. the assistant answers from live data, respects roles and never acts;
+9. a "high" transfer is stepped up, then held for two approvers, and money moves only after the
+   second approval (`ai_risk_hold`). The test picks the amount with the admin what-if explanation, so
+   it lands in the band at any hour. Between 22:00 and 23:59 IST the PaySim model jumps from about 0
+   to about 1 with the amount, no transfer can land in "high", and the test skips (the policy test
+   still covers the rule).
 
 The OPA policy test suite adds the AI hold rule (41 policy tests).
