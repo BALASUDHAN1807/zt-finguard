@@ -241,7 +241,10 @@ h2, h3 {font-weight:600 !important;}
 [data-testid="stSidebar"] .stRadio label {padding:7px 10px; border-radius:4px; width:100%;}
 [data-testid="stSidebar"] .stRadio label:has(input:checked) {background:rgba(255,255,255,.09); box-shadow:inset 3px 0 0 var(--brass);}
 [data-testid="stSidebar"] [data-baseweb="radio"] > div:first-child {display:none;}
-[data-testid="stSidebar"] .stButton > button {background:transparent; border:1px solid rgba(255,255,255,.3); color:#fff;}
+[data-testid="stSidebar"] .stButton button {background:transparent; border:1px solid rgba(255,255,255,.3); color:#fff;}
+[data-testid="stSidebar"] .stButton button:hover, [data-testid="stSidebar"] .stButton button:focus,
+[data-testid="stSidebar"] .stButton button:active {background:rgba(255,255,255,.12); color:#fff; border-color:rgba(255,255,255,.6);}
+[data-testid="stSidebar"] .stButton button p {color:inherit;}
 [data-testid="stSidebar"] hr {border-color:rgba(255,255,255,.12);}
 .zt-who {padding:4px 0 14px;}
 .zt-who b {font-size:1.05rem; color:#fff;}
@@ -571,12 +574,9 @@ def session_clock() -> None:
             st.warning(f"This session ends in about **{left} s** ({ENDS_BY.get(why, why)}). Activity cannot "
                        "extend it - finish what you are doing and sign in again.")
     else:
-        idle = d["idle"]
-        st.caption(f"Idle limit {idle['minutes']} min ({idle['source_text']}), "
-                   f"maximum session {d['absolute']['minutes'] // 60} h {d['absolute']['minutes'] % 60} min"
-                   if d["absolute"]["minutes"] >= 60 else
-                   f"Idle limit {idle['minutes']} min ({idle['source_text']}), maximum session "
-                   f"{d['absolute']['minutes']} min")
+        idle, mins = d["idle"], d["absolute"]["minutes"]
+        span = (f"{mins // 60} h" + (f" {mins % 60} min" if mins % 60 else "")) if mins >= 60 else f"{mins} min"
+        st.caption(f"Idle limit {idle['minutes']} min ({idle['source_text']}), maximum session {span}")
 
 
 # ---------------------------------------------------------------- customer
@@ -1400,7 +1400,7 @@ def identity_devices() -> None:
         identity_logins()
 
 
-KIND_LABEL = {"idle": "inactivity", "absolute": "maximum length", "risk": "risk deadline",
+END_LABEL = {"idle": "inactivity", "absolute": "maximum length", "risk": "risk deadline",
               "hours": "outside working hours", "concurrent": "too many sessions", "signed_out": "signed out",
               "signed_out_everywhere": "signed out everywhere", "ended_by_owner": "ended by owner",
               "revoked_by_admin": "revoked by admin", "shortened": "shortened (risk rose)", "other": "other"}
@@ -1425,13 +1425,13 @@ def identity_timeouts() -> None:
             f"{role} {m} min" for role, m in sorted(d["avg_session_minutes"].items())))
     if d["by_day"]:
         df = pd.DataFrame(d["by_day"])
-        df["kind"] = df["kind"].map(lambda x: KIND_LABEL.get(x, x))
+        df["kind"] = df["kind"].map(lambda x: END_LABEL.get(x, x))
         st.altair_chart(alt.Chart(df).mark_bar().encode(
             x=alt.X("day:O", title=None), y=alt.Y("n:Q", title="sessions ended", axis=alt.Axis(tickMinStep=1)),
             color=alt.Color("kind:N", title="why", scale=alt.Scale(scheme="tableau10")),
             tooltip=["day", "kind", "n"]).properties(height=240), use_container_width=True)
     if d["by_role"]:
-        rows = [{"role": role, "why": KIND_LABEL.get(kind, kind), "n": n}
+        rows = [{"role": role, "why": END_LABEL.get(kind, kind), "n": n}
                 for role, kinds in d["by_role"].items() for kind, n in kinds.items()]
         st.altair_chart(alt.Chart(pd.DataFrame(rows)).mark_bar().encode(
             y=alt.Y("role:N", title=None), x=alt.X("n:Q", title="sessions ended", axis=alt.Axis(tickMinStep=1)),
@@ -1440,7 +1440,7 @@ def identity_timeouts() -> None:
     if d["recent"]:
         rc = pd.DataFrame(d["recent"])
         rc["time"] = local_time(rc["ts"], "%d %b %H:%M:%S")
-        rc["kind"] = rc["kind"].map(lambda x: KIND_LABEL.get(x, x))
+        rc["kind"] = rc["kind"].map(lambda x: END_LABEL.get(x, x))
         st.dataframe(rc[["time", "user", "role", "kind", "minutes", "text"]], hide_index=True,
                      use_container_width=True, height=320,
                      column_config={"kind": "why", "minutes": "session length (min)", "text": "explanation"})
