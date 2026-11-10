@@ -250,15 +250,19 @@ async def session(request: Request, authorization: str | None = Header(None),
     device_trust = await r.get(f"dev:{claims['sub']}:{claims['dfp']}") or "pending"
     if device_trust == "revoked":
         deny(request, claims["usr"], "device_revoked")
-    # F19: inactivity timeout (dashboard auto-refresh sends X-ZT-Background and never counts as activity)
-    idle_reason, left = await sessions.check(r, claims.get("sid"), claims["sub"],
-                                             touch=x_zt_background != "1")
+    # F19 + session timeouts: idle (role / customer / admin / risky limits), absolute lifetime, risk
+    # deadline and staff working hours. Dashboard auto-refresh sends X-ZT-Background and never counts
+    # as activity.
+    idle_reason, left, sstate = await sessions.check(r, claims.get("sid"), claims["sub"],
+                                                     touch=x_zt_background != "1", audit=clients.audit,
+                                                     role=claims.get("role"))
     if idle_reason:
         await r.set(f"rtfam_revoked:{claims.get('sid')}", 1, ex=8 * 3600)
         deny(request, claims["usr"], idle_reason)
     await session_watch(request, r, claims)
     claims["_device_trust"] = device_trust
     claims["_idle_left"] = left
+    claims["_session"] = sstate
     GATEWAY_CHECK_MS.append((time.perf_counter() - t0) * 1000)
     claims["_raw"] = tokens.bearer(authorization)
     return claims
@@ -286,6 +290,8 @@ async def session_watch(request: Request, r, claims: dict) -> None:
         await r.hset(f"sessinfo:{sid}", mapping={"ip_changed": ip, "risk_flags": "ip_changed"})
         clients.audit(actor=claims["usr"], action="session.ip_changed", resource=sid[:8], decision="alert",
                       reason="session_ip_changed", details={"from": first_ip, "to": ip, "jti": claims["jti"][:8]})
+        # risk rose mid-session: the session gets a short deadline instead of only a flag
+        await sessions.shorten(r, sid, "ip_changed", clients.audit, claims["usr"])
     window = int(time.time() // 60)
     n = await r.incr(f"tokuse:{claims['jti']}:{window}")
     if n == 1:
@@ -359,6 +365,9 @@ async def ai_gate(request: Request, claims: dict, action: str) -> dict:
                   details={"action": action, "severity": d["severity"], "recommended": d["recommended_action"],
                            "engines": d["components"], "explanation": d["explanation"],
                            "reasons": d["reasons"][:6]})
+    if d["severity"] in ("high", "critical"):
+        await sessions.shorten(clients.redis(), claims.get("sid"), f"ai_risk_{d['severity']}:{action}",
+                               clients.audit, claims["usr"])
     if d["severity"] == "critical":
         raise HTTPException(403, {"error": "risk_too_high", "action": action, "explanation": d["explanation"],
                                   "recommended_action": d["recommended_action"]})
@@ -471,13 +480,56 @@ class StepUpBody(BaseModel):
 
 @app.post("/api/auth/step-up")
 async def step_up(body: StepUpBody, claims: dict = Depends(session)):
-    return await forward("POST", "auth", "/stepup", body=body.model_dump() | {"sub": claims["sub"]})
+    out = await forward("POST", "auth", "/stepup", body=body.model_dump() | {"sub": claims["sub"]})
+    if out.status_code == 200:
+        await sessions.mark_auth(clients.redis(), claims.get("sid"))
+    return out
 
 
 @app.get("/api/me")
 async def me(claims: dict = Depends(session)):
     return {k: claims[k] for k in ("usr", "role", "mfa", "amr", "exp", "iat", "jti")} | {
-        "device_trust": claims["_device_trust"], "idle_seconds_left": claims["_idle_left"]}
+        "device_trust": claims["_device_trust"], "idle_seconds_left": claims["_idle_left"],
+        "session_seconds_left": claims["_session"]["seconds_left"], "session_ends_by": claims["_session"]["ends_by"]}
+
+
+# ------------------------------------------------- session timeouts: live status
+def session_view(st_: dict) -> dict:
+    """What the client needs for the countdown and the 'Stay signed in' button."""
+    ends_by = st_["ends_by"]
+    return {"seconds_left": st_["seconds_left"], "ends_by": ends_by,
+            "extendable": ends_by == "idle",       # activity only extends the idle window
+            "warn": st_["seconds_left"] <= 60,
+            "idle": st_["idle"] | {"source_text": sessions.SOURCE_TEXT.get(st_["idle"]["source"])},
+            "absolute": st_["absolute"], "risk": st_["risk"], "hours": st_["hours"], "role": st_["role"],
+            "reauth": {"minutes": st_["reauth_minutes"], "auth_age_seconds": st_["auth_age_seconds"],
+                       "fresh": st_["auth_age_seconds"] <= st_["reauth_minutes"] * 60}}
+
+
+@app.get("/api/session/status")
+async def session_status(claims: dict = Depends(session)):
+    """Polled by the dashboard with X-ZT-Background: never counts as activity."""
+    return session_view(claims["_session"])
+
+
+@app.post("/api/session/keepalive")
+async def session_keepalive(claims: dict = Depends(session)):
+    """'Stay signed in': a deliberate click, so it is real activity (the session dependency touched it)."""
+    clients.audit(actor=claims["usr"], action="session.keepalive", resource=(claims.get("sid") or "")[:8],
+                  decision="info", reason="stay_signed_in")
+    return session_view(claims["_session"])
+
+
+@app.post("/api/session/end-others")
+async def session_end_others(claims: dict = Depends(session)):
+    """End every other session of this user (any role); this one stays signed in."""
+    return await forward("POST", "auth", "/me/sessions/revoke-others", claims)
+
+
+@app.post("/api/session/end-all")
+async def session_end_all(claims: dict = Depends(session)):
+    """Sign out everywhere, including this session (any role)."""
+    return await forward("POST", "auth", "/me/sessions/revoke-all", claims)
 
 
 # ---------------------------------------------------------- banking routes
@@ -511,9 +563,34 @@ async def transfer(body: TransferBody, request: Request, claims: dict = Depends(
     # Device trust is decided here (the policy enforcement point) and passed on; the
     # transaction service only accepts this header from the gateway's mTLS identity.
     ctx = await security_ctx(request, claims)
-    return await forward("POST", "transaction", "/transfer", claims, body.model_dump(),
-                         extra_headers={"X-ZT-Device-Trust": claims["_device_trust"],
-                                        "X-ZT-Context": json.dumps(ctx, separators=(",", ":"))})
+    st_ = claims["_session"]
+    if not body.step_up_token and st_["auth_age_seconds"] > st_["reauth_minutes"] * 60:
+        # re-confirm before moving money: the last proof of identity is too old (same step-up flow as risk)
+        mins = st_["auth_age_seconds"] // 60
+        clients.audit(actor=claims["usr"], action="session.reauth_required", resource="transfer",
+                      decision="step_up", reason="reauth_required",
+                      details={"auth_age_minutes": mins, "limit_minutes": st_["reauth_minutes"],
+                               "to": body.to_account, "amount": body.amount})
+        return JSONResponse(status_code=403, content={
+            "decision": "step_up", "reasons": ["reauth_required"],
+            "message": "Confirm it is you: enter a fresh authenticator code to send money.",
+            "risk": {"score": 0.0, "level": "low", "reasons": [
+                {"text": f"You last confirmed your identity {mins} min ago - transfers need a code from the "
+                         f"last {st_['reauth_minutes']} min", "weight": 0.0}]},
+            "bind": {"to_account": body.to_account, "amount": body.amount}})
+    out = await forward("POST", "transaction", "/transfer", claims, body.model_dump(),
+                        extra_headers={"X-ZT-Device-Trust": claims["_device_trust"],
+                                       "X-ZT-Context": json.dumps(ctx, separators=(",", ":"))})
+    try:
+        d = json.loads(out.body)
+        risk = d.get("risk") or {}
+        if not d.get("session_revoked") and risk.get("severity") in ("high", "critical"):
+            await sessions.shorten(clients.redis(), claims.get("sid"),
+                                   f"transfer_{d.get('decision')}_{risk.get('severity') or 'risk'}",
+                                   clients.audit, claims["usr"])
+    except (ValueError, AttributeError):
+        pass
+    return out
 
 
 # ------------------------------------------- F19 / F21: user self-service
@@ -1261,6 +1338,46 @@ async def admin_device_action(body: AdminDeviceBody, device_id: int, op: str = P
 async def admin_sessions(claims: dict = Depends(session)):
     await require_admin_action("admin.user_control", claims)
     return await forward("GET", "auth", "/admin/sessions", claims)
+
+
+@app.get("/api/admin/sessions/analytics")
+async def session_analytics(days: int = 7, claims: dict = Depends(session)):
+    """Timeout analytics: every session end, by kind, role and day, plus session lengths."""
+    await require_admin_action("admin.user_control", claims)
+    days = max(1, min(days, 30))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    rows = (await events_of(action="session.timeout", limit=2000, since=since)
+            + await events_of(action="session.end", limit=2000, since=since))
+    rows += [{"ts": e["ts"], "actor": e["actor"], "details": {"kind": "shortened", "role": None},
+              "reason": e["reason"], "action": e["action"]}
+             for e in await events_of(action="session.shortened", limit=500, since=since)]
+    ist = timezone(timedelta(hours=5, minutes=30))
+    by_kind: dict[str, int] = {}
+    by_role: dict[str, dict[str, int]] = {}
+    by_day: dict[str, dict[str, int]] = {}
+    lengths: dict[str, list[int]] = {}
+    recent = []
+    for e in rows:
+        det = e.get("details") or {}
+        kind, role = det.get("kind") or "other", det.get("role") or "unknown"
+        day = datetime.fromisoformat(e["ts"].replace("Z", "+00:00")).astimezone(ist).date().isoformat()
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        if kind != "shortened":
+            by_role.setdefault(role, {}).setdefault(kind, 0)
+            by_role[role][kind] += 1
+            if det.get("duration_s") is not None:
+                lengths.setdefault(role, []).append(int(det["duration_s"]))
+        by_day.setdefault(day, {}).setdefault(kind, 0)
+        by_day[day][kind] += 1
+        recent.append({"ts": e["ts"], "user": e["actor"], "kind": kind, "role": det.get("role"),
+                       "reason": e.get("reason"), "minutes": round((det.get("duration_s") or 0) / 60, 1),
+                       "text": det.get("text") or sessions.describe(e.get("reason") or "")})
+    recent.sort(key=lambda x: x["ts"], reverse=True)
+    timeouts = sum(v for k, v in by_kind.items() if k in sessions.TIMEOUT_KINDS)
+    return {"days": days, "timeouts": timeouts, "by_kind": by_kind, "by_role": by_role,
+            "by_day": [{"day": d, "kind": k, "n": n} for d, ks in sorted(by_day.items()) for k, n in ks.items()],
+            "avg_session_minutes": {role: round(statistics.mean(v) / 60, 1) for role, v in lengths.items() if v},
+            "recent": recent[:100], "policy": await sessions.settings(clients.redis())}
 
 
 @app.post("/api/admin/sessions/{sid}/revoke")
@@ -2027,6 +2144,18 @@ async def _policy_loop() -> None:
 async def _start_policy_sync() -> None:
     task = asyncio.create_task(_policy_loop())
     _POLICY["task"] = task
+    _POLICY["sweeper"] = asyncio.create_task(_session_sweeper())
+
+
+async def _session_sweeper() -> None:
+    """Abandoned sessions never make another request, so their timeout would never be recorded:
+    every 30 s, end and record every session past one of its deadlines."""
+    while True:
+        try:
+            await sessions.active(clients.redis(), audit=clients.audit)
+        except Exception:  # noqa: BLE001 - best effort; the per-request check still enforces timeouts
+            pass
+        await asyncio.sleep(30)
 
 
 def ip_blocked(ip: str) -> bool:
@@ -2720,9 +2849,10 @@ SETTINGS = {
     "api_anomaly_threshold": (5, 60, 60, "Refused API calls per minute from one client before it is blocked"),
     "api_block_minutes": (10, 1440, 10, "How long a client flagged as anomalous stays blocked (minutes)"),
     "risky_session_idle_minutes": (1, 10, 10, "Inactivity timeout for risky sessions (new device / medium risk)"),
+    **sessions.SESSION_SETTINGS,
 }
 STRICTER_IS_LOWER = {"lockout_threshold", "otp_ttl_seconds", "otp_max_tries", "api_anomaly_threshold",
-                     "risky_session_idle_minutes"}
+                     "risky_session_idle_minutes"} | sessions.STRICTER_IS_LOWER
 
 
 async def current_settings() -> dict:
@@ -2770,7 +2900,8 @@ async def admin_settings(claims: dict = Depends(session)):
             {"control": "API rate limit", "value": f"{RATE_LIMIT} requests / min per address"},
             {"control": "Sign-in rate limit", "value": f"{LOGIN_RATE_LIMIT} / min per address"},
             {"control": "TLS", "value": "1.3 only, mutual TLS between all services"},
-            {"control": "Inactivity timeout", "value": "Session & device policy page (admin maximum)"},
+            {"control": "Inactivity timeout", "value": "Session & device policy page (customer maximum); "
+                                                        "role limits, absolute lifetime and staff hours below"},
         ],
         "keys": {
             "ca": _cert_info(config.CA_FILE),
@@ -3349,7 +3480,8 @@ async def ws_events(ws: WebSocket):
         revoked_at = await r.get(f"revoked:{claims['sub']}")
         if revoked_at and claims.get("iat_ms", claims["iat"] * 1000) <= int(revoked_at):
             return None
-        reason, _ = await sessions.check(r, claims.get("sid"), claims["sub"], touch=False)
+        reason, _, _ = await sessions.check(r, claims.get("sid"), claims["sub"], touch=False,
+                                            audit=clients.audit, role=claims.get("role"))
         if reason:
             return None
         d = await clients.authorize({"subject": {"user": claims["usr"], "role": claims["role"],

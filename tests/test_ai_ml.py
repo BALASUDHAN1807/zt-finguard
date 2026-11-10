@@ -216,6 +216,9 @@ def test_high_severity_transfer_is_stepped_up_then_held_for_dual_control():
     assert r.status_code == 403 and r.json()["decision"] == "step_up", r.text
     assert risk["severity"] == "high" and risk["recommended_action"] == "hold", risk
     assert risk["components"]["velocity"] >= 80 and risk["explanation"].startswith("Held because")
+    # raised risk mid-session: the session now has a short deadline that activity cannot extend
+    st = c.req("GET", "/api/session/status", background=True).json()
+    assert st["ends_by"] == "risk" and st["seconds_left"] <= 120 and not st["extendable"], st
     su = c.req("POST", "/api/auth/step-up", json={"totp": fresh_code(name), "to_account": to, "amount": amount})
     held = c.req("POST", "/api/transfer", json={"to_account": to, "amount": amount,
                                                 "step_up_token": su.json()["step_up_token"]})

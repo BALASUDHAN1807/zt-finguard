@@ -392,7 +392,11 @@ def test_inactive_session_expires_and_background_polling_does_not_keep_it_alive(
     assert r.status_code == 401 and r.json()["detail"].startswith("session_idle_timeout")
     # the refresh token cannot revive it - the user must sign in again
     assert c.req("POST", "/api/auth/refresh", json={"refresh_token": c.refresh}).status_code == 401
-    assert Client(device=c.device).login(name).status_code == 200
+    again = Client(device=c.device).login(name)
+    assert again.status_code == 200
+    # the next sign-in explains why the previous session ended (and the end is in the security activity)
+    last = again.json()["last_session_end"]
+    assert last["kind"] == "idle" and "1 minute(s) of inactivity" in last["text"], last
 
 
 # ------------------------------------------- F22: mobile number + SMS OTP

@@ -30,6 +30,7 @@ Runs unchanged on **Docker** or **rootless Podman**.
 | **Teller portal** | 12 pages: counter deposits / withdrawals / transfers only after the customer proves identity (SMS code + authenticator), dual-control approvals (maker-checker, 2 approvers from ₹1 lakh), customer 360 with masked data, AI risk view, branch reports ([docs/teller-portal.md](docs/teller-portal.md)) |
 | **Customer portal** | 11 pages: dashboard, accounts and statements, transfers with Indian payment methods and charges, history, devices, security center, fraud alerts with reasons, notifications, self-protection (freeze / lockdown / three-factor recovery), profile, support tickets ([docs/customer-portal.md](docs/customer-portal.md)) |
 | **Admin security dashboard** | 11 modules: overview, identity & devices, banking operations (maker-checker), AI fraud intelligence, container security, threat center, incident response, network map, restrict-only policy editor, audit & compliance, security settings ([docs/admin-dashboard.md](docs/admin-dashboard.md)) |
+| **Session timeouts** | every request re-checked: role-based idle limits (admin 5 min, staff 10 min), absolute lifetime (admin 1 h, others 8 h), countdown with *Stay signed in*, fresh code for transfers after 5 min, 2-minute deadline when risk rises mid-session, 3 sessions per user, staff working hours, end other sessions / sign out everywhere, timeout analytics and plain-language reasons ([docs/session-timeouts.md](docs/session-timeouts.md)) |
 | **Mobile + SMS OTP sign-in** | mobile number at sign-up; sign in with a one-time SMS code (5 min, single use, 3 tries); new device / unusual sign-in also needs the authenticator code. Simulated SMS inbox for the demo ([docs/mobile-otp.md](docs/mobile-otp.md)) |
 
 ## Architecture
@@ -129,7 +130,8 @@ through the same checks as any API call.
 
 ```bash
 make opa-test     # 41 policy unit tests
-make test         # 87 end-to-end tests (49 core + 7 customer + 5 teller + 8 hardening + 9 container + 9 AI/ML tests)
+make test         # 109 tests (49 core + 7 customer + 5 teller + 8 hardening + 9 container + 9 AI/ML
+                  #   + 7 session-timeout end-to-end + 15 session-policy unit tests)
 make sbom         # CycloneDX SBOM per image (also on every deploy)
 make guard        # supply-chain deployment gate (signatures + vulnerability policy)
 make revoke-cert CERT=<service>     make rotate-secrets SECRET=jwt|redis|metrics|signing|all

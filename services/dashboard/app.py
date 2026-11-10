@@ -22,6 +22,12 @@ import altair as alt
 import httpx
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+
+try:                                     # plain-language session-end reasons (shared with gateway/auth)
+    from ztcommon import sessions as zs
+except ImportError:                      # dashboard run outside the image
+    zs = None
 
 GATEWAY = os.environ.get("GATEWAY_URL", "https://gateway:8443")
 CA_FILE = os.environ.get("TLS_CA_FILE", "/run/secrets/ca_crt")
@@ -58,6 +64,8 @@ def S():
     ss.setdefault("notice", None)
     ss.setdefault("pending_stepup", None)
     ss.setdefault("last_transfer", None)
+    ss.setdefault("last_end", None)        # why the previous session ended (shown once after sign-in)
+    ss.setdefault("session_info", None)
     ss.setdefault("otp_mobile", "")       # F22 sign-in in progress
     ss.setdefault("otp_sent", False)
     ss.setdefault("otp_need_totp", False)
@@ -88,8 +96,12 @@ REASONS = {
 
 
 def friendly(reason: str) -> str:
+    """Why the session ended, in plain words, for the sign-in page."""
+    base = reason.split(":", 1)[1] if reason.startswith("session_revoked:") else reason
+    if zs is not None and zs.kind_of(base) != "other":
+        return f"**{zs.describe(base)}** Please sign in again."
     if reason.startswith("session_idle_timeout_"):
-        mins = reason.rsplit("_", 1)[-1].rstrip("m")
+        mins = reason.split(":", 1)[0].rsplit("_", 1)[-1].rstrip("m")
         return f"You were signed out after **{mins} minute(s) of inactivity**. Please sign in again."
     return REASONS.get(reason, f"Session ended by the gateway: **{reason}**")
 
@@ -307,6 +319,8 @@ def signed_in(d: dict) -> None:
     ss.expires_at = time.time() + d["expires_in"]
     ss.notice = None
     ss.last_transfer = None
+    ss.last_end = d.get("last_session_end")
+    ss.session_info = d.get("session")
     ss.otp_sent, ss.otp_need_totp, ss.otp_msg = False, False, None
     st.rerun()
 
@@ -505,12 +519,64 @@ def sidebar() -> str:
         }[ss.role]
         page = st.radio("Navigate", pages, label_visibility="collapsed")
         st.divider()
-        if st.button("Sign out", use_container_width=True):
+        session_clock()
+        c1, c2 = st.columns(2)
+        if c1.button("Sign out", use_container_width=True):
             api("POST", "/api/auth/logout", json={"refresh_token": ss.refresh})
             end_session("Signed out. Your token was revoked on the server.")
             st.rerun()
+        if c2.button("Sign out everywhere", use_container_width=True,
+                     help="Ends this session and every other session of yours, on every device"):
+            api("POST", "/api/session/end-all")
+            end_session("**You signed out on every device.** Every session was ended on the server.")
+            st.rerun()
         st.caption(f"Device `{ss.device_id[:16]}`")
     return page
+
+
+# ------------------------------------------------------ session timeout clock
+ENDS_BY = {"idle": "inactivity", "absolute": "maximum session length", "risk": "raised session risk",
+           "hours": "end of staff working hours"}
+
+
+def countdown(left: int, why: str, warn: bool) -> None:
+    """A live mm:ss countdown (ticks in the browser between server checks)."""
+    color = "#B42318" if warn else "#667085"
+    components.html(f"""<div id="c" style="font:13px/1.4 'Source Sans Pro',system-ui,sans-serif;color:{color};
+font-weight:{600 if warn else 400}"></div><script>
+let t={int(left)};const e=document.getElementById('c');
+function f(){{const m=Math.floor(t/60),s=t%60;
+e.textContent='Signs out in '+m+':'+String(s).padStart(2,'0')+' ({ENDS_BY.get(why, why)})';if(t>0)t--;}}
+f();setInterval(f,1000);</script>""", height=24)
+
+
+@st.fragment(run_every=10)
+def session_clock() -> None:
+    """Polls the session state (background: never counts as activity). In the last minute it warns,
+    and offers 'Stay signed in' when activity can extend the session. If the session already ended
+    (timeout, signed out in another tab or device) the app goes straight to the sign-in page."""
+    r = api("GET", "/api/session/status", background=True)
+    if r is None or r.status_code != 200:
+        return
+    d = r.json()
+    left, why = d["seconds_left"], d["ends_by"]
+    countdown(left, why, d["warn"])
+    if d["warn"]:
+        if d["extendable"]:
+            st.warning(f"You will be signed out in about **{left} s** because of inactivity.")
+            if st.button("Stay signed in", type="primary", use_container_width=True, key="zt_stay"):
+                api("POST", "/api/session/keepalive")
+                st.rerun(scope="fragment")
+        else:
+            st.warning(f"This session ends in about **{left} s** ({ENDS_BY.get(why, why)}). Activity cannot "
+                       "extend it - finish what you are doing and sign in again.")
+    else:
+        idle = d["idle"]
+        st.caption(f"Idle limit {idle['minutes']} min ({idle['source_text']}), "
+                   f"maximum session {d['absolute']['minutes'] // 60} h {d['absolute']['minutes'] % 60} min"
+                   if d["absolute"]["minutes"] >= 60 else
+                   f"Idle limit {idle['minutes']} min ({idle['source_text']}), maximum session "
+                   f"{d['absolute']['minutes']} min")
 
 
 # ---------------------------------------------------------------- customer
@@ -1116,8 +1182,28 @@ def timeout_panel() -> None:
                     f"Your administrator allows at most **{cfg['admin_max_minutes']} minutes**.")
         c1, c2, c3 = st.columns(3)
         c1.metric("Your choice", f"{cfg['preferred_minutes']} min")
-        c2.metric("Effective timeout", f"{cfg['effective_minutes']} min")
+        c2.metric("Effective timeout", f"{cfg.get('applied_idle_minutes', cfg['effective_minutes'])} min",
+                  help=f"Set by: {cfg.get('idle_source_text') or 'your setting'}")
         c3.metric("Administrator maximum", f"{cfg['admin_max_minutes']} min")
+        hours = cfg.get("staff_hours")
+        rules = [
+            ("Inactivity", f"{cfg.get('applied_idle_minutes', cfg['effective_minutes'])} min "
+                           f"({cfg.get('idle_source_text') or 'your setting'}); automatic refreshes do not count"),
+            ("Maximum session length", f"{cfg.get('absolute_minutes')} min after sign-in, even while active"),
+            ("Transfers", f"need a fresh authenticator code if your last sign-in or code is older than "
+                          f"{cfg.get('reauth_minutes')} min"),
+            ("Risk during the session", "if the network address changes or a request looks high-risk, the "
+                                        "session gets a short final deadline"),
+            ("Simultaneous sessions", f"at most {cfg.get('max_sessions')}; signing in again ends the oldest"),
+        ]
+        if hours:
+            rules.append(("Working hours", f"{hours['start']:02d}:00-{hours['end']:02d}:00 IST "
+                                           f"({'open now' if hours['open'] else 'closed now'})"))
+        if cfg.get("risk_deadline"):
+            rules.append(("This session", f"shortened because of raised risk: "
+                                          f"{cfg['risk_deadline']['seconds_left']} s left"))
+        st.dataframe(pd.DataFrame(rules, columns=["rule", "what applies to you"]), hide_index=True,
+                     use_container_width=True)
         with st.form("idle"):
             choices = cfg["choices"] or [cfg["effective_minutes"]]
             current = min(choices, key=lambda c: abs(c - cfg["effective_minutes"]))
@@ -1301,7 +1387,7 @@ def containers_page() -> None:
 def identity_devices() -> None:
     st.title("Identity & devices")
     st.caption("Who can sign in, from which devices, and what is signed in right now.")
-    t = st.tabs(["Users", "Devices", "Active sessions", "Sign-in history"])
+    t = st.tabs(["Users", "Devices", "Active sessions", "Session timeouts", "Sign-in history"])
     with t[0]:
         identity_users()
     with t[1]:
@@ -1309,7 +1395,71 @@ def identity_devices() -> None:
     with t[2]:
         identity_sessions()
     with t[3]:
+        identity_timeouts()
+    with t[4]:
         identity_logins()
+
+
+KIND_LABEL = {"idle": "inactivity", "absolute": "maximum length", "risk": "risk deadline",
+              "hours": "outside working hours", "concurrent": "too many sessions", "signed_out": "signed out",
+              "signed_out_everywhere": "signed out everywhere", "ended_by_owner": "ended by owner",
+              "revoked_by_admin": "revoked by admin", "shortened": "shortened (risk rose)", "other": "other"}
+
+
+def identity_timeouts() -> None:
+    days = st.select_slider("Period", options=[1, 7, 14, 30], value=7, format_func=lambda d: f"last {d} day(s)",
+                            key="to_days")
+    d = cp_json("/api/admin/sessions/analytics", days=days)
+    if not d:
+        return
+    bk = d["by_kind"]
+    k = st.columns(6)
+    k[0].metric("Timeouts", d["timeouts"])
+    k[1].metric("Inactivity", bk.get("idle", 0))
+    k[2].metric("Maximum length", bk.get("absolute", 0))
+    k[3].metric("Risk deadline", bk.get("risk", 0), help=f"{bk.get('shortened', 0)} session(s) shortened")
+    k[4].metric("Too many sessions", bk.get("concurrent", 0))
+    k[5].metric("Outside hours", bk.get("hours", 0))
+    if d["avg_session_minutes"]:
+        st.markdown("**Average session length:** " + " · ".join(
+            f"{role} {m} min" for role, m in sorted(d["avg_session_minutes"].items())))
+    if d["by_day"]:
+        df = pd.DataFrame(d["by_day"])
+        df["kind"] = df["kind"].map(lambda x: KIND_LABEL.get(x, x))
+        st.altair_chart(alt.Chart(df).mark_bar().encode(
+            x=alt.X("day:O", title=None), y=alt.Y("n:Q", title="sessions ended", axis=alt.Axis(tickMinStep=1)),
+            color=alt.Color("kind:N", title="why", scale=alt.Scale(scheme="tableau10")),
+            tooltip=["day", "kind", "n"]).properties(height=240), use_container_width=True)
+    if d["by_role"]:
+        rows = [{"role": role, "why": KIND_LABEL.get(kind, kind), "n": n}
+                for role, kinds in d["by_role"].items() for kind, n in kinds.items()]
+        st.altair_chart(alt.Chart(pd.DataFrame(rows)).mark_bar().encode(
+            y=alt.Y("role:N", title=None), x=alt.X("n:Q", title="sessions ended", axis=alt.Axis(tickMinStep=1)),
+            color=alt.Color("why:N", scale=alt.Scale(scheme="tableau10")),
+            tooltip=["role", "why", "n"]).properties(height=160), use_container_width=True)
+    if d["recent"]:
+        rc = pd.DataFrame(d["recent"])
+        rc["time"] = local_time(rc["ts"], "%d %b %H:%M:%S")
+        rc["kind"] = rc["kind"].map(lambda x: KIND_LABEL.get(x, x))
+        st.dataframe(rc[["time", "user", "role", "kind", "minutes", "text"]], hide_index=True,
+                     use_container_width=True, height=320,
+                     column_config={"kind": "why", "minutes": "session length (min)", "text": "explanation"})
+    else:
+        st.info("No sessions have ended in this period.")
+    pol = d["policy"]
+    st.markdown("**Current timeout policy** (change it on *Security settings*)")
+    st.dataframe(pd.DataFrame([
+        {"role": "admin", "idle (min)": pol["admin_idle_minutes"], "maximum (min)": pol["admin_absolute_minutes"],
+         "hours": "any time"},
+        {"role": "teller / operations", "idle (min)": pol["staff_idle_minutes"],
+         "maximum (min)": pol["staff_absolute_minutes"],
+         "hours": f"{pol['staff_hours_start']:02d}:00-{pol['staff_hours_end']:02d}:00 IST"},
+        {"role": "customer", "idle (min)": "own choice, up to the admin maximum",
+         "maximum (min)": pol["customer_absolute_minutes"], "hours": "any time"},
+    ]), hide_index=True, use_container_width=True)
+    st.caption(f"All roles: transfers need a fresh code after {pol['reauth_minutes']} min; a session whose risk "
+               f"rises gets {pol['risk_shrink_minutes']} min left; at most {pol['max_sessions_per_user']} "
+               "simultaneous sessions per user (the oldest is signed out).")
 
 
 def ok_or_error(res, success: str) -> None:
@@ -3039,6 +3189,8 @@ def sessions_panel(sessions_list: list[dict]) -> None:
         sid = next(x["sid"] for x in others if pick.endswith(x["sid"][:8]))
         if c[0].button("Revoke this session"):
             result(api("POST", f"/api/me/sessions/{sid}/revoke"), "Session ended.", rerun=True)
+    if others and c[1].button("End all other sessions", help="Keeps this session signed in"):
+        result(api("POST", "/api/session/end-others"), "Other sessions ended.", rerun=True)
     if c[1].button("Force sign-out from all devices", type="primary"):
         r = api("POST", "/api/me/sessions/revoke-all")
         if r is not None and r.status_code == 200:
@@ -5763,6 +5915,15 @@ if not ss.token:
     footer()
 else:
     page = sidebar()
+    if ss.last_end:
+        le = ss.last_end
+        at = datetime.fromtimestamp(le["at_ms"] / 1000).strftime("%d %b %H:%M")
+        st.info(f"Your previous session ({le.get('device') or 'a device'}) ended at {at}: {le['text']}")
+        ss.last_end = None
+    if ss.session_info and ss.session_info.get("older_sessions_ended"):
+        st.warning(f"You can be signed in on at most {ss.session_info['max_sessions']} session(s): "
+                   f"{ss.session_info['older_sessions_ended']} older session(s) were signed out.")
+        ss.session_info["older_sessions_ended"] = 0
     {
         "My account": my_account,
         "Send money": send_money,

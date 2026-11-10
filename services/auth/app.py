@@ -400,6 +400,15 @@ async def assess_login(user: dict, ctx: ClientCtx, dfp: str, actor: str) -> tupl
 async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known: bool, risk: dict,
                          method: str, amr: list[str]) -> dict:
     """Shared by password and SMS-OTP sign-in: block high risk, register the device, issue tokens."""
+    r = clients.redis()
+    cfg = await sessions.settings(r)
+    if user["role"] in sessions.STAFF and not sessions.staff_hours_open(cfg)[0]:
+        clients.audit(actor=actor, action="auth.login", resource="session", decision="deny",
+                      reason="outside_staff_hours",
+                      details={"ip": ctx.ip, "hours": f"{cfg['staff_hours_start']:02d}:00-{cfg['staff_hours_end']:02d}:00 IST"})
+        raise HTTPException(403, {"error": f"staff sign-in is allowed only during working hours "
+                                           f"({cfg['staff_hours_start']:02d}:00-{cfg['staff_hours_end']:02d}:00 IST)",
+                                  "reason": "outside_staff_hours"})
     p = await db.pool()
     async with p.connection() as conn:
         signals = risk.pop("_signals", {})
@@ -425,12 +434,11 @@ async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known
         device = await register_device(conn, user, dfp, ctx)
         await conn.commit()
 
-    r = clients.redis()
     sid = uuid.uuid4().hex
     await publish_device(user["id"], dfp, device["status"])
     await r.set(f"idle:{user['id']}", user["idle_timeout_minutes"], ex=sessions.SESSION_TTL)
     access, claims = issue_access(user, dfp, sid, amr)
-    others = [x for x in await sessions.active(r, str(user["id"])) if x.get("dfp") != dfp]
+    others = [x for x in await sessions.active(r, str(user["id"]), audit=clients.audit) if x.get("dfp") != dfp]
     # session risk: sign-in risk + device trust. Risky sessions get a shorter inactivity timeout.
     session_risk = round(min(1.0, float(risk["score"]) + (0.3 if device["status"] != "trusted" else 0)
                              + (0.1 if device.get("new") else 0)), 2)
@@ -458,6 +466,22 @@ async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known
                       reason="concurrent_sessions",
                       details={"other_sessions": len(others), "other_ips": sorted({o["ip"] for o in others}),
                                "ip": ctx.ip})
+    last_end = await r.getdel(f"lastend:{user['id']}")      # read before this sign-in ends any session
+    # concurrent-session cap: the oldest sessions are signed out (and told why on their next request)
+    live = sorted(await sessions.active(r, str(user["id"])), key=lambda x: int(x.get("started_ms") or 0),
+                  reverse=True)
+    ended_old = []
+    for old in live[cfg["max_sessions_per_user"]:]:
+        if old["sid"] == sid:
+            continue
+        await kill_session(r, old["sid"], "session_concurrent_limit")
+        ended_old.append({"device": old.get("device"), "ip": old.get("ip")})
+    if ended_old:
+        await alert(user, "security", "Older session signed out",
+                    f"You can be signed in on at most {cfg['max_sessions_per_user']} session(s); "
+                    f"{len(ended_old)} older session(s) were signed out "
+                    f"({', '.join(sorted({x['device'] or '?' for x in ended_old}))}).", "medium")
+    state = await sessions.evaluate(r, sid, str(user["id"]))
     _, cap, effective = await sessions.limits(r, str(user["id"]))
     refresh = await issue_refresh(user, dfp, family=sid)
     clients.audit(actor=actor, action="auth.login", resource="session", decision="allow",
@@ -481,7 +505,12 @@ async def complete_login(user: dict, ctx: ClientCtx, dfp: str, actor: str, known
         "username": user["username"], "role": user["role"],
         "login_risk": risk,
         "device": {"id": device["id"], "status": device["status"], "label": device["label"]},
-        "session": {"idle_timeout_minutes": effective, "admin_max_minutes": cap},
+        "session": {"idle_timeout_minutes": state["idle"]["minutes"], "idle_source": state["idle"]["source"],
+                    "customer_choice_minutes": effective, "admin_max_minutes": cap,
+                    "absolute_minutes": state["absolute"]["minutes"], "ends_by": state["ends_by"],
+                    "seconds_left": state["seconds_left"], "staff_hours": state["hours"],
+                    "max_sessions": cfg["max_sessions_per_user"], "older_sessions_ended": len(ended_old)},
+        "last_session_end": json.loads(last_end) if last_end else None,
     }
 
 
@@ -697,7 +726,7 @@ async def refresh(body: RefreshIn):
                       decision="alert", reason="refresh_token_used_from_other_device")
         raise HTTPException(401, "refresh token bound to another device")
     # F19: an idle-expired session cannot be revived by refreshing (no activity is recorded)
-    reason, _ = await sessions.check(r, data["fam"], data["sub"], touch=False)
+    reason, _, _ = await sessions.check(r, data["fam"], data["sub"], touch=False, audit=clients.audit)
     if reason:
         await r.set(f"rtfam_revoked:{data['fam']}", 1, ex=REFRESH_TTL)
         raise HTTPException(401, reason)
@@ -730,7 +759,7 @@ async def logout(body: LogoutIn):
     r = clients.redis()
     ttl = max(body.exp - int(time.time()), 1)
     await r.set(f"deny:jti:{body.jti}", "logged_out", ex=ttl)
-    await sessions.end(r, body.sid)
+    await sessions.finish(r, body.sid, "signed_out", clients.audit)
     if body.sid:
         await r.set(f"rtfam_revoked:{body.sid}", 1, ex=REFRESH_TTL)
     if body.refresh_token:
@@ -860,6 +889,7 @@ async def verify_my_totp(body: VerifyTotpIn, authorization: str | None = Header(
         raise HTTPException(401, "authenticator code invalid or already used")
     clients.audit(actor=claims["usr"], action="auth.step_up", resource=body.purpose, decision="allow",
                   reason="totp_reverified")
+    await sessions.mark_auth(clients.redis(), claims.get("sid"))
     return {"verified": True}
 
 
@@ -868,9 +898,20 @@ async def my_session(authorization: str | None = Header(None)):
     claims = caller_claims(authorization)
     r = clients.redis()
     pref, cap, effective = await sessions.limits(r, claims["sub"])
-    _, left = await sessions.check(r, claims.get("sid"), claims["sub"], touch=False)
+    _, left, state = await sessions.check(r, claims.get("sid"), claims["sub"], touch=False, audit=clients.audit,
+                                          role=claims.get("role"))
+    cfg = await sessions.settings(r)
+    idle = state.get("idle") or {}
     return {"preferred_minutes": pref, "admin_max_minutes": cap, "effective_minutes": effective,
-            "seconds_until_idle_logout": left,
+            "seconds_until_idle_logout": (idle.get("seconds_left") if idle else left),
+            "seconds_left": left, "ends_by": state.get("ends_by"),
+            "applied_idle_minutes": idle.get("minutes", effective), "idle_source": idle.get("source"),
+            "idle_source_text": sessions.SOURCE_TEXT.get(idle.get("source")),
+            "absolute_minutes": (state.get("absolute") or {}).get("minutes"),
+            "absolute_seconds_left": (state.get("absolute") or {}).get("seconds_left"),
+            "risk_deadline": state.get("risk"), "staff_hours": state.get("hours"),
+            "reauth_minutes": cfg["reauth_minutes"], "max_sessions": cfg["max_sessions_per_user"],
+            "role": state.get("role") or claims.get("role"),
             "choices": [c for c in sessions.TIMEOUT_CHOICES if c <= cap]}
 
 
@@ -1284,9 +1325,9 @@ class AdminDeviceIn(BaseModel):
     reason: str = Field(default="", max_length=200)
 
 
-async def kill_session(r, sid: str) -> None:
+async def kill_session(r, sid: str, reason: str = "revoked_by_admin") -> None:
     await r.set(f"rtfam_revoked:{sid}", 1, ex=REFRESH_TTL)
-    await sessions.end(r, sid)
+    await sessions.finish(r, sid, reason, clients.audit)
 
 
 @app.post("/admin/devices/{device_id}/{op}", dependencies=[gateway_only])
@@ -1729,15 +1770,36 @@ async def revoke_my_session(sid: str, authorization: str | None = Header(None)):
         raise HTTPException(404, "session not found")
     if sid == claims.get("sid"):
         raise HTTPException(400, "use Sign out for this session")
-    await kill_session(r, sid)
+    await kill_session(r, sid, "ended_by_owner")
     clients.audit(actor=claims["usr"], action="session.revoke_own", resource=info.get("device", "?"),
                   decision="info", reason="revoked_by_owner", details={"ip": info.get("ip")})
     return {"revoked": sid}
 
 
+@app.post("/me/sessions/revoke-others", dependencies=[gateway_only])
+async def revoke_other_sessions(authorization: str | None = Header(None)):
+    """End every other session of the caller; the current one stays signed in."""
+    claims, user = await me(authorization)
+    r = clients.redis()
+    ended = 0
+    for x in await sessions.active(r, claims["sub"], audit=clients.audit):
+        if x["sid"] != claims.get("sid"):
+            await kill_session(r, x["sid"], "ended_by_owner")
+            ended += 1
+    clients.audit(actor=claims["usr"], action="auth.revoke_sessions", resource="session", decision="info",
+                  reason="other_sessions_ended_by_owner", details={"ended": ended})
+    if ended:
+        await alert(user, "security", "Other sessions signed out",
+                    f"{ended} other session(s) were ended. This one stays signed in.", "medium")
+    return {"ended": ended}
+
+
 @app.post("/me/sessions/revoke-all", dependencies=[gateway_only])
 async def revoke_all_mine(authorization: str | None = Header(None)):
     claims, user = await me(authorization)
+    r = clients.redis()
+    for x in await sessions.active(r, claims["sub"], audit=clients.audit):
+        await sessions.finish(r, x["sid"], "signed_out_everywhere", clients.audit, keep_info=True)
     await revoke_user_sessions(claims["sub"], "signed_out_everywhere")
     clients.audit(actor=claims["usr"], action="auth.revoke_sessions", resource="session", decision="info",
                   reason="signed_out_everywhere_by_owner")

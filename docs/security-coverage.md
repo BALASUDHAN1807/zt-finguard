@@ -189,6 +189,12 @@ closure reports and response times (MTTA / MTTC / MTTR): Threat center + Inciden
 | 7 | Renewal | rotating refresh tokens |
 | 8 | Step-up for sensitive operations | fresh TOTP for payees, devices, protection, policy / settings changes |
 | 9-10 | Suspicious termination, logging | see area 3; every session event is audited |
+| 11 | **Role-based and absolute timeouts** | admin 5 min idle / 1 h maximum, staff 10 min / 8 h, customers own choice / 8 h ([session-timeouts.md](session-timeouts.md)) |
+| 12 | **Warning before sign-out** | live countdown, warning in the last minute, *Stay signed in* |
+| 13 | **Re-authentication for transfers** | fresh code needed when the last proof of identity is older than 5 min |
+| 14 | **Risk-shortened sessions** | IP change / high AI risk → 2 min left, cannot be extended |
+| 15 | **Concurrent-session cap, staff hours** | 3 sessions per user (oldest ends); tellers / operations only 08:00-20:00 IST |
+| 16 | **End other sessions, timeout analytics, explanations** | every role; every end recorded and charted; reason shown on the sign-in page |
 
 ## 15. Account & transaction protection
 
